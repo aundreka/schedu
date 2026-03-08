@@ -36,20 +36,20 @@ export default function AuthIndex() {
   const isEmail = (v: string) => v.includes("@");
 
   const getEmailFromIdentifier = async (id: string): Promise<string | null> => {
-    const trimmed = id.trim().toLowerCase();
+    const trimmed = id.trim();
     if (!trimmed) return null;
 
     if (isEmail(trimmed)) return trimmed;
 
-    // lookup email by username in public.users
+    // Lookup email by username in public.users (case-insensitive).
     const { data, error } = await supabase
       .from("users")
       .select("email")
-      .eq("username", trimmed)
-      .maybeSingle();
+      .ilike("username", trimmed)
+      .limit(1);
 
     if (error) throw error;
-    return data?.email ?? null;
+    return data?.[0]?.email ?? null;
   };
 
   const handlePasswordSignIn = async () => {

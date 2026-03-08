@@ -10,6 +10,8 @@ create table if not exists public.subjects (
   code text not null,
   title text not null,
   year text,
+  academic_year text,
+  unit_no integer,
   subject_image text,
   syllabus text,
   syllabus_kind text,
@@ -20,13 +22,6 @@ create table if not exists public.subjects (
   updated_at timestamptz not null default now(),
   unique (school_id, code)
 );
-
-alter table public.subjects
-  add column if not exists year text,
-  add column if not exists subject_image text,
-  add column if not exists syllabus text,
-  add column if not exists syllabus_kind text,
-  add column if not exists syllabus_mime_type text;
 
 create table if not exists public.user_subjects (
   user_id uuid not null references public.users(userid) on delete cascade,

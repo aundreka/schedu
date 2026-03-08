@@ -3,6 +3,7 @@ import {
   ActivityIndicator,
   Modal,
   Pressable,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
@@ -11,6 +12,7 @@ import {
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { useAppTheme } from "../context/theme";
+import { usePullToRefresh } from "../hooks/usePullToRefresh";
 import { supabase } from "../lib/supabase";
 
 const OPTIONS = [
@@ -88,6 +90,8 @@ export default function Settings() {
     loadUserDetails();
   }, [loadUserDetails]);
 
+  const { refreshing, onRefresh } = usePullToRefresh(loadUserDetails);
+
   const handleSaveDetails = async () => {
     if (!userId) return;
     setSaving(true);
@@ -127,7 +131,11 @@ export default function Settings() {
 
   return (
     <View style={[styles.container, { backgroundColor: c.background }]}>
-      <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
+      <ScrollView
+        contentContainerStyle={styles.content}
+        showsVerticalScrollIndicator={false}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={c.tint} />}
+      >
         <View style={styles.screenTopRow}>
           <Text style={[styles.screenTitle, { color: c.text }]}>Settings</Text>
         </View>

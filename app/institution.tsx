@@ -5,6 +5,7 @@ import {
   Image,
   Modal,
   Pressable,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
@@ -17,6 +18,7 @@ import { router, useLocalSearchParams } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { Swipeable } from "react-native-gesture-handler";
 import { useAppTheme } from "../context/theme";
+import { usePullToRefresh } from "../hooks/usePullToRefresh";
 import { supabase } from "../lib/supabase";
 
 type SchoolType = "university" | "basic_ed" | "training_center";
@@ -202,6 +204,21 @@ export default function InstitutionScreen() {
 
     init();
   }, [schoolIdValue, loadInstitution, loadSections]);
+
+  const refreshInstitution = useCallback(async () => {
+    if (!schoolIdValue) return;
+    const {
+      data: { user },
+      error,
+    } = await supabase.auth.getUser();
+    if (error) throw error;
+    if (!user) throw new Error("No signed-in user found.");
+
+    setUserId(user.id);
+    await Promise.all([loadInstitution(user.id, schoolIdValue), loadSections(schoolIdValue)]);
+  }, [loadInstitution, loadSections, schoolIdValue]);
+
+  const { refreshing, onRefresh } = usePullToRefresh(refreshInstitution);
 
   const resetSectionForm = () => {
     setSectionName("");
@@ -457,7 +474,10 @@ export default function InstitutionScreen() {
 
   return (
     <View style={[styles.container, { backgroundColor: c.background }]}>
-      <ScrollView contentContainerStyle={styles.content}>
+      <ScrollView
+        contentContainerStyle={styles.content}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={c.tint} />}
+      >
         <View style={[styles.card, { backgroundColor: c.card, borderColor: c.border }]}>
           <View style={styles.cardTopActions}>
             <Pressable

@@ -5,6 +5,7 @@ import {
   Image,
   Modal,
   Pressable,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
@@ -16,6 +17,7 @@ import * as FileSystem from "expo-file-system/legacy";
 import { router } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { useAppTheme } from "../context/theme";
+import { usePullToRefresh } from "../hooks/usePullToRefresh";
 import { supabase } from "../lib/supabase";
 
 type SchoolType = "university" | "basic_ed" | "training_center";
@@ -115,6 +117,7 @@ export default function Profile() {
   const [userId, setUserId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [signingOut, setSigningOut] = useState(false);
 
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [institutions, setInstitutions] = useState<Institution[]>([]);
@@ -250,6 +253,24 @@ export default function Profile() {
 
     init();
   }, [loadInstitutions, loadUserProfile, loadLessonPlanCount]);
+
+  const refreshProfile = useCallback(async () => {
+    const {
+      data: { user },
+      error,
+    } = await supabase.auth.getUser();
+    if (error) throw error;
+    if (!user) throw new Error("No signed-in user found.");
+
+    setUserId(user.id);
+    await Promise.all([
+      loadInstitutions(user.id),
+      loadUserProfile(user.id, user.email ?? null),
+      loadLessonPlanCount(user.id),
+    ]);
+  }, [loadInstitutions, loadLessonPlanCount, loadUserProfile]);
+
+  const { refreshing, onRefresh } = usePullToRefresh(refreshProfile);
 
   const resetInstitutionForm = () => {
     setInstitutionName("");
@@ -405,6 +426,21 @@ export default function Profile() {
     ]);
   };
 
+  const handleSignOut = async () => {
+    if (signingOut) return;
+
+    setSigningOut(true);
+    try {
+      const { error } = await supabase.auth.signOut();
+      if (error) throw error;
+      router.replace("/(auth)");
+    } catch (err: any) {
+      Alert.alert("Sign out failed", err?.message ?? "Please try again.");
+    } finally {
+      setSigningOut(false);
+    }
+  };
+
   const displayName = [profile?.first_name, profile?.last_name].filter(Boolean).join(" ") || "Teacher";
   const handleName = profile?.username ? `@${profile.username}` : "@user";
   const profileInitials = getInitials(displayName) || "U";
@@ -412,7 +448,11 @@ export default function Profile() {
 
   return (
     <View style={[styles.container, { backgroundColor: c.background }]}>
-      <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
+      <ScrollView
+        contentContainerStyle={styles.content}
+        showsVerticalScrollIndicator={false}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={c.tint} />}
+      >
         <View style={styles.screenTopRow}>
           <Text style={[styles.screenTitle, { color: c.text }]}>Profile</Text>
           <Pressable style={styles.iconBtn} onPress={() => router.push("/settings")}>
@@ -544,6 +584,24 @@ export default function Profile() {
             ))}
           </View>
         )}
+
+        <Pressable
+          onPress={handleSignOut}
+          disabled={signingOut}
+          style={({ pressed }) => [
+            styles.signOutBtn,
+            {
+              backgroundColor: signingOut ? `${c.mutedText}66` : c.card,
+              borderColor: c.border,
+              opacity: pressed ? 0.88 : 1,
+            },
+          ]}
+        >
+          <Ionicons name="log-out-outline" size={16} color={c.text} />
+          <Text style={[styles.signOutText, { color: c.text }]}>
+            {signingOut ? "Signing out..." : "Sign Out"}
+          </Text>
+        </Pressable>
       </ScrollView>
 
       <Modal visible={showFilterModal} transparent animationType="fade" onRequestClose={() => setShowFilterModal(false)}>
@@ -820,6 +878,17 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   placeholderText: { fontSize: 13, textAlign: "center" },
+  signOutBtn: {
+    marginTop: 24,
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingVertical: 13,
+    alignItems: "center",
+    justifyContent: "center",
+    flexDirection: "row",
+    gap: 8,
+  },
+  signOutText: { fontSize: 14, fontWeight: "700" },
 
   modalBackdrop: {
     flex: 1,
