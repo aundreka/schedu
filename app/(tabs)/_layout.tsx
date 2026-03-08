@@ -1,33 +1,76 @@
-import { Tabs } from 'expo-router';
-import React from 'react';
+import { Tabs } from "expo-router";
+import { Ionicons } from "@expo/vector-icons";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
+import AppHeader from "../../components/header";
+import { useAppTheme } from "../../context/theme";
 
-import { HapticTab } from '@/components/haptic-tab';
-import { IconSymbol } from '@/components/ui/icon-symbol';
-import { Colors } from '@/constants/theme';
-import { useColorScheme } from '@/hooks/use-color-scheme';
-
-export default function TabLayout() {
-  const colorScheme = useColorScheme();
+export default function TabsLayout() {
+  const { colors: c } = useAppTheme();
+  const insets = useSafeAreaInsets();
 
   return (
     <Tabs
       screenOptions={{
-        tabBarActiveTintColor: Colors[colorScheme ?? 'light'].tint,
-        headerShown: false,
-        tabBarButton: HapticTab,
-      }}>
+        header: () => <AppHeader />,
+
+        tabBarActiveTintColor: c.tint,
+        tabBarInactiveTintColor: c.mutedText,
+
+        tabBarShowLabel: true,
+        tabBarHideOnKeyboard: true,
+        tabBarStyle: {
+          backgroundColor: c.card,
+          borderTopColor: c.border,
+          height: 70 + insets.bottom,
+          paddingBottom: insets.bottom,
+          paddingTop: 6,
+        },
+        tabBarLabelStyle: { fontSize: 11 },
+      }}
+    >
       <Tabs.Screen
         name="index"
         options={{
-          title: 'Home',
-          tabBarIcon: ({ color }) => <IconSymbol size={28} name="house.fill" color={color} />,
+          title: "Home",
+          tabBarIcon: ({ size, color }) => (
+            <Ionicons name="home-outline" size={size} color={color} />
+          ),
         }}
       />
       <Tabs.Screen
-        name="explore"
+        name="calendar"
         options={{
-          title: 'Explore',
-          tabBarIcon: ({ color }) => <IconSymbol size={28} name="paperplane.fill" color={color} />,
+          title: "Calendar",
+          tabBarIcon: ({ size, color }) => (
+            <Ionicons name="calendar-outline" size={size} color={color} />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="create"
+        options={{
+          title: "Create",
+          tabBarIcon: ({ size, color }) => (
+            <Ionicons name="add-circle-outline" size={size} color={color} />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="library"
+        options={{
+          title: "Library",
+          tabBarIcon: ({ size, color }) => (
+            <Ionicons name="book-outline" size={size} color={color} />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="plans"
+        options={{
+          title: "Plans",
+          tabBarIcon: ({ size, color }) => (
+            <Ionicons name="bookmark-outline" size={size} color={color} />
+          ),
         }}
       />
     </Tabs>

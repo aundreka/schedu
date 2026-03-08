@@ -1,24 +1,28 @@
-import { DarkTheme, DefaultTheme, ThemeProvider } from '@react-navigation/native';
-import { Stack } from 'expo-router';
-import { StatusBar } from 'expo-status-bar';
-import 'react-native-reanimated';
+import { Stack } from "expo-router";
+import { ThemeProvider as NavThemeProvider, DarkTheme, DefaultTheme } from "@react-navigation/native";
+import { StatusBar } from "expo-status-bar";
+import { ThemeProvider, useAppTheme } from "../context/theme";
 
-import { useColorScheme } from '@/hooks/use-color-scheme';
-
-export const unstable_settings = {
-  anchor: '(tabs)',
-};
-
-export default function RootLayout() {
-  const colorScheme = useColorScheme();
+function AppNav() {
+  const { scheme } = useAppTheme();
 
   return (
-    <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
+    <NavThemeProvider value={scheme === "dark" ? DarkTheme : DefaultTheme}>
+      <StatusBar style={scheme === "dark" ? "light" : "dark"} />
       <Stack>
-        <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-        <Stack.Screen name="modal" options={{ presentation: 'modal', title: 'Modal' }} />
+        <Stack.Screen name="(auth)" options={{ headerShown: false }} />
+        <Stack.Screen name="(tabs)" options={{ headerShown: false, title: "Back" }} />
+        <Stack.Screen name="profile" options={{ headerShown: true, title: "Profile" }} />
+        <Stack.Screen name="settings" options={{ headerShown: true, title: "Settings" }} />
       </Stack>
-      <StatusBar style="auto" />
+    </NavThemeProvider>
+  );
+}
+
+export default function RootLayout() {
+  return (
+    <ThemeProvider>
+      <AppNav />
     </ThemeProvider>
   );
 }
