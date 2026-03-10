@@ -1,0 +1,21 @@
+scenario,repeat_idx,seed,algorithm_id,algorithm,runtime_ms,coverage_pct,lesson_order_pct,assessment_window_pct,load_balance_pct,objective_score,generated_items
+S1,1,20260310,rules_engine,Rules Engine,1.988,100,100,55.556,55.652,84.459,19
+S1,2,20260311,rules_engine,Rules Engine,0.324,100,100,55.556,55.652,84.459,19
+S1,3,20260312,rules_engine,Rules Engine,0.292,100,100,55.556,55.652,84.459,19
+S1,4,20260313,rules_engine,Rules Engine,0.242,100,100,55.556,55.652,84.459,19
+S1,5,20260314,rules_engine,Rules Engine,0.314,100,100,55.556,55.652,84.459,19
+S2,1,20270310,rules_engine,Rules Engine,0.344,100,100,56.522,57.825,84.978,41
+S2,2,20270311,rules_engine,Rules Engine,0.368,100,100,56.522,57.825,84.978,41
+S2,3,20270312,rules_engine,Rules Engine,0.36,100,100,56.522,57.825,84.978,41
+S2,4,20270313,rules_engine,Rules Engine,0.305,100,100,56.522,57.825,84.978,41
+S2,5,20270314,rules_engine,Rules Engine,0.291,100,100,56.522,57.825,84.978,41
+S3,1,20280310,rules_engine,Rules Engine,0.46,100,100,42.308,61.594,82.701,80
+S3,2,20280311,rules_engine,Rules Engine,0.466,100,100,42.308,61.594,82.701,80
+S3,3,20280312,rules_engine,Rules Engine,0.503,100,100,42.308,61.594,82.701,80
+S3,4,20280313,rules_engine,Rules Engine,0.636,100,100,42.308,61.594,82.701,80
+S3,5,20280314,rules_engine,Rules Engine,0.353,100,100,42.308,61.594,82.701,80
+S4,1,20290310,rules_engine,Rules Engine,0.559,100,100,44.286,55.064,82.117,104
+S4,2,20290311,rules_engine,Rules Engine,0.39,100,100,44.286,55.064,82.117,104
+S4,3,20290312,rules_engine,Rules Engine,0.392,100,100,44.286,55.064,82.117,104
+S4,4,20290313,rules_engine,Rules Engine,0.517,100,100,44.286,55.064,82.117,104
+S4,5,20290314,rules_engine,Rules Engine,0.495,100,100,44.286,55.064,82.117,104

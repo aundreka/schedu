@@ -16,9 +16,9 @@ import * as ImagePicker from "expo-image-picker";
 import * as FileSystem from "expo-file-system/legacy";
 import { router } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
-import { useAppTheme } from "../context/theme";
-import { usePullToRefresh } from "../hooks/usePullToRefresh";
-import { supabase } from "../lib/supabase";
+import { useAppTheme } from "../../context/theme";
+import { usePullToRefresh } from "../../hooks/usePullToRefresh";
+import { supabase } from "../../lib/supabase";
 
 type SchoolType = "university" | "basic_ed" | "training_center";
 type InstitutionFilter = "all" | "primary" | SchoolType;
@@ -455,7 +455,7 @@ export default function Profile() {
       >
         <View style={styles.screenTopRow}>
           <Text style={[styles.screenTitle, { color: c.text }]}>Profile</Text>
-          <Pressable style={styles.iconBtn} onPress={() => router.push("/settings")}>
+          <Pressable style={styles.iconBtn} onPress={() => router.push("/profile/settings")}>
             <Ionicons name="settings-outline" size={22} color={c.text} />
           </Pressable>
         </View>
@@ -554,7 +554,7 @@ export default function Profile() {
                     <Pressable
                       key={inst.school_id}
                       onPress={() =>
-                        router.push({ pathname: "/institution", params: { schoolId: inst.school_id } })
+                        router.push({ pathname: "/profile/institution", params: { schoolId: inst.school_id } })
                       }
                       onLongPress={() => handleInstitutionLongPress(inst)}
                       style={({ pressed }) => [styles.gridItem, { opacity: pressed ? 0.85 : 1 }]}

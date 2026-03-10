@@ -15,6 +15,7 @@ import { Ionicons } from "@expo/vector-icons";
 import { router } from "expo-router";
 import { useAppTheme } from "../../../context/theme";
 import { Radius, Spacing, Typography } from "../../../constants/fonts";
+import TabPageHeader from "../../../components/tab-page-header";
 import { usePullToRefresh } from "../../../hooks/usePullToRefresh";
 import { supabase } from "../../../lib/supabase";
 
@@ -232,26 +233,30 @@ export default function LibraryScreen() {
   return (
     <View style={[styles.page, { backgroundColor: c.background }]}>
       <View style={[styles.content, { backgroundColor: surface }]}>
-        <View style={styles.topRow}>
-          <Text style={[styles.pageTitle, { color: c.text }]}>Library</Text>
-          <View style={styles.actions}>
-            <Pressable
-              style={styles.iconBtn}
-              onPress={() => {
+        <TabPageHeader
+          title="Library"
+          textColor={c.text}
+          actions={[
+            {
+              key: "search",
+              icon: "search-outline",
+              onPress: () => {
                 setSearchOpen((v) => !v);
                 if (searchOpen) setSearchQuery("");
-              }}
-            >
-              <Ionicons name="search-outline" size={22} color={c.text} />
-            </Pressable>
-            <Pressable style={styles.iconBtn} onPress={() => router.push("/subject")}>
-              <Ionicons name="add" size={24} color={c.text} />
-            </Pressable>
-            <Pressable style={styles.iconBtn} onPress={() => setFilterOpen(true)}>
-              <Ionicons name="options-outline" size={22} color={c.text} />
-            </Pressable>
-          </View>
-        </View>
+              },
+            },
+            {
+              key: "create",
+              icon: "add",
+              onPress: () => router.push("/create/subject"),
+            },
+            {
+              key: "filter",
+              icon: "options-outline",
+              onPress: () => setFilterOpen(true),
+            },
+          ]}
+        />
 
         {searchOpen ? (
           <View style={[styles.searchWrap, { borderColor: c.border, backgroundColor: c.card }]}>
@@ -398,25 +403,6 @@ const styles = StyleSheet.create({
     flex: 1,
     paddingHorizontal: Spacing.lg,
     paddingTop: Spacing.lg,
-  },
-  topRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-  },
-  pageTitle: {
-    ...Typography.h1,
-  },
-  actions: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: Spacing.sm,
-  },
-  iconBtn: {
-    width: 28,
-    height: 28,
-    alignItems: "center",
-    justifyContent: "center",
   },
   filterBtn: {
     marginTop: Spacing.sm,

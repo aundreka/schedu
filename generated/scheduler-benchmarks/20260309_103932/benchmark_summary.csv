@@ -1,0 +1,2 @@
+algorithm_id,algorithm,n,objective_mean,objective_ci95,coverage_mean,lesson_order_mean,assessment_window_mean,load_balance_mean,runtime_mean_ms,runtime_ci95_ms
+rules_engine,Rules Engine,20,83.564,0.534,100,100,49.668,57.534,0.475,0.195

@@ -19,10 +19,10 @@ import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system/legacy";
 import { router } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
-import { useAppTheme } from "../../context/theme";
-import { usePullToRefresh } from "../../hooks/usePullToRefresh";
-import { supabase } from "../../lib/supabase";
-import wordnetIndex from "../../generated/wordnet-index.json";
+import { useAppTheme } from "../../../context/theme";
+import { usePullToRefresh } from "../../../hooks/usePullToRefresh";
+import { supabase } from "../../../lib/supabase";
+import wordnetIndex from "../../../generated/wordnet-index.json";
 
 type Institution = {
   school_id: string;

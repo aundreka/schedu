@@ -8,7 +8,10 @@
     "android": "expo run:android",
     "ios": "expo run:ios",
     "web": "expo start --web",
-    "lint": "expo lint"
+    "lint": "expo lint",
+    "benchmark:scheduler": "bash ./scripts/run-scheduler-benchmark.sh",
+    "benchmark:visualize": "node ./scripts/visualize-benchmark.mjs",
+    "test:scheduler": "bash ./scripts/run-scheduler-invariants.sh"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",

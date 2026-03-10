@@ -17,9 +17,9 @@ import * as FileSystem from "expo-file-system/legacy";
 import { router, useLocalSearchParams } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
 import { Swipeable } from "react-native-gesture-handler";
-import { useAppTheme } from "../context/theme";
-import { usePullToRefresh } from "../hooks/usePullToRefresh";
-import { supabase } from "../lib/supabase";
+import { useAppTheme } from "../../context/theme";
+import { usePullToRefresh } from "../../hooks/usePullToRefresh";
+import { supabase } from "../../lib/supabase";
 
 type SchoolType = "university" | "basic_ed" | "training_center";
 

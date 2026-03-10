@@ -17,6 +17,7 @@ begin
   if not exists (select 1 from pg_type where typname = 'plan_item_category') then
     create type public.plan_item_category as enum (
       'lesson',
+      'review',
       'written_work',
       'performance_task',
       'exam'
@@ -25,6 +26,48 @@ begin
 
   if not exists (select 1 from pg_type where typname = 'room_type') then
     create type public.room_type as enum ('lecture', 'laboratory');
+  end if;
+
+  if not exists (select 1 from pg_type where typname = 'meeting_type') then
+    create type public.meeting_type as enum ('lecture', 'laboratory');
+  end if;
+
+  if not exists (select 1 from pg_type where typname = 'session_category') then
+    create type public.session_category as enum (
+      'lesson',
+      'written_work',
+      'performance_task',
+      'exam'
+    );
+  end if;
+
+  if not exists (select 1 from pg_type where typname = 'session_subcategory') then
+    create type public.session_subcategory as enum (
+      'lecture',
+      'laboratory',
+      'assignment',
+      'seatwork',
+      'quiz',
+      'activity',
+      'lab_report',
+      'reporting',
+      'project',
+      'prelim',
+      'midterm',
+      'final'
+    );
+  end if;
+
+  if not exists (select 1 from pg_type where typname = 'plan_blackout_reason') then
+    create type public.plan_blackout_reason as enum (
+      'event',
+      'exam_week',
+      'holiday',
+      'leave',
+      'sick',
+      'suspended',
+      'other'
+    );
   end if;
 
   if not exists (select 1 from pg_type where typname = 'record_status') then

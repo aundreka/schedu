@@ -48,8 +48,6 @@ function AppNav() {
         <Stack.Screen name="(auth)" options={{ headerShown: false }} />
         <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
         <Stack.Screen name="profile" options={{ headerShown: true }} />
-        <Stack.Screen name="institution" options={{ headerShown: true }} />
-        <Stack.Screen name="settings" options={{ headerShown: true }} />
       </Stack>
     </NavThemeProvider>
   );

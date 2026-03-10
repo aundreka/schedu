@@ -11,9 +11,9 @@ import {
   View,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
-import { useAppTheme } from "../context/theme";
-import { usePullToRefresh } from "../hooks/usePullToRefresh";
-import { supabase } from "../lib/supabase";
+import { useAppTheme } from "../../context/theme";
+import { usePullToRefresh } from "../../hooks/usePullToRefresh";
+import { supabase } from "../../lib/supabase";
 
 const OPTIONS = [
   { label: "System", value: "system" },
