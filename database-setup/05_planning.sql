@@ -26,13 +26,12 @@ create table if not exists public.plan_entries (
   lesson_plan_id uuid not null references public.lesson_plans(lesson_plan_id) on delete cascade,
   lesson_id uuid references public.lessons(lesson_id) on delete set null,
   entry_type public.plan_entry_type not null default 'planned_item',
-  category public.plan_item_category not null,
   day public.weekday_name,
   scheduled_date date,
   start_time time,
   end_time time,
   meeting_type public.meeting_type,
-  session_category public.session_category,
+  session_category public.session_category not null,
   session_subcategory public.session_subcategory,
   room public.room_type,
   instance_no integer,
@@ -63,16 +62,12 @@ create table if not exists public.plan_entries (
       and instance_no > 0
     )
   ),
-  constraint plan_entries_session_category_matches_category_check check (
-    session_category is null
-    or session_category::text = category::text
-  ),
   constraint plan_entries_session_pair_check check (
-    (session_category is null and session_subcategory is null)
-    or (session_category = 'lesson' and session_subcategory in ('lecture', 'laboratory'))
+    (session_category = 'lesson' and session_subcategory in ('lecture', 'laboratory'))
     or (session_category = 'written_work' and session_subcategory in ('assignment', 'seatwork', 'quiz'))
     or (session_category = 'performance_task' and session_subcategory in ('activity', 'lab_report', 'reporting', 'project'))
     or (session_category = 'exam' and session_subcategory in ('prelim', 'midterm', 'final'))
+    or (session_category = 'buffer' and session_subcategory in ('review', 'preparation', 'other'))
   )
 );
 
@@ -133,7 +128,6 @@ create index if not exists lesson_plans_date_range_idx on public.lesson_plans(st
 
 create index if not exists plan_entries_lesson_plan_id_idx on public.plan_entries(lesson_plan_id);
 create index if not exists plan_entries_lesson_id_idx on public.plan_entries(lesson_id);
-create index if not exists plan_entries_category_idx on public.plan_entries(category);
 create index if not exists plan_entries_entry_type_idx on public.plan_entries(entry_type);
 create index if not exists plan_entries_day_idx on public.plan_entries(day);
 create index if not exists plan_entries_scheduled_date_idx on public.plan_entries(scheduled_date);

@@ -1,5 +1,5 @@
 import assert from "assert/strict";
-import { generateSchedulePlan, type SchedulerInput, type SchedulerSourceEntry } from "../algorithms/lessonPlanScheduler";
+import { generateSchedulePlan, type SchedulerInput, type SchedulerSourceEntry } from "../algorithm/oldlessonPlanScheduler";
 
 function entry(overrides: Partial<SchedulerSourceEntry> & Pick<SchedulerSourceEntry, "plan_entry_id" | "lesson_plan_id" | "title" | "category">): SchedulerSourceEntry {
   return {

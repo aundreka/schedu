@@ -2,12 +2,12 @@ import { mkdirSync, writeFileSync } from "fs";
 import { join } from "path";
 import { performance } from "perf_hooks";
 import {
-  generateScheduledEntries,
-  SCHEDULER_ALGORITHMS,
-  type SchedulerAlgorithmId,
-  type SchedulerInput,
-  type SchedulerSourceEntry,
-} from "../algorithms/lessonPlanScheduler";
+    generateScheduledEntries,
+    SCHEDULER_ALGORITHMS,
+    type SchedulerAlgorithmId,
+    type SchedulerInput,
+    type SchedulerSourceEntry,
+} from "../algorithm/oldlessonPlanScheduler";
 
 type ScenarioConfig = {
   id: string;

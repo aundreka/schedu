@@ -92,6 +92,11 @@ type SpecialDate = {
   reason: string;
 };
 
+type ExamSchedule = {
+  id: string;
+  dateText: string;
+};
+
 type TimeTarget = {
   day: WeekdayName;
   instanceId: string;
@@ -100,7 +105,8 @@ type TimeTarget = {
 
 type DateTarget =
   | { type: "duration"; field: "start" | "end" }
-  | { type: "special"; id: string };
+  | { type: "special"; id: string }
+  | { type: "exam"; id: string };
 
 const TERM_LABEL: Record<AcademicTerm, string> = {
   quarter: "Quarter",
@@ -233,6 +239,30 @@ function getDaysInMonth(year: number, month: number) {
   return new Date(year, month, 0).getDate();
 }
 
+function getExamDefinition(index: number, total: number) {
+  if (total <= 1) {
+    return { title: "Final Exam", subcategory: "final" as const, label: "Final Exam" };
+  }
+
+  if (total === 2) {
+    return index === 0
+      ? { title: "Midterm Exam", subcategory: "midterm" as const, label: "Midterm Exam" }
+      : { title: "Final Exam", subcategory: "final" as const, label: "Final Exam" };
+  }
+
+  if (total === 3) {
+    if (index === 0) return { title: "Prelim Exam", subcategory: "prelim" as const, label: "Prelim Exam" };
+    if (index === 1) return { title: "Midterm Exam", subcategory: "midterm" as const, label: "Midterm Exam" };
+    return { title: "Final Exam", subcategory: "final" as const, label: "Final Exam" };
+  }
+
+  return {
+    title: `Exam ${index + 1}`,
+    subcategory: index === 0 ? ("prelim" as const) : index === total - 1 ? ("final" as const) : ("midterm" as const),
+    label: `Exam ${index + 1}`,
+  };
+}
+
 function makeInstance(room: RoomType = "lecture", start = "8:00 AM", end = "10:00 AM"): ClassInstance {
   return { id: makeId(), room, start, end };
 }
@@ -315,6 +345,7 @@ export default function LessonplanScreen() {
   });
 
   const [specialDates, setSpecialDates] = useState<SpecialDate[]>([{ id: makeId(), dateText: `${nowYear}-06-05`, reason: "" }]);
+  const [examSchedules, setExamSchedules] = useState<ExamSchedule[]>([{ id: makeId(), dateText: "" }]);
 
   const selectedInstitution = useMemo(
     () => institutions.find((item) => item.school_id === selectedInstitutionId) ?? null,
@@ -554,6 +585,15 @@ export default function LessonplanScreen() {
     });
   }, [autoPlanName]);
 
+  useEffect(() => {
+    const examCount = Math.max(1, Number(requirementCounts.exam || "1"));
+    setExamSchedules((prev) => {
+      if (prev.length === examCount) return prev;
+
+      return Array.from({ length: examCount }, (_, index) => prev[index] ?? { id: makeId(), dateText: "" });
+    });
+  }, [requirementCounts.exam]);
+
   const { refreshing, onRefresh } = usePullToRefresh(loadBase);
   const animateIn = () => LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
 
@@ -701,6 +741,10 @@ export default function LessonplanScreen() {
     setSpecialDates((prev) => prev.map((row) => (row.id === id ? { ...row, [field]: value } : row)));
   };
 
+  const setExamScheduleField = (id: string, value: string) => {
+    setExamSchedules((prev) => prev.map((row) => (row.id === id ? { ...row, dateText: value } : row)));
+  };
+
   const removeSpecialDateRow = (id: string) => {
     animateIn();
     setSpecialDates((prev) => prev.filter((row) => row.id !== id));
@@ -727,6 +771,8 @@ export default function LessonplanScreen() {
     if (dateTarget.type === "duration") {
       if (dateTarget.field === "start") setStartDate(iso);
       if (dateTarget.field === "end") setEndDate(iso);
+    } else if (dateTarget.type === "exam") {
+      setExamScheduleField(dateTarget.id, iso);
     } else {
       setSpecialDateField(dateTarget.id, "dateText", iso);
     }
@@ -871,15 +917,16 @@ export default function LessonplanScreen() {
           return a.lesson.sequence_no - b.lesson.sequence_no;
         });
 
+      const defaultLessonSubtype: "lecture" = "lecture";
+
       const lessonRows =
         selectedLessons.length > 0
           ? selectedLessons.map(({ chapter, lesson }, index) => ({
               lesson_plan_id: lessonPlanId,
               lesson_id: lesson.lesson_id,
               entry_type: "planned_item",
-              category: "lesson",
               session_category: "lesson",
-              session_subcategory: null,
+              session_subcategory: defaultLessonSubtype,
               scheduled_date: null,
               is_locked: false,
               title: `Lesson ${index + 1}: ${lesson.title}`,
@@ -892,9 +939,8 @@ export default function LessonplanScreen() {
           : selectedChapters.map((chapter, index) => ({
               lesson_plan_id: lessonPlanId,
               entry_type: "planned_item",
-              category: "lesson",
               session_category: "lesson",
-              session_subcategory: null,
+              session_subcategory: defaultLessonSubtype,
               scheduled_date: null,
               is_locked: false,
               title: `Lesson ${index + 1}: ${chapter.title}`,
@@ -917,7 +963,6 @@ export default function LessonplanScreen() {
               return {
                 lesson_plan_id: lessonPlanId,
                 entry_type: "recurring_class",
-                category: "lesson",
                 day,
                 start_time: parsedStart,
                 end_time: parsedEnd,
@@ -944,7 +989,6 @@ export default function LessonplanScreen() {
         return {
           lesson_plan_id: lessonPlanId,
           entry_type: "planned_item",
-          category: "written_work",
           session_category: "written_work",
           session_subcategory: subtype,
           scheduled_date: null,
@@ -961,7 +1005,6 @@ export default function LessonplanScreen() {
         return {
           lesson_plan_id: lessonPlanId,
           entry_type: "planned_item",
-          category: "performance_task",
           session_category: "performance_task",
           session_subcategory: subtype === "project" ? "project" : "activity",
           scheduled_date: null,
@@ -972,17 +1015,24 @@ export default function LessonplanScreen() {
         };
       });
 
-      const examRows = Array.from({ length: examCount }, (_, index) => ({
-        lesson_plan_id: lessonPlanId,
-        entry_type: "planned_item",
-        category: "exam",
-        session_category: "exam",
-        session_subcategory: examCount === 1 ? "final" : index === 0 ? "prelim" : index === examCount - 1 ? "final" : "midterm",
-        scheduled_date: null,
-        is_locked: false,
-        title: examCount === 1 ? "Final Exam" : `Exam ${index + 1}`,
-        description: null,
-      }));
+      const examRows = Array.from({ length: examCount }, (_, index) => {
+        const examDefinition = getExamDefinition(index, examCount);
+        const rawExamDate = examSchedules[index]?.dateText ?? "";
+        const normalizedExamDate = normalizeDateInput(rawExamDate);
+        const scheduledDate =
+          /^\d{4}-\d{2}-\d{2}$/.test(normalizedExamDate) ? normalizedExamDate : null;
+
+        return {
+          lesson_plan_id: lessonPlanId,
+          entry_type: "planned_item",
+          session_category: "exam",
+          session_subcategory: examDefinition.subcategory,
+          scheduled_date: scheduledDate,
+          is_locked: Boolean(scheduledDate),
+          title: examDefinition.title,
+          description: null,
+        };
+      });
 
       const entryPayload = [...recurringRows, ...lessonRows, ...writtenWorkRows, ...performanceTaskRows, ...examRows];
       if (entryPayload.length > 0) {
@@ -1388,6 +1438,30 @@ export default function LessonplanScreen() {
             );
           })}
         </View>
+
+        {examSchedules.length > 0 ? (
+          <View style={styles.examScheduleWrap}>
+            <Text style={[styles.sectionTitle, { color: c.text }]}>Exam Dates</Text>
+            {examSchedules.map((row, index) => {
+              const examDefinition = getExamDefinition(index, examSchedules.length);
+              return (
+                <View key={row.id} style={styles.specialRow}>
+                  <View style={[styles.examLabelBox, { backgroundColor: filledFieldBg }]}>
+                    <Text style={[styles.examLabelText, { color: filledText }]}>{examDefinition.label}</Text>
+                  </View>
+                  <Pressable
+                    style={[styles.specialDatePill, { backgroundColor: row.dateText ? filledFieldBg : emptyFieldBg }]}
+                    onPress={() => openDatePicker({ type: "exam", id: row.id }, row.dateText)}
+                  >
+                    <Text style={[styles.dateInput, { color: row.dateText ? filledText : emptyText }]}>
+                      {row.dateText ? formatIsoDisplay(row.dateText) : "Optional date"}
+                    </Text>
+                  </Pressable>
+                </View>
+              );
+            })}
+          </View>
+        ) : null}
 
         <View style={styles.divider} />
 
@@ -1919,6 +1993,24 @@ const styles = StyleSheet.create({
     borderRadius: Radius.round,
     borderWidth: 1,
     borderColor: "#D8DDE3",
+  },
+  examScheduleWrap: {
+    gap: 8,
+    marginTop: 10,
+  },
+  examLabelBox: {
+    width: "42%",
+    minHeight: 44,
+    borderWidth: 1,
+    borderColor: "#D8DDE3",
+    borderRadius: Radius.round,
+    justifyContent: "center",
+    paddingHorizontal: 10,
+  },
+  examLabelText: {
+    ...Typography.caption,
+    textAlign: "center",
+    fontWeight: "600",
   },
   extraBox: {
     minHeight: 170,

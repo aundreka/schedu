@@ -1,8 +1,9 @@
+import { Ionicons } from "@expo/vector-icons";
+import { Picker } from "@react-native-picker/picker";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
-  LayoutAnimation,
   Modal,
   Platform,
   Pressable,
@@ -12,16 +13,18 @@ import {
   Text,
   TextInput,
   UIManager,
-  View,
+  View
 } from "react-native";
-import { Ionicons } from "@expo/vector-icons";
-import { Picker } from "@react-native-picker/picker";
-import { PinchGestureHandler, State as GestureState } from "react-native-gesture-handler";
+import { State as GestureState, PinchGestureHandler } from "react-native-gesture-handler";
+import {
+  generateSchedulePlan,
+  type SchedulerDiagnostics,
+  type SchedulerSourceEntry,
+} from "../../../algorithm/oldlessonPlanScheduler";
 import { Radius, Spacing, Typography } from "../../../constants/fonts";
 import { useAppTheme } from "../../../context/theme";
 import { usePullToRefresh } from "../../../hooks/usePullToRefresh";
 import { supabase } from "../../../lib/supabase";
-import { generateSchedulePlan, type SchedulerDiagnostics } from "../../../algorithms/lessonPlanScheduler";
 
 type ZoomLevel = "daily" | "monthly";
 
@@ -135,7 +138,7 @@ const WEEKDAY_INDEX: Record<string, number> = {
 
 const CATEGORY_STYLE: Record<string, { color: string; chipLabel: string }> = {
   lesson: { color: "#7FB6A1", chipLabel: "L" },
-  review: { color: "#67B8C7", chipLabel: "RV" },
+  buffer: { color: "#67B8C7", chipLabel: "BF" },
   written_work: { color: "#8E9AE6", chipLabel: "WW" },
   performance_task: { color: "#CE6E73", chipLabel: "PT" },
   exam: { color: "#D49C49", chipLabel: "EX" },
@@ -184,7 +187,7 @@ function entrySort(a: PlanEntry, b: PlanEntry) {
     lesson: 0,
     written_work: 1,
     performance_task: 2,
-    review: 3,
+    buffer: 3,
     exam: 4,
   };
   const pa = priority[a.category] ?? 99;
@@ -221,12 +224,17 @@ function normalizedEntryTitle(title: string) {
     .toLowerCase();
 }
 
-function entryMeetingTypeKey(entry: PlanEntry) {
-  return entry.meeting_type ?? `${entry.start_time ?? ""}|${entry.end_time ?? ""}`;
-}
-
 function entryChainKey(entry: PlanEntry) {
-  return `${normalizedEntryTitle(entry.title)}|${entryMeetingTypeKey(entry)}`;
+  const stableOriginId =
+    entry.source_plan_entry_id ??
+    entry.original_plan_entry_id ??
+    entry.lesson_id;
+
+  if (stableOriginId) {
+    return `${entry.category}|${stableOriginId}`;
+  }
+
+  return `${entry.category}|${normalizedEntryTitle(entry.title)}`;
 }
 
 function getEditableEntryId(entry: PlanEntry) {
@@ -268,6 +276,7 @@ function defaultSubtypeForCategory(category: string) {
   if (category === "written_work") return "assignment";
   if (category === "performance_task") return "activity";
   if (category === "exam") return "final";
+  if (category === "buffer") return "review";
   return "";
 }
 
@@ -276,7 +285,95 @@ function subtypesForCategory(category: string) {
   if (category === "written_work") return ["assignment", "seatwork", "quiz"];
   if (category === "performance_task") return ["activity", "lab_report", "reporting", "project"];
   if (category === "exam") return ["prelim", "midterm", "final"];
+  if (category === "buffer") return ["review", "preparation", "other"];
   return [];
+}
+
+function normalizeEntryCategory(
+  sessionCategory: string | null | undefined,
+  sessionSubcategory: string | null | undefined
+) {
+  const normalizedCategory = (sessionCategory ?? "").trim().toLowerCase();
+  const normalizedSubcategory = (sessionSubcategory ?? "").trim().toLowerCase();
+
+  if (
+    normalizedCategory === "lesson" ||
+    normalizedCategory === "written_work" ||
+    normalizedCategory === "performance_task" ||
+    normalizedCategory === "exam" ||
+    normalizedCategory === "buffer"
+  ) {
+    return normalizedCategory;
+  }
+
+  if (normalizedSubcategory === "review" || normalizedSubcategory === "preparation") {
+    return "buffer";
+  }
+
+  return "lesson";
+}
+
+function toSchedulerEntry(entry: PlanEntry): SchedulerSourceEntry {
+  const schedulerCategory =
+    entry.category === "buffer" ? "review" : (entry.category as SchedulerSourceEntry["category"]);
+  const schedulerSessionCategory =
+    entry.session_category === "lesson" ||
+    entry.session_category === "written_work" ||
+    entry.session_category === "performance_task" ||
+    entry.session_category === "exam"
+      ? entry.session_category
+      : null;
+  const schedulerSessionSubcategory =
+    entry.session_subcategory === "lecture" ||
+    entry.session_subcategory === "laboratory" ||
+    entry.session_subcategory === "assignment" ||
+    entry.session_subcategory === "seatwork" ||
+    entry.session_subcategory === "quiz" ||
+    entry.session_subcategory === "activity" ||
+    entry.session_subcategory === "lab_report" ||
+    entry.session_subcategory === "reporting" ||
+    entry.session_subcategory === "project" ||
+    entry.session_subcategory === "prelim" ||
+    entry.session_subcategory === "midterm" ||
+    entry.session_subcategory === "final"
+      ? entry.session_subcategory
+      : null;
+  const schedulerWwSubtype =
+    entry.ww_subtype === "assignment" ||
+    entry.ww_subtype === "seatwork" ||
+    entry.ww_subtype === "quiz"
+      ? entry.ww_subtype
+      : null;
+  const schedulerPtSubtype =
+    entry.pt_subtype === "activity" ||
+    entry.pt_subtype === "lab_report" ||
+    entry.pt_subtype === "reporting" ||
+    entry.pt_subtype === "project"
+      ? entry.pt_subtype
+      : null;
+
+  return {
+    ...entry,
+    category: schedulerCategory,
+    meeting_type:
+      entry.meeting_type === "lecture" || entry.meeting_type === "laboratory"
+        ? entry.meeting_type
+        : null,
+    session_category: schedulerSessionCategory,
+    session_subcategory: schedulerSessionSubcategory,
+    ww_subtype: schedulerWwSubtype,
+    pt_subtype: schedulerPtSubtype,
+  };
+}
+
+function fromScheduledEntry(entry: SchedulerSourceEntry): PlanEntry {
+  return {
+    ...entry,
+    category:
+      entry.category === "review"
+        ? "buffer"
+        : normalizeEntryCategory(entry.session_category, entry.session_subcategory),
+  };
 }
 
 function isIsoDate(value: string) {
@@ -397,7 +494,7 @@ export default function CalendarScreen() {
         const { data: entryRows, error: entryError } = await supabase
           .from("plan_entries")
           .select(
-            "plan_entry_id, lesson_plan_id, lesson_id, title, category, description, scheduled_date, start_time, end_time, meeting_type, session_category, session_subcategory, entry_type, day, room, instance_no, is_locked, ww_subtype, pt_subtype, original_plan_entry_id, lesson:lessons(chapter_id, estimated_minutes)"
+            "plan_entry_id, lesson_plan_id, lesson_id, title, description, scheduled_date, start_time, end_time, meeting_type, session_category, session_subcategory, entry_type, day, room, instance_no, is_locked, ww_subtype, pt_subtype, original_plan_entry_id, source_plan_entry_id, lesson:lessons(chapter_id, estimated_minutes)"
           )
           .in("lesson_plan_id", lessonPlanIds)
           .order("scheduled_date", { ascending: true });
@@ -407,19 +504,21 @@ export default function CalendarScreen() {
           const planId = String(row.lesson_plan_id);
           const lessonRaw = row?.lesson;
           const lesson = Array.isArray(lessonRaw) ? lessonRaw[0] : lessonRaw;
+          const sessionCategory = row?.session_category ? String(row.session_category) : null;
+          const sessionSubcategory = row?.session_subcategory ? String(row.session_subcategory) : null;
           const current = entriesMap[planId] ?? [];
           current.push({
             plan_entry_id: String(row.plan_entry_id),
             lesson_plan_id: planId,
             title: String(row.title ?? "Untitled"),
-            category: String(row.category ?? "planned_item"),
+            category: normalizeEntryCategory(sessionCategory, sessionSubcategory),
             description: row?.description ? String(row.description) : null,
             scheduled_date: row?.scheduled_date ? String(row.scheduled_date) : null,
             start_time: row?.start_time ? String(row.start_time) : null,
             end_time: row?.end_time ? String(row.end_time) : null,
             meeting_type: row?.meeting_type ? String(row.meeting_type) : null,
-            session_category: row?.session_category ? String(row.session_category) : null,
-            session_subcategory: row?.session_subcategory ? String(row.session_subcategory) : null,
+            session_category: sessionCategory,
+            session_subcategory: sessionSubcategory,
             entry_type: row?.entry_type ? String(row.entry_type) : null,
             day: row?.day ? String(row.day) : null,
             room: row?.room ? String(row.room) : null,
@@ -432,6 +531,7 @@ export default function CalendarScreen() {
             ww_subtype: row?.ww_subtype ? String(row.ww_subtype) : null,
             pt_subtype: row?.pt_subtype ? String(row.pt_subtype) : null,
             original_plan_entry_id: row?.original_plan_entry_id ? String(row.original_plan_entry_id) : null,
+            source_plan_entry_id: row?.source_plan_entry_id ? String(row.source_plan_entry_id) : null,
           });
           entriesMap[planId] = current;
         }
@@ -512,8 +612,39 @@ export default function CalendarScreen() {
       setBlackoutsByPlan(blackoutMap);
       setSuspendedByPlan(suspendedMap);
 
-      const defaultPlan =
-        mappedPlans.find((plan) => plan.start_date <= today && plan.end_date >= today) ?? mappedPlans[0] ?? null;
+      const currentPlan =
+        mappedPlans.find((plan) => plan.start_date <= today && plan.end_date >= today) ?? null;
+
+      const soonestUpcomingPlan =
+        currentPlan
+          ? null
+          : mappedPlans
+              .map((plan) => {
+                const scheduledEntries = generateSchedulePlan({
+                  lessonPlanId: plan.lesson_plan_id,
+                  startDate: plan.start_date,
+                  endDate: plan.end_date,
+                  entries: (entriesMap[plan.lesson_plan_id] ?? []).map(toSchedulerEntry),
+                  blackoutDates: blackoutMap[plan.lesson_plan_id] ?? [],
+                }).entries;
+
+                const nextDate =
+                  scheduledEntries
+                    .map((entry) => entry.scheduled_date)
+                    .filter((date): date is string => typeof date === "string")
+                    .filter((date) => date >= today)
+                    .sort()[0] ?? null;
+
+                return { plan, nextDate };
+              })
+              .filter((item): item is { plan: LessonPlanOption; nextDate: string } => Boolean(item.nextDate))
+              .sort((a, b) => {
+                const dateCompare = a.nextDate.localeCompare(b.nextDate);
+                if (dateCompare !== 0) return dateCompare;
+                return a.plan.start_date.localeCompare(b.plan.start_date);
+              })[0]?.plan ?? null;
+
+      const defaultPlan = currentPlan ?? soonestUpcomingPlan ?? mappedPlans[0] ?? null;
       const defaultPlanId = defaultPlan?.lesson_plan_id ?? "";
       setSelectedPlanId((prev) => (prev && mappedPlans.some((plan) => plan.lesson_plan_id === prev) ? prev : defaultPlanId));
 
@@ -577,7 +708,7 @@ export default function CalendarScreen() {
   const scheduleResult = useMemo(() => {
     if (!selectedPlan) {
       return {
-        entries: selectedPlanEntries,
+        entries: selectedPlanEntries.map(toSchedulerEntry),
         diagnostics: {
           feasible: true,
           hardViolations: 0,
@@ -591,12 +722,15 @@ export default function CalendarScreen() {
       lessonPlanId: selectedPlan.lesson_plan_id,
       startDate: selectedPlan.start_date,
       endDate: selectedPlan.end_date,
-      entries: selectedPlanEntries,
+      entries: selectedPlanEntries.map(toSchedulerEntry),
       blackoutDates: blackoutsByPlan[selectedPlan.lesson_plan_id] ?? [],
     });
   }, [selectedPlan, selectedPlanEntries, blackoutsByPlan]);
 
-  const displayEntries = scheduleResult.entries;
+  const displayEntries = useMemo(
+    () => scheduleResult.entries.map(fromScheduledEntry),
+    [scheduleResult.entries]
+  );
 
   const entriesByDate = useMemo(() => {
     const map: Record<string, PlanEntry[]> = {};
@@ -617,6 +751,7 @@ export default function CalendarScreen() {
 
   useEffect(() => {
     if (!selectedPlan) return;
+    if (zoomLevel !== "monthly") return;
     if (selectedDate < selectedPlan.start_date) {
       setSelectedDate(selectedPlan.start_date);
       setCurrentMonthDate(startOfMonth(selectedPlan.start_date));
@@ -626,7 +761,7 @@ export default function CalendarScreen() {
       setSelectedDate(selectedPlan.end_date);
       setCurrentMonthDate(startOfMonth(selectedPlan.end_date));
     }
-  }, [selectedPlan, selectedDate]);
+  }, [selectedPlan, selectedDate, zoomLevel]);
 
   const allPlansDailyEntries = useMemo<DailyTimelineEntry[]>(() => {
     const rows: DailyTimelineEntry[] = [];
@@ -636,9 +771,9 @@ export default function CalendarScreen() {
         lessonPlanId: plan.lesson_plan_id,
         startDate: plan.start_date,
         endDate: plan.end_date,
-        entries: planEntries,
+        entries: planEntries.map(toSchedulerEntry),
         blackoutDates: blackoutsByPlan[plan.lesson_plan_id] ?? [],
-      }).entries;
+      }).entries.map(fromScheduledEntry);
       for (const entry of scheduled) {
         if (entry.scheduled_date !== selectedDate) continue;
         rows.push({
@@ -763,7 +898,7 @@ export default function CalendarScreen() {
       lesson: 0,
       written_work: 1,
       performance_task: 2,
-      review: 3,
+      buffer: 3,
       exam: 4,
     };
 
@@ -841,6 +976,8 @@ export default function CalendarScreen() {
           ? (entry.pt_subtype ?? inferPerformanceTaskSubtype(entry.title, entry.description ?? null))
           : entry.category === "exam"
             ? inferExamSubtype(entry.title, entry.description ?? null)
+            : entry.category === "buffer"
+              ? "review"
             : entry.category === "lesson"
               ? (entry.meeting_type ?? "lecture")
               : "");
@@ -944,7 +1081,7 @@ export default function CalendarScreen() {
     const wwSubtype = entryEditor.category === "written_work" ? selectedSubtype : null;
     const ptSubtype = entryEditor.category === "performance_task" ? selectedSubtype : null;
     const meetingType = entryEditor.category === "lesson" ? selectedSubtype : null;
-    const sessionCategory = ["lesson", "written_work", "performance_task", "exam"].includes(entryEditor.category)
+    const sessionCategory = ["lesson", "written_work", "performance_task", "exam", "buffer"].includes(entryEditor.category)
       ? entryEditor.category
       : null;
     const sessionSubcategory = allowedSubtypes.length > 0 ? selectedSubtype : null;
@@ -962,7 +1099,6 @@ export default function CalendarScreen() {
           return {
             lesson_plan_id: selectedPlan.lesson_plan_id,
             entry_type: date === startDate ? "planned_item" : "moved_item",
-            category: entryEditor.category,
             scheduled_date: date,
             title,
             description: entryEditor.description.trim() || null,
@@ -989,10 +1125,11 @@ export default function CalendarScreen() {
                 reviewRows.push({
                   lesson_plan_id: selectedPlan.lesson_plan_id,
                   entry_type: "planned_item",
-                  category: "review",
                   scheduled_date: cursor,
                   title: `Review: ${title}`,
                   description: `${entryEditor.category === "exam" ? "Exam" : "Performance task"} preparation`,
+                  session_category: "buffer",
+                  session_subcategory: "review",
                   is_locked: true,
                 });
               }
@@ -1018,7 +1155,6 @@ export default function CalendarScreen() {
           .from("plan_entries")
           .update({
             title,
-            category: entryEditor.category,
             description: entryEditor.description.trim() || null,
             start_time: resolveEditorTimesForDate(startDate, selectedMeetingType, startTime, endTime).start,
             end_time: resolveEditorTimesForDate(startDate, selectedMeetingType, startTime, endTime).end,
@@ -1039,7 +1175,6 @@ export default function CalendarScreen() {
           return {
             lesson_plan_id: selectedPlan.lesson_plan_id,
             entry_type: "moved_item",
-            category: entryEditor.category,
             scheduled_date: date,
             title,
             description: entryEditor.description.trim() || null,
@@ -1570,7 +1705,7 @@ export default function CalendarScreen() {
               <View style={styles.editorSection}>
                 <Text style={[styles.entryFieldLabel, { color: c.mutedText }]}>Category</Text>
                 <View style={styles.entryCategoryRow}>
-                  {["lesson", "review", "written_work", "performance_task", "exam"].map((category) => (
+                  {["lesson", "buffer", "written_work", "performance_task", "exam"].map((category) => (
                     <Pressable
                       key={category}
                       style={[

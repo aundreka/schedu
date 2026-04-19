@@ -14,16 +14,6 @@ begin
     create type public.academic_term as enum ('quarter', 'trimester', 'semester');
   end if;
 
-  if not exists (select 1 from pg_type where typname = 'plan_item_category') then
-    create type public.plan_item_category as enum (
-      'lesson',
-      'review',
-      'written_work',
-      'performance_task',
-      'exam'
-    );
-  end if;
-
   if not exists (select 1 from pg_type where typname = 'room_type') then
     create type public.room_type as enum ('lecture', 'laboratory');
   end if;
@@ -37,7 +27,8 @@ begin
       'lesson',
       'written_work',
       'performance_task',
-      'exam'
+      'exam',
+      'buffer'
     );
   end if;
 
@@ -54,7 +45,10 @@ begin
       'project',
       'prelim',
       'midterm',
-      'final'
+      'final',
+      'review',
+      'preparation',
+      'other'
     );
   end if;
 

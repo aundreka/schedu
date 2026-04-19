@@ -167,6 +167,30 @@ function inferPerformanceTaskSubtype(title: string, description: string | null) 
   return "activity";
 }
 
+function normalizeEntryCategory(
+  sessionCategory: string | null | undefined,
+  sessionSubcategory: string | null | undefined
+) {
+  const normalizedCategory = (sessionCategory ?? "").trim().toLowerCase();
+  const normalizedSubcategory = (sessionSubcategory ?? "").trim().toLowerCase();
+
+  if (
+    normalizedCategory === "lesson" ||
+    normalizedCategory === "written_work" ||
+    normalizedCategory === "performance_task" ||
+    normalizedCategory === "exam" ||
+    normalizedCategory === "buffer"
+  ) {
+    return normalizedCategory;
+  }
+
+  if (normalizedSubcategory === "review" || normalizedSubcategory === "preparation") {
+    return "buffer";
+  }
+
+  return "lesson";
+}
+
 function mapPlanDetail(row: any): PlanDetail | null {
   const subjectRaw = row?.subject;
   const subject = Array.isArray(subjectRaw) ? subjectRaw[0] : subjectRaw;
@@ -207,7 +231,9 @@ function mapPlanEntry(row: any): PlanEntryItem | null {
   const lesson = Array.isArray(lessonRaw) ? lessonRaw[0] : lessonRaw;
   const planEntryId = String(row?.plan_entry_id ?? "");
   const title = String(row?.title ?? "");
-  const category = String(row?.category ?? "planned_item");
+  const sessionCategory = row?.session_category ? String(row.session_category) : null;
+  const sessionSubcategory = row?.session_subcategory ? String(row.session_subcategory) : null;
+  const category = normalizeEntryCategory(sessionCategory, sessionSubcategory);
   const entryType = String(row?.entry_type ?? "planned_item");
 
   if (!planEntryId || !title) return null;
@@ -222,8 +248,8 @@ function mapPlanEntry(row: any): PlanEntryItem | null {
     start_time: row?.start_time ? String(row.start_time) : null,
     end_time: row?.end_time ? String(row.end_time) : null,
     meeting_type: row?.meeting_type ? String(row.meeting_type) : null,
-    session_category: row?.session_category ? String(row.session_category) : null,
-    session_subcategory: row?.session_subcategory ? String(row.session_subcategory) : null,
+    session_category: sessionCategory,
+    session_subcategory: sessionSubcategory,
     room: row?.room ? String(row.room) : null,
     instance_no: typeof row?.instance_no === "number" ? Number(row.instance_no) : null,
     description: row?.description ? String(row.description) : null,
@@ -291,7 +317,7 @@ export default function PlanDetailScreen() {
       const { data: entryRows, error: entriesError } = await supabase
         .from("plan_entries")
         .select(
-          "plan_entry_id, title, category, entry_type, day, scheduled_date, start_time, end_time, meeting_type, session_category, session_subcategory, room, instance_no, description, ww_subtype, pt_subtype, lesson:lessons(title)"
+          "plan_entry_id, title, entry_type, day, scheduled_date, start_time, end_time, meeting_type, session_category, session_subcategory, room, instance_no, description, ww_subtype, pt_subtype, lesson:lessons(title)"
         )
         .eq("lesson_plan_id", mappedPlan.lesson_plan_id)
         .order("scheduled_date", { ascending: true })
@@ -399,10 +425,6 @@ export default function PlanDetailScreen() {
         Alert.alert("Entry title required", "Every plan entry must have a title.");
         return;
       }
-      if (!category) {
-        Alert.alert("Entry category required", "Every plan entry must have a category.");
-        return;
-      }
       if (scheduledDate && !isIsoDate(scheduledDate)) {
         Alert.alert("Invalid entry date", "Planned entry dates must use YYYY-MM-DD.");
         return;
@@ -429,13 +451,13 @@ export default function PlanDetailScreen() {
       normalizedEntries.push({
         ...entry,
         title: entryTitle,
-        category,
+        category: category || "lesson",
         day: day || null,
         meeting_type: entry.entry_type === "recurring_class" ? (room || null) : entry.meeting_type ?? null,
         session_category:
           entry.entry_type === "recurring_class"
             ? "lesson"
-            : ["lesson", "written_work", "performance_task", "exam"].includes(category)
+            : ["lesson", "written_work", "performance_task", "exam", "buffer"].includes(category)
               ? category
               : null,
         session_subcategory:
@@ -485,7 +507,6 @@ export default function PlanDetailScreen() {
 
         const payload = {
           title: entry.title,
-          category: entry.category,
           day: entry.day,
           scheduled_date: entry.scheduled_date,
           start_time: entry.start_time,
