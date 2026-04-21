@@ -13,7 +13,7 @@ export default function CreateLayout() {
       <Stack.Screen name="index" />
       <Stack.Screen name="lessonplan" />
       <Stack.Screen name="subject" />
-      <Stack.Screen name="notes" />
+      <Stack.Screen name="lesson" />
       <Stack.Screen name="activities" />
     </Stack>
   );

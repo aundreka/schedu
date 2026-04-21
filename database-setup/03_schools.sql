@@ -6,7 +6,7 @@ create table if not exists public.schools (
   school_id uuid primary key default gen_random_uuid(),
   public_id text not null unique default ('sch_' || replace(gen_random_uuid()::text, '-', '')),
   name text not null,
-  type public.school_type not null,
+  type public.school_type not null default 'university',
   avatar_url text,
   avatar_color text not null default '#22C55E',
   is_default boolean not null default false,

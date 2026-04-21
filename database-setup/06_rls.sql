@@ -15,9 +15,10 @@ alter table public.user_subjects enable row level security;
 alter table public.chapters enable row level security;
 alter table public.lessons enable row level security;
 alter table public.lesson_plans enable row level security;
-alter table public.plan_entries enable row level security;
+alter table public.slots enable row level security;
+alter table public.blocks enable row level security;
 alter table public.school_calendar_events enable row level security;
-alter table public.teacher_absences enable row level security;
+alter table public.delays enable row level security;
 
 -- schools
 drop policy if exists "users can read member schools" on public.schools;
@@ -276,27 +277,27 @@ on public.lesson_plans for all
 using (auth.uid() = user_id)
 with check (auth.uid() = user_id);
 
--- plan_entries
-drop policy if exists "users can read entries from own lesson plans" on public.plan_entries;
-create policy "users can read entries from own lesson plans"
-on public.plan_entries for select
+-- slots
+drop policy if exists "users can read slots from own lesson plans" on public.slots;
+create policy "users can read slots from own lesson plans"
+on public.slots for select
 using (
   exists (
     select 1
     from public.lesson_plans lp
-    where lp.lesson_plan_id = plan_entries.lesson_plan_id
+    where lp.lesson_plan_id = slots.lesson_plan_id
       and lp.user_id = auth.uid()
   )
 );
 
-drop policy if exists "users can manage entries from own lesson plans" on public.plan_entries;
-create policy "users can manage entries from own lesson plans"
-on public.plan_entries for all
+drop policy if exists "users can manage slots from own lesson plans" on public.slots;
+create policy "users can manage slots from own lesson plans"
+on public.slots for all
 using (
   exists (
     select 1
     from public.lesson_plans lp
-    where lp.lesson_plan_id = plan_entries.lesson_plan_id
+    where lp.lesson_plan_id = slots.lesson_plan_id
       and lp.user_id = auth.uid()
   )
 )
@@ -304,7 +305,40 @@ with check (
   exists (
     select 1
     from public.lesson_plans lp
-    where lp.lesson_plan_id = plan_entries.lesson_plan_id
+    where lp.lesson_plan_id = slots.lesson_plan_id
+      and lp.user_id = auth.uid()
+  )
+);
+
+-- blocks
+drop policy if exists "users can read blocks from own lesson plans" on public.blocks;
+create policy "users can read blocks from own lesson plans"
+on public.blocks for select
+using (
+  exists (
+    select 1
+    from public.lesson_plans lp
+    where lp.lesson_plan_id = blocks.lesson_plan_id
+      and lp.user_id = auth.uid()
+  )
+);
+
+drop policy if exists "users can manage blocks from own lesson plans" on public.blocks;
+create policy "users can manage blocks from own lesson plans"
+on public.blocks for all
+using (
+  exists (
+    select 1
+    from public.lesson_plans lp
+    where lp.lesson_plan_id = blocks.lesson_plan_id
+      and lp.user_id = auth.uid()
+  )
+)
+with check (
+  exists (
+    select 1
+    from public.lesson_plans lp
+    where lp.lesson_plan_id = blocks.lesson_plan_id
       and lp.user_id = auth.uid()
   )
 );
@@ -342,14 +376,14 @@ with check (
   )
 );
 
--- teacher_absences
-drop policy if exists "users can read own absences" on public.teacher_absences;
+-- delays
+drop policy if exists "users can read own absences" on public.delays;
 create policy "users can read own absences"
-on public.teacher_absences for select
+on public.delays for select
 using (auth.uid() = user_id);
 
-drop policy if exists "users can manage own absences" on public.teacher_absences;
+drop policy if exists "users can manage own absences" on public.delays;
 create policy "users can manage own absences"
-on public.teacher_absences for all
+on public.delays for all
 using (auth.uid() = user_id)
 with check (auth.uid() = user_id);

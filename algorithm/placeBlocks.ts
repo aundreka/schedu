@@ -17,6 +17,31 @@ export type PlaceBlocksResult = {
   validationIssues: ValidationIssue[];
 };
 
+function seedExistingPlacements(
+  slots: SessionSlot[]
+): {
+  placementsByBlockId: Map<string, Placement[]>;
+  placedBlockIds: Set<string>;
+} {
+  const placementsByBlockId = new Map<string, Placement[]>();
+  const placedBlockIds = new Set<string>();
+
+  for (const slot of slots) {
+    for (const placement of slot.placements) {
+      const existing = placementsByBlockId.get(placement.blockId) ?? [];
+      existing.push(placement);
+      placementsByBlockId.set(placement.blockId, existing);
+      placedBlockIds.add(placement.blockId);
+    }
+  }
+
+  for (const placements of placementsByBlockId.values()) {
+    finalizePlacementChain(placements);
+  }
+
+  return { placementsByBlockId, placedBlockIds };
+}
+
 function cloneSlots(slots: SessionSlot[]): SessionSlot[] {
   return slots.map((slot) => ({
     ...slot,
@@ -489,12 +514,17 @@ export function placeBlocks(input: PlaceBlocksInput): PlaceBlocksResult {
     preferLessonWrittenWorkOverlay: input.teacherRules?.preferLessonWrittenWorkOverlay ?? true,
   };
 
-  const placementsByBlockId = new Map<string, Placement[]>();
-  const placedBlockIds = new Set<string>();
+  const seeded = seedExistingPlacements(slots);
+  const placementsByBlockId = seeded.placementsByBlockId;
+  const placedBlockIds = seeded.placedBlockIds;
   const validationIssues: ValidationIssue[] = [...input.pacingPlan.validationIssues];
 
-  const pendingMajorBlocks = [...input.pacingPlan.majorBlockOrder.filter(isMajorBlock)];
-  const pendingMinorBlocks = input.blocks.filter((block) => !isMajorBlock(block));
+  const pendingMajorBlocks = input.pacingPlan.majorBlockOrder.filter(
+    (block) => isMajorBlock(block) && !placedBlockIds.has(block.id)
+  );
+  const pendingMinorBlocks = input.blocks.filter(
+    (block) => !isMajorBlock(block) && !placedBlockIds.has(block.id)
+  );
   let progressMade = true;
 
   while ((pendingMajorBlocks.length > 0 || pendingMinorBlocks.length > 0) && progressMade) {

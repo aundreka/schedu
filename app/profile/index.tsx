@@ -46,12 +46,7 @@ type PickedImage = {
   name: string;
   mimeType: string;
 };
-
-const SCHOOL_TYPES: { label: string; value: SchoolType }[] = [
-  { label: "University", value: "university" },
-  { label: "Basic Education", value: "basic_ed" },
-  { label: "Training Center", value: "training_center" },
-];
+const DEFAULT_SCHOOL_TYPE: SchoolType = "university";
 
 const AVATAR_COLORS = [
   "#22C55E",
@@ -130,7 +125,6 @@ export default function Profile() {
 
   const [showInstitutionModal, setShowInstitutionModal] = useState(false);
   const [institutionName, setInstitutionName] = useState("");
-  const [institutionType, setInstitutionType] = useState<SchoolType>("basic_ed");
   const [avatarColor, setAvatarColor] = useState<string>(AVATAR_COLORS[0]);
   const [pickedAvatar, setPickedAvatar] = useState<PickedImage | null>(null);
 
@@ -274,7 +268,6 @@ export default function Profile() {
 
   const resetInstitutionForm = () => {
     setInstitutionName("");
-    setInstitutionType("basic_ed");
     setAvatarColor(AVATAR_COLORS[0]);
     setPickedAvatar(null);
   };
@@ -320,7 +313,7 @@ export default function Profile() {
       const { error: schoolError } = await supabase.from("schools").insert({
         school_id: schoolId,
         name,
-        type: institutionType,
+        type: DEFAULT_SCHOOL_TYPE,
         created_by: userId,
         is_default: false,
         avatar_color: avatarColor,
@@ -664,30 +657,6 @@ export default function Profile() {
               ]}
             />
 
-            <Text style={[styles.inputLabel, { color: c.mutedText }]}>Institution Type</Text>
-            <View style={styles.inlineOptionWrap}>
-              {SCHOOL_TYPES.map((opt) => {
-                const selected = opt.value === institutionType;
-                return (
-                  <Pressable
-                    key={opt.value}
-                    onPress={() => setInstitutionType(opt.value)}
-                    style={[
-                      styles.inlineOption,
-                      {
-                        borderColor: selected ? c.tint : c.border,
-                        backgroundColor: selected ? `${c.tint}22` : c.card,
-                      },
-                    ]}
-                  >
-                    <Text style={[styles.inlineOptionText, { color: selected ? c.tint : c.text }]}>
-                      {opt.label}
-                    </Text>
-                  </Pressable>
-                );
-              })}
-            </View>
-
             <Text style={[styles.inputLabel, { color: c.mutedText }]}>Color</Text>
             <View style={styles.colorRow}>
               {AVATAR_COLORS.map((color) => (
@@ -925,14 +894,6 @@ const styles = StyleSheet.create({
     paddingVertical: 11,
     fontSize: 14,
   },
-  inlineOptionWrap: { flexDirection: "row", gap: 8, flexWrap: "wrap" },
-  inlineOption: {
-    borderWidth: 1,
-    borderRadius: 999,
-    paddingHorizontal: 10,
-    paddingVertical: 7,
-  },
-  inlineOptionText: { fontSize: 12, fontWeight: "600" },
 
   colorRow: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
   colorDot: {

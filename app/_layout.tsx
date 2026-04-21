@@ -1,9 +1,11 @@
-﻿import { Stack } from "expo-router";
+import { Stack, router, useRootNavigationState, useSegments } from "expo-router";
 import { Image, StyleSheet, Text, View } from "react-native";
 import { ThemeProvider as NavThemeProvider, DarkTheme, DefaultTheme } from "@react-navigation/native";
 import { StatusBar } from "expo-status-bar";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
+import { useEffect } from "react";
 import { ThemeProvider, useAppTheme } from "../context/theme";
+import { supabase } from "../lib/supabase";
 
 function BrandTitle({
   mutedText,
@@ -25,6 +27,35 @@ function BrandTitle({
 
 function AppNav() {
   const { scheme, colors: c } = useAppTheme();
+  const segments = useSegments();
+  const navigationState = useRootNavigationState();
+  const isAuthRoute = segments[0] === "(auth)";
+
+  useEffect(() => {
+    if (!navigationState?.key) return;
+
+    let active = true;
+
+    const redirectToAuthIfMissing = (hasSession: boolean) => {
+      if (!active || hasSession || isAuthRoute) return;
+      router.replace("/(auth)");
+    };
+
+    void supabase.auth.getSession().then(({ data: { session } }) => {
+      redirectToAuthIfMissing(!!session);
+    });
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      redirectToAuthIfMissing(!!session);
+    });
+
+    return () => {
+      active = false;
+      subscription.unsubscribe();
+    };
+  }, [isAuthRoute, navigationState?.key]);
 
   return (
     <NavThemeProvider value={scheme === "dark" ? DarkTheme : DefaultTheme}>

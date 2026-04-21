@@ -14,7 +14,7 @@ import {
 import * as ImagePicker from "expo-image-picker";
 import * as FileSystem from "expo-file-system/legacy";
 import { Ionicons } from "@expo/vector-icons";
-import { router, useLocalSearchParams } from "expo-router";
+import { router, useFocusEffect, useLocalSearchParams } from "expo-router";
 import { Radius, Spacing, Typography } from "../../../constants/fonts";
 import { useAppTheme } from "../../../context/theme";
 import { usePullToRefresh } from "../../../hooks/usePullToRefresh";
@@ -74,8 +74,7 @@ type UnitGroup = {
 type StructureEditorMode =
   | { type: "unit"; unitId: string }
   | { type: "chapter"; chapterId: string }
-  | { type: "lesson"; lessonId: string }
-  | { type: "add_lesson"; chapterId: string };
+  | { type: "lesson"; lessonId: string };
 
 function toLocalDateString(date = new Date()) {
   const y = date.getFullYear();
@@ -164,12 +163,17 @@ function normalizeSubjectRow(row: any): SubjectDetail | null {
 
 export default function SubjectDetailScreen() {
   const { colors: c, scheme } = useAppTheme();
-  const params = useLocalSearchParams<{ subjectId?: string | string[] }>();
+  const params = useLocalSearchParams<{ subjectId?: string | string[]; openChapterId?: string | string[] }>();
   const subjectId = useMemo(() => {
     const raw = params.subjectId;
     if (!raw) return "";
     return Array.isArray(raw) ? String(raw[0] ?? "") : String(raw);
   }, [params.subjectId]);
+  const openChapterId = useMemo(() => {
+    const raw = params.openChapterId;
+    if (!raw) return "";
+    return Array.isArray(raw) ? String(raw[0] ?? "") : String(raw);
+  }, [params.openChapterId]);
 
   const [loading, setLoading] = useState(true);
   const [subject, setSubject] = useState<SubjectDetail | null>(null);
@@ -191,6 +195,7 @@ export default function SubjectDetailScreen() {
   const [openLessonMenuId, setOpenLessonMenuId] = useState<string | null>(null);
   const [structureEditorMode, setStructureEditorMode] = useState<StructureEditorMode | null>(null);
   const [structureEditTitle, setStructureEditTitle] = useState("");
+  const [structureEditSequence, setStructureEditSequence] = useState("");
   const [savingStructureEdit, setSavingStructureEdit] = useState(false);
 
   const loadSubjectDetail = useCallback(async () => {
@@ -304,17 +309,17 @@ export default function SubjectDetailScreen() {
 
       if (selectedPlan?.lesson_plan_id) {
         const { data: entryRows, error: entriesError } = await supabase
-          .from("plan_entries")
-          .select("plan_entry_id, category, title")
+          .from("blocks")
+          .select("block_id, session_category, title")
           .eq("lesson_plan_id", selectedPlan.lesson_plan_id)
-          .in("category", ["written_work", "performance_task"])
+          .in("session_category", ["written_work", "performance_task"])
           .order("created_at", { ascending: true });
         if (entriesError) throw entriesError;
 
         for (const row of entryRows ?? []) {
-          const category = String(row.category) as PlanEntryCategory;
+          const category = String(row.session_category) as PlanEntryCategory;
           const item: PlanItem = {
-            plan_entry_id: String(row.plan_entry_id),
+            plan_entry_id: String(row.block_id),
             category,
             title: String(row.title ?? "Untitled"),
           };
@@ -325,7 +330,11 @@ export default function SubjectDetailScreen() {
 
       setSubject(normalizedSubject);
       setChapters(chapterBase);
-      setOpenChapters(new Set(chapterBase[0] ? [chapterBase[0].chapter_id] : []));
+      const chapterToOpen =
+        (openChapterId && chapterBase.some((chapter) => chapter.chapter_id === openChapterId) && openChapterId) ||
+        chapterBase[0]?.chapter_id ||
+        "";
+      setOpenChapters(chapterToOpen ? new Set([chapterToOpen]) : new Set());
       setWrittenWorks(written);
       setPerformanceTasks(performance);
       setOpenUnitMenuId(null);
@@ -333,6 +342,7 @@ export default function SubjectDetailScreen() {
       setOpenLessonMenuId(null);
       setStructureEditorMode(null);
       setStructureEditTitle("");
+      setStructureEditSequence("");
       setShowSubjectMenu(false);
     } catch {
       setSubject(null);
@@ -350,11 +360,13 @@ export default function SubjectDetailScreen() {
     } finally {
       setLoading(false);
     }
-  }, [subjectId]);
+  }, [openChapterId, subjectId]);
 
-  useEffect(() => {
-    loadSubjectDetail();
-  }, [loadSubjectDetail]);
+  useFocusEffect(
+    useCallback(() => {
+      loadSubjectDetail();
+    }, [loadSubjectDetail])
+  );
 
   const { refreshing, onRefresh } = usePullToRefresh(loadSubjectDetail);
 
@@ -398,6 +410,51 @@ export default function SubjectDetailScreen() {
     });
   }, [chapters]);
 
+  const goToCreateLesson = (options?: { chapterId?: string; chapterNumber?: number; lessonNumber?: number }) => {
+    setShowSubjectMenu(false);
+    setOpenUnitMenuId(null);
+    setOpenChapterMenuId(null);
+    setOpenLessonMenuId(null);
+    router.push({
+      pathname: "/create/lesson",
+      params: subjectId
+        ? {
+            subjectId,
+            ...(options?.chapterId ? { chapterId: options.chapterId } : {}),
+            ...(typeof options?.chapterNumber === "number"
+              ? { chapterNumber: String(options.chapterNumber) }
+              : {}),
+            ...(typeof options?.lessonNumber === "number" ? { lessonNumber: String(options.lessonNumber) } : {}),
+          }
+        : undefined,
+    });
+  };
+
+  const goToCreateActivity = () => {
+    router.push("/create/activities");
+  };
+
+  const goToLessonDetail = (lessonId: string) => {
+    router.push({
+      pathname: "/library/lesson_detail",
+      params: { lessonId, subjectId },
+    });
+  };
+
+  const goToWrittenWorkDetail = (planEntryId: string) => {
+    router.push({
+      pathname: "/library/ww_detail",
+      params: { planEntryId, subjectId },
+    });
+  };
+
+  const goToPerformanceTaskDetail = (planEntryId: string) => {
+    router.push({
+      pathname: "/library/pt_detail",
+      params: { planEntryId, subjectId },
+    });
+  };
+
   const toggleChapter = (chapterId: string) => {
     setShowSubjectMenu(false);
     setOpenUnitMenuId(null);
@@ -434,9 +491,10 @@ export default function SubjectDetailScreen() {
     setOpenUnitMenuId(null);
     setStructureEditorMode({ type: "unit", unitId });
     setStructureEditTitle((currentTitle ?? "").trim());
+    setStructureEditSequence("");
   };
 
-  const startChapterEdit = (chapterId: string, currentTitle: string) => {
+  const startChapterEdit = (chapterId: string, currentTitle: string, currentSequence: number) => {
     setShowEditForm(false);
     setShowSubjectMenu(false);
     setOpenUnitMenuId(null);
@@ -444,9 +502,10 @@ export default function SubjectDetailScreen() {
     setOpenChapterMenuId(null);
     setStructureEditorMode({ type: "chapter", chapterId });
     setStructureEditTitle(currentTitle.trim());
+    setStructureEditSequence(String(currentSequence));
   };
 
-  const startLessonEdit = (lessonId: string, currentTitle: string) => {
+  const startLessonEdit = (lessonId: string, currentTitle: string, currentSequence: number) => {
     setShowEditForm(false);
     setShowSubjectMenu(false);
     setOpenUnitMenuId(null);
@@ -454,26 +513,13 @@ export default function SubjectDetailScreen() {
     setOpenLessonMenuId(null);
     setStructureEditorMode({ type: "lesson", lessonId });
     setStructureEditTitle(currentTitle.trim());
-  };
-
-  const startAddLesson = (chapterId: string) => {
-    setShowEditForm(false);
-    setShowSubjectMenu(false);
-    setOpenUnitMenuId(null);
-    setOpenChapterMenuId(null);
-    setOpenLessonMenuId(null);
-    setStructureEditorMode({ type: "add_lesson", chapterId });
-    setStructureEditTitle("");
-    setOpenChapters((current) => {
-      const next = new Set(current);
-      next.add(chapterId);
-      return next;
-    });
+    setStructureEditSequence(String(currentSequence));
   };
 
   const cancelStructureEdit = () => {
     setStructureEditorMode(null);
     setStructureEditTitle("");
+    setStructureEditSequence("");
     setSavingStructureEdit(false);
   };
 
@@ -485,6 +531,8 @@ export default function SubjectDetailScreen() {
       return;
     }
 
+    const normalizedSequence = Number.parseInt(structureEditSequence.trim(), 10);
+
     setSavingStructureEdit(true);
     try {
       if (structureEditorMode.type === "unit") {
@@ -495,27 +543,27 @@ export default function SubjectDetailScreen() {
           .eq("subject_id", subject.subject_id);
         if (error) throw error;
       } else if (structureEditorMode.type === "chapter") {
+        if (!Number.isFinite(normalizedSequence) || normalizedSequence <= 0) {
+          Alert.alert("Invalid chapter number", "Please enter a valid chapter number.");
+          return;
+        }
+
         const { error } = await supabase
           .from("chapters")
-          .update({ title: normalizedTitle })
+          .update({ title: normalizedTitle, sequence_no: normalizedSequence })
           .eq("chapter_id", structureEditorMode.chapterId)
           .eq("subject_id", subject.subject_id);
         if (error) throw error;
       } else if (structureEditorMode.type === "lesson") {
+        if (!Number.isFinite(normalizedSequence) || normalizedSequence <= 0) {
+          Alert.alert("Invalid lesson number", "Please enter a valid lesson number.");
+          return;
+        }
+
         const { error } = await supabase
           .from("lessons")
-          .update({ title: normalizedTitle })
+          .update({ title: normalizedTitle, sequence_no: normalizedSequence })
           .eq("lesson_id", structureEditorMode.lessonId);
-        if (error) throw error;
-      } else {
-        const chapter = chapters.find((item) => item.chapter_id === structureEditorMode.chapterId);
-        const nextSequence =
-          (chapter?.lessons ?? []).reduce((maxValue, lesson) => Math.max(maxValue, lesson.sequence_no), 0) + 1;
-        const { error } = await supabase.from("lessons").insert({
-          chapter_id: structureEditorMode.chapterId,
-          title: normalizedTitle,
-          sequence_no: nextSequence,
-        });
         if (error) throw error;
       }
 
@@ -563,9 +611,6 @@ export default function SubjectDetailScreen() {
             const { error } = await supabase.from("chapters").delete().eq("chapter_id", chapterId);
             if (error) throw error;
             if (structureEditorMode?.type === "chapter" && structureEditorMode.chapterId === chapterId) {
-              cancelStructureEdit();
-            }
-            if (structureEditorMode?.type === "add_lesson" && structureEditorMode.chapterId === chapterId) {
               cancelStructureEdit();
             }
             await loadSubjectDetail();
@@ -877,26 +922,35 @@ export default function SubjectDetailScreen() {
               {structureEditorMode.type === "unit"
                 ? "Edit unit name"
                 : structureEditorMode.type === "chapter"
-                  ? "Edit chapter name"
-                  : structureEditorMode.type === "lesson"
-                    ? "Edit lesson name"
-                    : "Add new lesson"}
+                  ? "Edit chapter"
+                  : "Edit lesson"}
             </Text>
             <TextInput
               value={structureEditTitle}
               onChangeText={setStructureEditTitle}
               placeholder={
-                structureEditorMode.type === "add_lesson"
-                  ? "Lesson title"
-                  : structureEditorMode.type === "unit"
-                    ? "Unit title"
-                    : structureEditorMode.type === "chapter"
-                      ? "Chapter title"
-                      : "Lesson title"
+                structureEditorMode.type === "unit"
+                  ? "Unit title"
+                  : structureEditorMode.type === "chapter"
+                    ? "Chapter title"
+                    : "Lesson title"
               }
               placeholderTextColor={c.mutedText}
               style={[styles.editInput, { color: c.text, borderColor: c.border, backgroundColor: c.background }]}
             />
+            {structureEditorMode.type === "chapter" || structureEditorMode.type === "lesson" ? (
+              <TextInput
+                value={structureEditSequence}
+                onChangeText={setStructureEditSequence}
+                placeholder={structureEditorMode.type === "chapter" ? "Chapter number" : "Lesson number"}
+                placeholderTextColor={c.mutedText}
+                keyboardType="number-pad"
+                style={[
+                  styles.editInput,
+                  { color: c.text, borderColor: c.border, backgroundColor: c.background },
+                ]}
+              />
+            ) : null}
 
             <View style={styles.editFooter}>
               <Pressable
@@ -919,11 +973,7 @@ export default function SubjectDetailScreen() {
                 style={[styles.saveBtn, { backgroundColor: c.text, opacity: savingStructureEdit ? 0.6 : 1 }]}
               >
                 <Text style={[styles.saveBtnText, { color: pageBg }]}>
-                  {savingStructureEdit
-                    ? "Saving..."
-                    : structureEditorMode.type === "add_lesson"
-                      ? "Add Lesson"
-                      : "Save Changes"}
+                  {savingStructureEdit ? "Saving..." : "Save Changes"}
                 </Text>
               </Pressable>
             </View>
@@ -940,6 +990,16 @@ export default function SubjectDetailScreen() {
             </View>
           )}
         </View>
+
+        {chapters.length === 0 ? (
+          <Pressable
+            style={[styles.addLessonButton, { backgroundColor: c.tint }]}
+            onPress={() => goToCreateLesson()}
+          >
+            <Ionicons name="add-circle-outline" size={18} color="#FFFFFF" />
+            <Text style={[styles.addLessonButtonText, { color: "#FFFFFF" }]}>Add Lesson</Text>
+          </Pressable>
+        ) : null}
 
         <View style={styles.chapterList}>
           {groupedChapters.map((group) => {
@@ -1005,9 +1065,23 @@ export default function SubjectDetailScreen() {
                               {" - "}
                               {chapter.title}
                             </Text>
-                            <Ionicons name={isOpen ? "chevron-up" : "chevron-down"} size={16} color={c.text} />
                           </Pressable>
                         </View>
+                        <Pressable
+                          style={styles.menuBtn}
+                          onPress={() =>
+                            goToCreateLesson({
+                              chapterId: chapter.chapter_id,
+                              lessonNumber:
+                                chapter.lessons.reduce(
+                                  (maxValue, lesson) => Math.max(maxValue, lesson.sequence_no),
+                                  0
+                                ) + 1,
+                            })
+                          }
+                        >
+                          <Ionicons name="add" size={18} color={c.text} />
+                        </Pressable>
                         <View style={styles.rowMenuWrap}>
                           <Pressable
                             style={styles.menuBtn}
@@ -1026,14 +1100,25 @@ export default function SubjectDetailScreen() {
                             <View style={[styles.inlineMenu, { backgroundColor: cardBg, borderColor: c.border }]}>
                               <Pressable
                                 style={styles.subjectMenuItem}
-                                onPress={() => startAddLesson(chapter.chapter_id)}
+                                onPress={() =>
+                                  goToCreateLesson({
+                                    chapterId: chapter.chapter_id,
+                                    lessonNumber:
+                                      chapter.lessons.reduce(
+                                        (maxValue, lesson) => Math.max(maxValue, lesson.sequence_no),
+                                        0
+                                      ) + 1,
+                                  })
+                                }
                               >
                                 <Ionicons name="add-outline" size={16} color={c.text} />
                                 <Text style={[styles.subjectMenuText, { color: c.text }]}>Add Lesson</Text>
                               </Pressable>
                               <Pressable
                                 style={styles.subjectMenuItem}
-                                onPress={() => startChapterEdit(chapter.chapter_id, chapter.title)}
+                                onPress={() =>
+                                  startChapterEdit(chapter.chapter_id, chapter.title, chapter.sequence_no)
+                                }
                               >
                                 <Ionicons name="create-outline" size={16} color={c.text} />
                                 <Text style={[styles.subjectMenuText, { color: c.text }]}>Edit Chapter</Text>
@@ -1054,10 +1139,12 @@ export default function SubjectDetailScreen() {
                         chapter.lessons.length > 0 ? (
                           <View style={styles.lessonList}>
                             {chapter.lessons.map((lesson, lessonIndex) => (
-                              <View
+                              <Pressable
                                 key={lesson.lesson_id}
+                                onPress={() => goToLessonDetail(lesson.lesson_id)}
                                 style={[
                                   styles.lessonRow,
+                                  openLessonMenuId === lesson.lesson_id ? styles.lessonRowOpen : null,
                                   { backgroundColor: lessonIndex % 2 === 0 ? lessonRowA : lessonRowB },
                                 ]}
                               >
@@ -1087,7 +1174,9 @@ export default function SubjectDetailScreen() {
                                       >
                                         <Pressable
                                           style={styles.subjectMenuItem}
-                                          onPress={() => startLessonEdit(lesson.lesson_id, lesson.title)}
+                                          onPress={() =>
+                                            startLessonEdit(lesson.lesson_id, lesson.title, lesson.sequence_no)
+                                          }
                                         >
                                           <Ionicons name="create-outline" size={16} color={c.text} />
                                           <Text style={[styles.subjectMenuText, { color: c.text }]}>Edit Lesson</Text>
@@ -1105,7 +1194,7 @@ export default function SubjectDetailScreen() {
                                     ) : null}
                                   </View>
                                 </View>
-                              </View>
+                              </Pressable>
                             ))}
                           </View>
                         ) : (
@@ -1123,24 +1212,38 @@ export default function SubjectDetailScreen() {
         </View>
 
         <View style={[styles.divider, { borderColor: c.border }]}> 
-          <View style={[styles.dividerDot, { backgroundColor: c.border }]}> 
-            <Ionicons name="chevron-down" size={12} color={c.mutedText} />
-          </View>
+          <Pressable
+            style={[styles.dividerDot, { backgroundColor: c.border }]}
+            onPress={() =>
+              goToCreateLesson({
+                chapterNumber: chapters.reduce((maxValue, chapter) => Math.max(maxValue, chapter.sequence_no), 0) + 1,
+                lessonNumber: 1,
+              })
+            }
+          >
+            <Ionicons name="add" size={14} color={c.mutedText} />
+          </Pressable>
         </View>
 
         <View style={styles.planGrid}>
           <View style={[styles.planCol, { backgroundColor: cardBg, borderColor: c.border }]}> 
             <View style={styles.planHeader}>
               <Text style={[styles.planTitle, { color: c.text }]}>Written Work</Text>
-              <Ionicons name="add" size={18} color={c.text} />
+              <Pressable style={styles.planAddButton} onPress={goToCreateActivity}>
+                <Ionicons name="add" size={18} color={c.text} />
+              </Pressable>
             </View>
             {writtenWorks.length > 0 ? (
               writtenWorks.map((item) => (
-                <View key={item.plan_entry_id} style={[styles.planItem, { backgroundColor: c.background }]}> 
+                <Pressable
+                  key={item.plan_entry_id}
+                  onPress={() => goToWrittenWorkDetail(item.plan_entry_id)}
+                  style={[styles.planItem, { backgroundColor: c.background }]}
+                >
                   <Text style={[styles.planItemText, { color: c.text }]} numberOfLines={1}>
                     {item.title}
                   </Text>
-                </View>
+                </Pressable>
               ))
             ) : (
               <Text style={[styles.planEmpty, { color: c.mutedText }]}>No written work yet.</Text>
@@ -1150,15 +1253,24 @@ export default function SubjectDetailScreen() {
           <View style={[styles.planCol, { backgroundColor: cardBg, borderColor: c.border }]}> 
             <View style={styles.planHeader}>
               <Text style={[styles.planTitle, { color: c.text }]}>Performance Task</Text>
-              <Ionicons name="add" size={18} color={c.text} />
+              <Pressable style={styles.planAddButton} onPress={goToCreateActivity}>
+                <Ionicons name="add" size={18} color={c.text} />
+              </Pressable>
             </View>
             {performanceTasks.length > 0 ? (
               performanceTasks.map((item) => (
-                <View key={item.plan_entry_id} style={[styles.planItemPink, { backgroundColor: scheme === "dark" ? "#4A2E33" : "#F0D7D8" }]}> 
+                <Pressable
+                  key={item.plan_entry_id}
+                  onPress={() => goToPerformanceTaskDetail(item.plan_entry_id)}
+                  style={[
+                    styles.planItemPink,
+                    { backgroundColor: scheme === "dark" ? "#4A2E33" : "#F0D7D8" },
+                  ]}
+                >
                   <Text style={[styles.planItemText, { color: c.text }]} numberOfLines={1}>
                     {item.title}
                   </Text>
-                </View>
+                </Pressable>
               ))
             ) : (
               <Text style={[styles.planEmpty, { color: c.mutedText }]}>No performance tasks yet.</Text>
@@ -1257,6 +1369,19 @@ const styles = StyleSheet.create({
     ...Typography.body,
     textAlign: "center",
   },
+  addLessonButton: {
+    minHeight: 44,
+    borderRadius: Radius.md,
+    marginBottom: Spacing.lg,
+    paddingHorizontal: Spacing.md,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+  },
+  addLessonButtonText: {
+    ...Typography.body,
+  },
   chapterList: {
     gap: Spacing.sm,
   },
@@ -1327,6 +1452,12 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     paddingHorizontal: Spacing.md,
     marginTop: 1,
+    position: "relative",
+    zIndex: 1,
+  },
+  lessonRowOpen: {
+    zIndex: 40,
+    elevation: 5,
   },
   lessonRowContent: {
     flexDirection: "row",
@@ -1376,6 +1507,12 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "space-between",
     marginBottom: Spacing.sm,
+  },
+  planAddButton: {
+    width: 28,
+    height: 28,
+    alignItems: "center",
+    justifyContent: "center",
   },
   planTitle: {
     ...Typography.h3,

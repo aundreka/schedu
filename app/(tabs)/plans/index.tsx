@@ -14,6 +14,7 @@ import { Radius, Spacing, Typography } from "../../../constants/fonts";
 import TabPageHeader from "../../../components/tab-page-header";
 import { useAppTheme } from "../../../context/theme";
 import { usePullToRefresh } from "../../../hooks/usePullToRefresh";
+import { subscribeToLessonPlanRefresh } from "../../../lib/lesson-plan-refresh";
 import { supabase } from "../../../lib/supabase";
 
 type PlanCardItem = {
@@ -114,6 +115,12 @@ export default function PlansScreen() {
 
   useEffect(() => {
     loadPlans();
+  }, [loadPlans]);
+
+  useEffect(() => {
+    return subscribeToLessonPlanRefresh(() => {
+      loadPlans();
+    });
   }, [loadPlans]);
 
   const { refreshing, onRefresh } = usePullToRefresh(loadPlans);

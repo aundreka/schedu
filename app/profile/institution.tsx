@@ -682,7 +682,7 @@ export default function InstitutionScreen() {
             <TextInput
               value={sectionGradeLevel}
               onChangeText={setSectionGradeLevel}
-              placeholder="Grade level"
+              placeholder="Year level"
               placeholderTextColor={c.mutedText}
               style={[
                 styles.input,

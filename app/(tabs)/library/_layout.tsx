@@ -10,6 +10,10 @@ export default function LibraryLayout() {
     >
       <Stack.Screen name="index" />
       <Stack.Screen name="subject_detail" />
+      <Stack.Screen name="lesson_detail" />
+      <Stack.Screen name="lesson_editor" />
+      <Stack.Screen name="ww_detail" />
+      <Stack.Screen name="pt_detail" />
     </Stack>
   );
 }

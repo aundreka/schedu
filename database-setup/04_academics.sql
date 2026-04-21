@@ -89,13 +89,24 @@ create table if not exists public.lessons (
   title text not null,
   content text,
   learning_objectives text,
-  estimated_minutes integer,
+  estimated_minutes integer default 60,
+  complexity_score integer,
   sequence_no integer not null,
   status public.record_status not null default 'draft',
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique (chapter_id, sequence_no)
 );
+
+alter table public.lessons
+  alter column estimated_minutes set default 60;
+
+update public.lessons
+set estimated_minutes = 60
+where estimated_minutes is null;
+
+alter table public.lessons
+  add column if not exists complexity_score integer;
 
 alter table public.chapters
   add column if not exists unit_id uuid references public.units(unit_id) on delete set null;

@@ -19,6 +19,185 @@ export type BuildPacingPlanInput = {
   blocks: Block[];
 };
 
+export type LessonComplexityInput = {
+  title?: string | null;
+  content?: string | null;
+  learningObjectives?: string | null;
+};
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function stripHtml(value: string): string {
+  return value
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|li|h\d|tr)>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenizeWords(value: string): string[] {
+  return value
+    .toLowerCase()
+    .match(/[a-z0-9]+(?:['-][a-z0-9]+)*/g) ?? [];
+}
+
+function buildLessonAnalysisText(input: LessonComplexityInput): string {
+  return [input.title, input.learningObjectives, input.content]
+    .filter((value): value is string => Boolean(value && value.trim()))
+    .map(stripHtml)
+    .join("\n");
+}
+
+function scoreWordCount(wordCount: number): number {
+  if (wordCount >= 351) return 20;
+  if (wordCount >= 181) return 15;
+  if (wordCount >= 81) return 10;
+  if (wordCount > 0) return 5;
+  return 0;
+}
+
+function countMeaningfulSegments(text: string): number {
+  if (!text.trim()) return 0;
+  const normalized = text
+    .replace(/[•●▪◦·]/g, "\n")
+    .replace(/\b(?:and|with|plus|including)\b/gi, "|")
+    .replace(/[;,/]/g, "|")
+    .replace(/\n+/g, "|")
+    .replace(/\b\d+\s*[\.\)]/g, "|");
+
+  const rawSegments = normalized
+    .split("|")
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length >= 4);
+
+  let count = 0;
+  for (const segment of rawSegments) {
+    const words = tokenizeWords(segment);
+    if (words.length >= 2 || segment.length >= 12) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function scoreSubtopics(segmentCount: number): number {
+  if (segmentCount >= 8) return 25;
+  if (segmentCount >= 6) return 20;
+  if (segmentCount >= 4) return 15;
+  if (segmentCount >= 2) return 8;
+  if (segmentCount >= 1) return 4;
+  return 0;
+}
+
+function scoreTechnicalMarkers(text: string): number {
+  const formulaSymbols = (text.match(/[=+\-/%^<>]/g) ?? []).length;
+  const parenthesesWithVars = (text.match(/\(([a-z0-9,\s]+)\)/gi) ?? []).length;
+  const acronyms = (text.match(/\b[A-Z]{2,}\b/g) ?? []).length;
+  const enumeratedSteps = (text.match(/\b(step|phase|procedure|algorithm|method)\s+\d+\b/gi) ?? []).length;
+  const greekOrMath = (text.match(/[α-ωΑ-ΩπΣΔ√∞≈≠≤≥]/g) ?? []).length;
+
+  const rawScore =
+    Math.min(6, formulaSymbols) +
+    Math.min(3, parenthesesWithVars) +
+    Math.min(2, acronyms) +
+    Math.min(2, enumeratedSteps * 2) +
+    Math.min(2, greekOrMath * 2);
+
+  return clamp(rawScore, 0, 15);
+}
+
+function countKeywordHits(text: string, keywords: string[]): number {
+  const lower = text.toLowerCase();
+  return keywords.reduce((count, keyword) => count + (lower.includes(keyword) ? 1 : 0), 0);
+}
+
+function scoreCognitiveVerbs(text: string): number {
+  const higherEffortKeywords = [
+    "analyze",
+    "compare",
+    "differentiate",
+    "derive",
+    "solve",
+    "interpret",
+    "evaluate",
+    "apply",
+    "explain why",
+    "investigate",
+  ];
+  const lowerEffortKeywords = [
+    "define",
+    "identify",
+    "enumerate",
+    "list",
+    "recognize",
+    "recall",
+    "label",
+    "name",
+  ];
+
+  const higherHits = countKeywordHits(text, higherEffortKeywords);
+  const lowerHits = countKeywordHits(text, lowerEffortKeywords);
+  const rawScore = higherHits * 5 + lowerHits * 2;
+  return clamp(rawScore, 0, 25);
+}
+
+function scoreProcedureProblemSolving(text: string): number {
+  const proceduralKeywords = [
+    "solve",
+    "compute",
+    "calculate",
+    "derive",
+    "prove",
+    "construct",
+    "perform",
+    "demonstrate",
+    "simulate",
+    "graph",
+    "experiment",
+  ];
+  const hits = countKeywordHits(text, proceduralKeywords);
+  return clamp(hits * 4, 0, 15);
+}
+
+export function deriveLessonComplexityScore(input: LessonComplexityInput): number {
+  const text = buildLessonAnalysisText(input);
+  if (!text) return 20;
+
+  const wordCount = tokenizeWords(text).length;
+  const subtopicCount = countMeaningfulSegments(text);
+  const total =
+    scoreWordCount(wordCount) +
+    scoreSubtopics(subtopicCount) +
+    scoreTechnicalMarkers(text) +
+    scoreCognitiveVerbs(text) +
+    scoreProcedureProblemSolving(text);
+
+  return clamp(total, 0, 100);
+}
+
+export function complexityScoreToEstimatedMinutes(score: number): number {
+  if (score <= 20) return 20;
+  if (score <= 40) return 40;
+  if (score <= 60) return 60;
+  if (score <= 80) return 90;
+  return 120;
+}
+
+export function complexityScoreToDifficulty(score: number): "light" | "medium" | "heavy" {
+  if (score <= 40) return "light";
+  if (score <= 70) return "medium";
+  return "heavy";
+}
+
 function isMajorBlock(block: Block): boolean {
   return block.overlayMode === "major" || block.overlayMode === "exclusive";
 }

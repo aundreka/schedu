@@ -19,6 +19,7 @@ import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system/legacy";
 import { router } from "expo-router";
 import { Ionicons } from "@expo/vector-icons";
+import { Picker } from "@react-native-picker/picker";
 import { useAppTheme } from "../../../context/theme";
 import { usePullToRefresh } from "../../../hooks/usePullToRefresh";
 import { supabase } from "../../../lib/supabase";
@@ -50,6 +51,7 @@ type OutlineUnit = {
   tempId: string;
   title: string;
   sequenceNo: number;
+  description?: string | null;
 };
 
 type OutlineChapter = {
@@ -57,12 +59,15 @@ type OutlineChapter = {
   title: string;
   sequenceNo: number;
   unitTempId: string | null;
+  description?: string | null;
 };
 
 type OutlineLesson = {
   title: string;
   sequenceNo: number;
   chapterTempId: string;
+  learningObjectives?: string | null;
+  content?: string | null;
 };
 
 type ParsedOutline = {
@@ -166,6 +171,10 @@ function guessMimeType(name: string, fallback?: string | null) {
   if (lower.endsWith(".webp")) return "image/webp";
   if (lower.endsWith(".pdf")) return "application/pdf";
   return fallback || "application/octet-stream";
+}
+
+function formatAcademicYear(startYear: number) {
+  return `${startYear}-${startYear + 1}`;
 }
 
 async function readUriAsArrayBuffer(uri: string) {
@@ -323,7 +332,7 @@ async function ocrImage(uri: string): Promise<string> {
       .filter((line) => line.length > 0);
 
     return orderedLines.join("\n").trim();
-  } catch (_e: any) {
+  } catch {
     throw new Error(
       "Image OCR needs a Dev Build (not Expo Go). Install react-native-mlkit-ocr and rebuild your app."
     );
@@ -478,6 +487,52 @@ function cleanOutlineTitle(text: string) {
   return isWeakOutlineTitle(normalized) ? null : normalized;
 }
 
+function formatOutlineTitle(text: string) {
+  const cleaned = cleanOutlineTitle(text);
+  if (!cleaned) return null;
+
+  const normalized = cleaned
+    .replace(/\s+/g, " ")
+    .replace(/[.]+$/, "")
+    .trim();
+
+  if (!normalized || normalized.length > 90) return null;
+
+  if (normalized === normalized.toUpperCase() && /[A-Z]{3,}/.test(normalized)) {
+    return normalized
+      .toLowerCase()
+      .replace(/\b\w/g, (char) => char.toUpperCase())
+      .replace(/\b(And|Or|Of|For|To|With|In|On|The|A|An)\b/g, (word, offset) =>
+        offset === 0 ? word : word.toLowerCase()
+      );
+  }
+
+  return normalized;
+}
+
+function formatOutlineBodyLine(text: string) {
+  const cleaned = fixCommonOcrTypos(
+    stripTrailingPageNumber(text)
+      .replace(/[|]+/g, " ")
+      .replace(/[ ]{2,}/g, " ")
+      .trim()
+  )
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!cleaned || cleaned.length < 4) return null;
+  if (/^(contents|table of contents)$/i.test(cleaned)) return null;
+  return cleaned;
+}
+
+function normalizeBulletObjective(text: string) {
+  const cleaned = formatOutlineBodyLine(
+    text.replace(/^(?:[\u2022\u2023\u25E6\u2043\u2219*•·●▪◦-]|\d+[.)]?|[A-Za-z][.)]?)\s+/, "")
+  );
+  if (!cleaned) return null;
+  return cleaned.replace(/[.;:]+$/, "").trim();
+}
+
 function parseHeading(line: string, type: "unit" | "chapter" | "lesson") {
   const escaped = type.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const tokenPattern =
@@ -505,6 +560,39 @@ function parseHeading(line: string, type: "unit" | "chapter" | "lesson") {
 
 function parseAnyHeading(line: string) {
   return parseHeading(line, "unit") || parseHeading(line, "chapter") || parseHeading(line, "lesson");
+}
+
+function isObjectiveHeading(line: string) {
+  return /^(learning objectives?|intended learning outcomes?|objectives?|outcomes?)$/i.test(line.trim());
+}
+
+function isObjectiveLeadIn(line: string) {
+  return /^(at the end of (?:the )?(?:lesson|chapter|unit)|students (?:should|will|are expected to) be able to)\b/i.test(
+    line.trim()
+  );
+}
+
+function isLikelyObjectiveItem(line: string) {
+  const value = line.trim();
+  if (!value) return false;
+  if (/^[\u2022\u2023\u25E6\u2043\u2219*•·●▪◦\-]/.test(value)) return true;
+  if (/^\d+[.)]\s+/.test(value)) return true;
+  if (/^[a-z][.)]\s+/i.test(value)) return true;
+  return /^(identify|describe|explain|differentiate|analyze|analyse|compare|classify|solve|construct|apply|demonstrate|evaluate|illustrate|discuss|define|interpret|use|create|relate|recognize|outline|summarize)\b/i.test(
+    value
+  );
+}
+
+function joinParagraphLines(lines: string[]) {
+  const cleaned = lines.map((line) => formatOutlineBodyLine(line)).filter((line): line is string => Boolean(line));
+  return cleaned.length > 0 ? cleaned.join(" ") : null;
+}
+
+function formatObjectives(items: string[]) {
+  const cleaned = items
+    .map((item) => normalizeBulletObjective(item))
+    .filter((item): item is string => Boolean(item));
+  return cleaned.length > 0 ? cleaned.map((item) => `- ${item}`).join("\n") : null;
 }
 
 function isLikelyTitleNoise(line: string) {
@@ -684,6 +772,10 @@ function parseOutlineFromText(rawText: string): ParsedOutline {
 
   let currentUnitTempId: string | null = null;
   let currentChapterTempId: string | null = null;
+  let currentLessonIndex: number | null = null;
+  let collectingObjectives = false;
+  let objectiveItems: string[] = [];
+  let pendingDescriptionLines: string[] = [];
   const rootBucketKey = "__root__";
 
   const getBucketKey = (unitTempId: string | null) => unitTempId ?? rootBucketKey;
@@ -718,18 +810,75 @@ function parseOutlineFromText(rawText: string): ParsedOutline {
     return chapterTempId;
   };
 
+  const flushCurrentLessonObjectives = () => {
+    if (currentLessonIndex === null) return;
+    const lesson = lessons[currentLessonIndex];
+    if (!lesson) return;
+    if (objectiveItems.length === 0) return;
+    lesson.learningObjectives = formatObjectives(objectiveItems);
+    objectiveItems = [];
+  };
+
+  const appendDescriptionToCurrentScope = () => {
+    const description = joinParagraphLines(pendingDescriptionLines);
+    pendingDescriptionLines = [];
+    if (!description) return;
+
+    if (currentLessonIndex !== null && lessons[currentLessonIndex]) {
+      const existing = lessons[currentLessonIndex].content?.trim();
+      lessons[currentLessonIndex].content = existing ? `${existing}\n\n${description}` : description;
+      return;
+    }
+
+    if (currentChapterTempId) {
+      const chapter = chapters.find((entry) => entry.tempId === currentChapterTempId);
+      if (chapter) {
+        const existing = chapter.description?.trim();
+        chapter.description = existing ? `${existing}\n\n${description}` : description;
+        return;
+      }
+    }
+
+    if (currentUnitTempId) {
+      const unit = units.find((entry) => entry.tempId === currentUnitTempId);
+      if (unit) {
+        const existing = unit.description?.trim();
+        unit.description = existing ? `${existing}\n\n${description}` : description;
+      }
+    }
+  };
+
+  const flushScopeBuffers = () => {
+    flushCurrentLessonObjectives();
+    collectingObjectives = false;
+    appendDescriptionToCurrentScope();
+  };
+
   for (const line of lines) {
+    if (isObjectiveHeading(line)) {
+      appendDescriptionToCurrentScope();
+      flushCurrentLessonObjectives();
+      collectingObjectives = true;
+      continue;
+    }
+
+    if (parseAnyHeading(line)) {
+      flushScopeBuffers();
+    }
+
     const unitMatch = parseHeading(line, "unit");
     if (unitMatch) {
       const tempId = `u_${units.length + 1}`;
       const fallback = unitMatch.token ? `Unit ${unitMatch.token}` : `Unit ${units.length + 1}`;
       units.push({
         tempId,
-        title: unitMatch.title ?? fallback,
+        title: formatOutlineTitle(unitMatch.title ?? fallback) ?? fallback,
         sequenceNo: units.length + 1,
+        description: null,
       });
       currentUnitTempId = tempId;
       currentChapterTempId = null;
+      currentLessonIndex = null;
       continue;
     }
 
@@ -744,9 +893,10 @@ function parseOutlineFromText(rawText: string): ParsedOutline {
         : `Chapter ${chapterSequenceNo}`;
       chapters.push({
         tempId,
-        title: chapterMatch.title ?? fallback,
+        title: formatOutlineTitle(chapterMatch.title ?? fallback) ?? fallback,
         sequenceNo: chapterSequenceNo,
         unitTempId: currentUnitTempId,
+        description: null,
       });
       pushChapterIndex(getBucketKey(currentUnitTempId), chapters.length - 1);
       lessonIndicesByChapterTempId.set(tempId, []);
@@ -755,6 +905,7 @@ function parseOutlineFromText(rawText: string): ParsedOutline {
       nextLessonSequenceByChapterTempId.set(tempId, 1);
       chapterHadExplicitSeq.set(tempId, parsedChapterSeq !== null);
       currentChapterTempId = tempId;
+      currentLessonIndex = null;
       continue;
     }
 
@@ -774,9 +925,11 @@ function parseOutlineFromText(rawText: string): ParsedOutline {
         : `Lesson ${lessonSequenceNo}`;
 
       lessons.push({
-        title: lessonMatch.title ?? fallback,
+        title: formatOutlineTitle(lessonMatch.title ?? fallback) ?? fallback,
         sequenceNo: lessonSequenceNo,
         chapterTempId,
+        learningObjectives: null,
+        content: null,
       });
       const lessonIndex = lessons.length - 1;
       const lessonIndices = lessonIndicesByChapterTempId.get(chapterTempId) ?? [];
@@ -786,13 +939,32 @@ function parseOutlineFromText(rawText: string): ParsedOutline {
       lessonExplicitFlags.push(parsedLessonSeq !== null);
       lessonHadExplicitSeq.set(chapterTempId, lessonExplicitFlags);
       lessonCountByChapterTempId.set(chapterTempId, chapterLessonCount + 1);
+      currentLessonIndex = lessonIndex;
       continue;
     }
 
     const cleanedTitle = cleanOutlineTitle(line);
     if (!cleanedTitle || isLikelyTitleNoise(cleanedTitle) || parseAnyHeading(cleanedTitle)) continue;
-    pushCandidate(getBucketKey(currentUnitTempId), cleanedTitle);
+
+    if (collectingObjectives || isObjectiveLeadIn(line) || isLikelyObjectiveItem(line)) {
+      collectingObjectives = true;
+      const normalizedObjective = normalizeBulletObjective(line);
+      if (normalizedObjective) {
+        objectiveItems.push(normalizedObjective);
+      }
+      continue;
+    }
+
+    const formattedBody = formatOutlineBodyLine(line);
+    if (formattedBody && (currentChapterTempId || currentUnitTempId)) {
+      pendingDescriptionLines.push(formattedBody);
+      continue;
+    }
+
+    pushCandidate(getBucketKey(currentUnitTempId), formatOutlineTitle(cleanedTitle) ?? cleanedTitle);
   }
+
+  flushScopeBuffers();
 
   // Normalize OCR outliers (e.g., 1, 9, 10, 11 -> 8, 9, 10, 11).
   const chapterEntries = chapters.map((chapter) => ({
@@ -832,7 +1004,7 @@ function parseOutlineFromText(rawText: string): ParsedOutline {
 
     let pointer = 0;
     if (unitIndex !== null && units[unitIndex] && /^Unit\s+/i.test(units[unitIndex].title)) {
-      units[unitIndex].title = candidates[pointer] ?? units[unitIndex].title;
+      units[unitIndex].title = formatOutlineTitle(candidates[pointer] ?? "") ?? units[unitIndex].title;
       pointer += 1;
     }
 
@@ -842,7 +1014,7 @@ function parseOutlineFromText(rawText: string): ParsedOutline {
       if (!chapter) continue;
 
       if (/^Chapter\s+/i.test(chapter.title) && pointer < candidates.length) {
-        chapter.title = candidates[pointer];
+        chapter.title = formatOutlineTitle(candidates[pointer]) ?? chapter.title;
         pointer += 1;
       }
 
@@ -851,7 +1023,7 @@ function parseOutlineFromText(rawText: string): ParsedOutline {
         const lesson = lessons[lessonIndex];
         if (!lesson) continue;
         if (/^Lesson\s+/i.test(lesson.title) && pointer < candidates.length) {
-          lesson.title = candidates[pointer];
+          lesson.title = formatOutlineTitle(candidates[pointer]) ?? lesson.title;
           pointer += 1;
         }
       }
@@ -881,9 +1053,11 @@ function parseOutlineFromText(rawText: string): ParsedOutline {
       });
       plainCandidates.forEach((title, index) => {
         lessons.push({
-          title,
+          title: formatOutlineTitle(title) ?? title,
           sequenceNo: index + 1,
           chapterTempId: fallbackChapterTempId,
+          learningObjectives: null,
+          content: null,
         });
       });
     }
@@ -952,6 +1126,7 @@ async function persistOutline(params: { subjectId: string; rawText: string; outl
         .insert({
           subject_id: subjectId,
           title: unit.title,
+          description: unit.description ?? null,
           sequence_no: unit.sequenceNo,
           status: "published",
         })
@@ -975,6 +1150,7 @@ async function persistOutline(params: { subjectId: string; rawText: string; outl
     const chapterPayload: Record<string, any> = {
       subject_id: subjectId,
       title: chapter.title,
+      description: chapter.description ?? null,
       sequence_no: chapter.sequenceNo,
       status: "published",
     };
@@ -998,6 +1174,8 @@ async function persistOutline(params: { subjectId: string; rawText: string; outl
     const { error } = await supabase.from("lessons").insert({
       chapter_id: chapterId,
       title: lesson.title,
+      content: lesson.content ?? null,
+      learning_objectives: lesson.learningObjectives ?? null,
       sequence_no: lesson.sequenceNo,
       status: "published",
     });
@@ -1015,32 +1193,32 @@ async function persistOutline(params: { subjectId: string; rawText: string; outl
 
 export default function SubjectScreen() {
   const { colors: c } = useAppTheme();
+  const nowYear = new Date().getFullYear();
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
   const [userId, setUserId] = useState<string | null>(null);
   const [institutions, setInstitutions] = useState<Institution[]>([]);
-  const [showInstitutionModal, setShowInstitutionModal] = useState(false);
 
   const [overview, setOverview] = useState("");
   const [title, setTitle] = useState("");
   const [subjectCode, setSubjectCode] = useState("");
   const [year, setYear] = useState("");
-  const [academicYear, setAcademicYear] = useState("");
+  const [schoolYearStart, setSchoolYearStart] = useState<number | null>(null);
   const [selectedSchoolId, setSelectedSchoolId] = useState<string>("");
-
+  const [schoolYearPickerOpen, setSchoolYearPickerOpen] = useState(false);
+  const [schoolYearPickerYear, setSchoolYearPickerYear] = useState(nowYear);
   const [coverImageUri, setCoverImageUri] = useState<string | null>(null);
   const [syllabusMode, setSyllabusMode] = useState<SyllabusMode>(null);
   const [syllabusText, setSyllabusText] = useState("");
   const [syllabusImage, setSyllabusImage] = useState<PickedFile | null>(null);
   const [syllabusFile, setSyllabusFile] = useState<PickedFile | null>(null);
 
-  const selectedInstitutionName = useMemo(() => {
-    return (
-      institutions.find((school) => school.school_id === selectedSchoolId)?.name ?? "Academic Institution"
-    );
-  }, [institutions, selectedSchoolId]);
+  const academicYear = useMemo(() => {
+    if (!schoolYearStart) return "";
+    return formatAcademicYear(schoolYearStart);
+  }, [schoolYearStart]);
 
   const loadSubjectForm = useCallback(async () => {
     setLoading(true);
@@ -1091,6 +1269,16 @@ export default function SubjectScreen() {
   }, [loadSubjectForm]);
 
   const { refreshing, onRefresh } = usePullToRefresh(loadSubjectForm);
+
+  const openSchoolYearPicker = () => {
+    setSchoolYearPickerYear(schoolYearStart ?? nowYear);
+    setSchoolYearPickerOpen(true);
+  };
+
+  const applyPickedSchoolYear = () => {
+    setSchoolYearStart(schoolYearPickerYear);
+    setSchoolYearPickerOpen(false);
+  };
 
   const pickCoverImage = async () => {
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
@@ -1310,7 +1498,7 @@ export default function SubjectScreen() {
       setTitle("");
       setSubjectCode("");
       setYear("");
-      setAcademicYear("");
+      setSchoolYearStart(null);
       setCoverImageUri(null);
       setSyllabusMode(null);
       setSyllabusText("");
@@ -1434,10 +1622,10 @@ export default function SubjectScreen() {
             <TextInput
               value={year}
               onChangeText={setYear}
-              placeholder="Grade Level"
+              placeholder="Year Level"
               placeholderTextColor={c.mutedText}
               style={[
-                styles.metaInput,
+                styles.metaCompactInput,
                 {
                   color: c.text,
                   borderColor: c.border,
@@ -1445,28 +1633,34 @@ export default function SubjectScreen() {
                 },
               ]}
             />
-          </View>
-
-          <View style={styles.metaRow}>
-            <TextInput
-              value={academicYear}
-              onChangeText={setAcademicYear}
-              placeholder="Academic Year (e.g. 2025-2026)"
-              placeholderTextColor={c.mutedText}
+            <View
               style={[
-                styles.metaInput,
+                styles.schoolPickerWrap,
                 {
-                  color: c.text,
                   borderColor: c.border,
                   backgroundColor: c.card,
                 },
               ]}
-            />
+            >
+              <Picker
+                enabled={institutions.length > 0}
+                selectedValue={selectedSchoolId}
+                onValueChange={(value) => setSelectedSchoolId(String(value))}
+                style={[styles.schoolPicker, { color: selectedSchoolId ? c.text : c.mutedText }]}
+              >
+                {institutions.length === 0 ? (
+                  <Picker.Item label="No schools found" value="" color={c.mutedText} />
+                ) : null}
+                {institutions.map((school) => (
+                  <Picker.Item key={school.school_id} label={school.name} value={school.school_id} />
+                ))}
+              </Picker>
+            </View>
           </View>
 
           <View style={styles.metaRow}>
             <Pressable
-              onPress={() => setShowInstitutionModal(true)}
+              onPress={openSchoolYearPicker}
               style={[
                 styles.institutionPicker,
                 {
@@ -1475,8 +1669,8 @@ export default function SubjectScreen() {
                 },
               ]}
             >
-              <Text numberOfLines={1} style={[styles.institutionText, { color: c.mutedText }]}>
-                {selectedInstitutionName}
+              <Text style={[styles.institutionText, { color: schoolYearStart ? c.text : c.mutedText }]}>
+                {schoolYearStart ? academicYear : "Pick School Year"}
               </Text>
             </Pressable>
           </View>
@@ -1593,49 +1787,40 @@ export default function SubjectScreen() {
       </KeyboardAvoidingView>
 
       <Modal
-        visible={showInstitutionModal}
+        visible={schoolYearPickerOpen}
         transparent
         animationType="fade"
-        onRequestClose={() => setShowInstitutionModal(false)}
+        onRequestClose={() => setSchoolYearPickerOpen(false)}
       >
-        <Pressable style={styles.modalBackdrop} onPress={() => setShowInstitutionModal(false)}>
+        <Pressable style={styles.modalBackdrop} onPress={() => setSchoolYearPickerOpen(false)}>
           <Pressable
-            style={[styles.modalCard, { borderColor: c.border, backgroundColor: c.card }]}
+            style={[styles.dateModalCard, { borderColor: c.border, backgroundColor: c.card }]}
             onPress={() => {}}
           >
-            <Text style={[styles.modalTitle, { color: c.text }]}>Select Institution</Text>
-            {institutions.length === 0 ? (
-              <Text style={{ color: c.mutedText }}>No institutions found. Add one in Profile first.</Text>
-            ) : (
-              institutions.map((school) => {
-                const selected = school.school_id === selectedSchoolId;
-                return (
-                  <Pressable
-                    key={school.school_id}
-                    onPress={() => {
-                      setSelectedSchoolId(school.school_id);
-                      setShowInstitutionModal(false);
-                    }}
-                    style={[
-                      styles.schoolOption,
-                      {
-                        borderColor: selected ? c.tint : c.border,
-                        backgroundColor: selected ? `${c.tint}22` : c.card,
-                      },
-                    ]}
-                  >
-                    <Text style={[styles.schoolOptionText, { color: selected ? c.tint : c.text }]}>
-                      {school.name}
-                    </Text>
-                    {school.is_primary ? (
-                      <View style={[styles.defaultPill, { borderColor: c.tint }]}>
-                        <Text style={[styles.defaultPillText, { color: c.tint }]}>Default</Text>
-                      </View>
-                    ) : null}
-                  </Pressable>
-                );
-              })
-            )}
+            <Text style={[styles.modalTitle, { color: c.text }]}>Pick School Year</Text>
+            <View style={styles.yearPickerCol}>
+              <Picker
+                selectedValue={schoolYearPickerYear}
+                onValueChange={(value) => setSchoolYearPickerYear(Number(value))}
+              >
+                {Array.from({ length: 16 }).map((_, index) => {
+                  const pickerYear = nowYear - 5 + index;
+                  return (
+                    <Picker.Item
+                      key={pickerYear}
+                      label={formatAcademicYear(pickerYear)}
+                      value={pickerYear}
+                    />
+                  );
+                })}
+              </Picker>
+            </View>
+            <Pressable
+              style={[styles.modalDoneButton, { backgroundColor: c.tint }]}
+              onPress={applyPickedSchoolYear}
+            >
+              <Text style={styles.modalDoneButtonText}>Set Year</Text>
+            </Pressable>
           </Pressable>
         </Pressable>
       </Modal>
@@ -1704,6 +1889,14 @@ const styles = StyleSheet.create({
     paddingHorizontal: 10,
     paddingVertical: 10,
   },
+  metaCompactInput: {
+    flex: 0.9,
+    borderRadius: 8,
+    borderWidth: 1,
+    fontSize: TYPE_SCALE.body,
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+  },
   institutionPicker: {
     flex: 1,
     borderRadius: 8,
@@ -1714,6 +1907,17 @@ const styles = StyleSheet.create({
   },
   institutionText: {
     fontSize: TYPE_SCALE.body,
+  },
+  schoolPickerWrap: {
+    flex: 1.15,
+    borderRadius: 8,
+    borderWidth: 1,
+    justifyContent: "center",
+    overflow: "hidden",
+  },
+  schoolPicker: {
+    width: "100%",
+    height: 44,
   },
   overviewInput: {
     marginTop: 6,
@@ -1775,45 +1979,36 @@ const styles = StyleSheet.create({
     textAlign: "center",
     fontSize: TYPE_SCALE.caption,
   },
+  dateModalCard: {
+    borderWidth: 1,
+    borderRadius: 14,
+    padding: 14,
+    gap: 10,
+  },
+  yearPickerCol: {
+    minHeight: 180,
+    justifyContent: "center",
+  },
   modalBackdrop: {
     flex: 1,
     backgroundColor: "rgba(0,0,0,0.35)",
     justifyContent: "center",
     padding: 18,
   },
-  modalCard: {
-    borderWidth: 1,
-    borderRadius: 14,
-    padding: 14,
-    gap: 8,
-  },
   modalTitle: {
     fontSize: TYPE_SCALE.h2,
     fontWeight: "700",
     marginBottom: 6,
   },
-  schoolOption: {
-    borderWidth: 1,
+  modalDoneButton: {
+    alignSelf: "flex-end",
     borderRadius: 10,
-    paddingHorizontal: 10,
+    paddingHorizontal: 16,
     paddingVertical: 10,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
   },
-  schoolOptionText: {
-    flex: 1,
+  modalDoneButtonText: {
+    color: "#FFFFFF",
     fontSize: TYPE_SCALE.body,
-    fontWeight: "600",
-  },
-  defaultPill: {
-    borderWidth: 1,
-    borderRadius: 999,
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-  },
-  defaultPillText: {
-    fontSize: 11,
     fontWeight: "700",
   },
 });

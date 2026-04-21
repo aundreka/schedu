@@ -16,10 +16,20 @@ import {
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { Picker } from "@react-native-picker/picker";
-import { router } from "expo-router";
+import { router, useLocalSearchParams } from "expo-router";
+import { buildBlocks } from "../../../algorithm/buildBlocks";
+import {
+  complexityScoreToDifficulty,
+  complexityScoreToEstimatedMinutes,
+  deriveLessonComplexityScore,
+} from "../../../algorithm/buildPacingPlan";
+import { buildSlots, type RawMeetingSchedule } from "../../../algorithm/buildSlots";
+import type { TeacherRules, TOCUnit } from "../../../algorithm/types";
 import { Radius, Spacing, Typography } from "../../../constants/fonts";
 import { useAppTheme } from "../../../context/theme";
 import { usePullToRefresh } from "../../../hooks/usePullToRefresh";
+import type { PlanBlockRow, PlanSlotRow } from "../../../lib/planning";
+import { emitLessonPlanRefresh } from "../../../lib/lesson-plan-refresh";
 import { supabase } from "../../../lib/supabase";
 
 type AcademicTerm = "quarter" | "trimester" | "semester";
@@ -67,6 +77,7 @@ type LessonOption = {
   content: string | null;
   learning_objectives: string | null;
   estimated_minutes: number | null;
+  complexity_score: number | null;
 };
 
 type UnitGroup = {
@@ -107,6 +118,35 @@ type DateTarget =
   | { type: "duration"; field: "start" | "end" }
   | { type: "special"; id: string }
   | { type: "exam"; id: string };
+
+type DuplicatedPlanRow = {
+  lesson_plan_id: string;
+  title: string;
+  academic_year: string | null;
+  term: string;
+  start_date: string;
+  end_date: string;
+  notes: string | null;
+  school_id: string;
+  subject_id: string;
+  section_id: string;
+};
+
+type DuplicatedSlotRow = Pick<
+  PlanSlotRow,
+  "series_key" | "weekday" | "start_time" | "end_time" | "meeting_type" | "room" | "slot_number"
+>;
+
+type DuplicatedBlockRow = Pick<
+  PlanBlockRow,
+  "session_category" | "slot_id" | "metadata"
+>;
+
+type DuplicatedContentRow = {
+  content_level: string | null;
+  chapter_id: string | null;
+  lesson_id: string | null;
+};
 
 const TERM_LABEL: Record<AcademicTerm, string> = {
   quarter: "Quarter",
@@ -198,6 +238,96 @@ function hasValidTimeRange(startValue: string, endValue: string) {
   return end > start;
 }
 
+function rangesOverlap(startA: string, endA: string, startB: string, endB: string) {
+  return startA < endB && startB < endA;
+}
+
+type ScheduleConflict = {
+  day: WeekdayName;
+  start: string;
+  end: string;
+  message: string;
+};
+
+function collectDraftRecurringSlots(input: {
+  activeDays: Set<WeekdayName>;
+  daySchedules: Record<WeekdayName, DaySchedule>;
+}) {
+  return Array.from(input.activeDays)
+    .flatMap((day) =>
+      input.daySchedules[day].instances
+        .map((instance) => {
+          const start = toSqlTime(instance.start);
+          const end = toSqlTime(instance.end);
+          if (!start || !end || end <= start) return null;
+          return {
+            day,
+            start,
+            end,
+            room: instance.room,
+          };
+        })
+        .filter((row): row is NonNullable<typeof row> => Boolean(row))
+    )
+    .sort((a, b) => {
+      if (a.day !== b.day) return a.day.localeCompare(b.day);
+      if (a.start !== b.start) return a.start.localeCompare(b.start);
+      return a.end.localeCompare(b.end);
+    });
+}
+
+function findDraftScheduleOverlap(slots: ReturnType<typeof collectDraftRecurringSlots>): ScheduleConflict | null {
+  for (let index = 0; index < slots.length; index += 1) {
+    const current = slots[index];
+    for (let nextIndex = index + 1; nextIndex < slots.length; nextIndex += 1) {
+      const other = slots[nextIndex];
+      if (other.day !== current.day) break;
+      if (!rangesOverlap(current.start, current.end, other.start, other.end)) continue;
+      return {
+        day: current.day,
+        start: current.start,
+        end: current.end,
+        message: `The ${DAY_OPTIONS.find((item) => item.key === current.day)?.label ?? current.day} schedule has overlapping class times.`,
+      };
+    }
+  }
+
+  return null;
+}
+
+type ExistingRecurringClass = {
+  lesson_plan_id: string;
+  title: string;
+  start_date: string;
+  end_date: string;
+  day: WeekdayName;
+  start_time: string;
+  end_time: string;
+};
+
+function findExistingScheduleOverlap(input: {
+  slots: ReturnType<typeof collectDraftRecurringSlots>;
+  existingRows: ExistingRecurringClass[];
+  nextPlanStart: string;
+  nextPlanEnd: string;
+}): ScheduleConflict | null {
+  for (const slot of input.slots) {
+    for (const row of input.existingRows) {
+      if (row.day !== slot.day) continue;
+      if (row.end_date < input.nextPlanStart || row.start_date > input.nextPlanEnd) continue;
+      if (!rangesOverlap(slot.start, slot.end, row.start_time, row.end_time)) continue;
+      return {
+        day: slot.day,
+        start: slot.start,
+        end: slot.end,
+        message: `${DAY_OPTIONS.find((item) => item.key === slot.day)?.label ?? slot.day} ${slot.start.slice(0, 5)}-${slot.end.slice(0, 5)} conflicts with "${row.title}".`,
+      };
+    }
+  }
+
+  return null;
+}
+
 function parseDisplayTime(value: string) {
   const raw = value.trim().toUpperCase();
   const match = raw.match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/);
@@ -214,6 +344,18 @@ function parseDisplayTime(value: string) {
 
 function formatDisplayTime(hour: number, minute: number, meridiem: "AM" | "PM") {
   return `${hour}:${String(minute).padStart(2, "0")} ${meridiem}`;
+}
+
+function sqlTimeToDisplay(value: string | null) {
+  if (!value) return "8:00 AM";
+  const match = value.match(/^(\d{2}):(\d{2})/);
+  if (!match) return value;
+  const hours24 = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (!Number.isFinite(hours24) || !Number.isFinite(minutes)) return value;
+  const meridiem: "AM" | "PM" = hours24 >= 12 ? "PM" : "AM";
+  const hours12 = hours24 % 12 === 0 ? 12 : hours24 % 12;
+  return formatDisplayTime(hours12, minutes, meridiem);
 }
 
 function parseAcademicStartYear(value: string | null) {
@@ -263,6 +405,86 @@ function getExamDefinition(index: number, total: number) {
   };
 }
 
+function buildTocUnitsFromSelections(
+  lessonPlanId: string,
+  selectedLessons: { chapter: ChapterOption; lesson: LessonOption }[],
+  selectedChapters: ChapterOption[]
+): TOCUnit[] {
+  if (selectedLessons.length > 0) {
+    return selectedLessons.map(({ chapter, lesson }, index) => {
+      const computedComplexity =
+        lesson.complexity_score ??
+        deriveLessonComplexityScore({
+          title: lesson.title,
+          content: lesson.content,
+          learningObjectives: lesson.learning_objectives,
+        });
+      const estimatedMinutes = lesson.estimated_minutes ?? complexityScoreToEstimatedMinutes(computedComplexity);
+
+      return {
+        id: lesson.lesson_id,
+        courseId: lessonPlanId,
+        chapterId: chapter.chapter_id,
+        chapterTitle: chapter.title,
+        title: `Lesson ${index + 1}: ${lesson.title}`,
+        order: index + 1,
+        estimatedMinutes,
+        difficulty: complexityScoreToDifficulty(computedComplexity),
+        preferredSessionType: "lecture",
+        required: true,
+      };
+    });
+  }
+
+  return selectedChapters.map((chapter, index) => ({
+    id: chapter.chapter_id,
+    courseId: lessonPlanId,
+    chapterId: chapter.chapter_id,
+    chapterTitle: chapter.title,
+    title: `Lesson ${index + 1}: ${chapter.title}`,
+    order: index + 1,
+    estimatedMinutes: 60,
+    difficulty: "medium",
+    preferredSessionType: "lecture",
+    required: true,
+  }));
+}
+
+function buildTeacherRulesFromCounts(requirementCounts: Record<RequirementKey, string>): TeacherRules {
+  return {
+    quizMode: "hybrid",
+    quizEveryNLessons: 3,
+    writtenWorkMode: "total",
+    writtenWorkTarget: Math.max(1, Number(requirementCounts.written_work || "1")),
+    allowLessonWrittenWorkOverlay: true,
+    preferLessonWrittenWorkOverlay: true,
+    performanceTaskMin: Math.max(1, Number(requirementCounts.performance_task || "1")),
+    includeReviewBeforeExam: Math.max(1, Number(requirementCounts.exam || "1")) > 0,
+  };
+}
+
+function buildRecurringSchedules(
+  activeDays: Set<WeekdayName>,
+  daySchedules: Record<WeekdayName, DaySchedule>
+): RawMeetingSchedule[] {
+  return Array.from(activeDays).reduce<RawMeetingSchedule[]>((acc, day) => {
+    daySchedules[day].instances.forEach((slot, index) => {
+        const startTime = toSqlTime(slot.start);
+        const endTime = toSqlTime(slot.end);
+        if (!startTime || !endTime) return;
+        acc.push({
+          id: slot.id,
+          slotNumber: index + 1,
+          dayOfWeek: DAY_OPTIONS.findIndex((item) => item.key === day) + 1,
+          startTime: startTime.slice(0, 5),
+          endTime: endTime.slice(0, 5),
+          sessionType: slot.room,
+        });
+    });
+    return acc;
+  }, []);
+}
+
 function makeInstance(room: RoomType = "lecture", start = "8:00 AM", end = "10:00 AM"): ClassInstance {
   return { id: makeId(), room, start, end };
 }
@@ -275,6 +497,12 @@ export default function LessonplanScreen() {
   const { colors: c } = useAppTheme();
   const createInFlightRef = useRef(false);
   const lastAutoPlanNameRef = useRef("");
+  const hydratedDuplicateIdRef = useRef("");
+  const params = useLocalSearchParams<{ duplicateFromPlanId?: string | string[] }>();
+  const duplicateFromPlanId = useMemo(() => {
+    const value = params.duplicateFromPlanId;
+    return Array.isArray(value) ? String(value[0] ?? "") : String(value ?? "");
+  }, [params.duplicateFromPlanId]);
 
   if (Platform.OS === "android" && UIManager.setLayoutAnimationEnabledExperimental) {
     UIManager.setLayoutAnimationEnabledExperimental(true);
@@ -322,29 +550,29 @@ export default function LessonplanScreen() {
     exam: "1",
   });
 
-  const [activeDays, setActiveDays] = useState<Set<WeekdayName>>(new Set(["monday", "wednesday"]));
+  const [activeDays, setActiveDays] = useState<Set<WeekdayName>>(new Set());
   const [daySchedules, setDaySchedules] = useState<Record<WeekdayName, DaySchedule>>({
     monday: {
-      instances: [makeInstance("lecture", "8:00 AM", "10:00 AM"), makeInstance("laboratory", "1:00 PM", "3:00 PM")],
+      instances: [],
     },
     tuesday: {
-      instances: [makeInstance("lecture", "8:00 AM", "10:00 AM")],
+      instances: [],
     },
     wednesday: {
-      instances: [makeInstance("lecture", "8:00 AM", "10:00 AM")],
+      instances: [],
     },
     thursday: {
-      instances: [makeInstance("lecture", "8:00 AM", "10:00 AM")],
+      instances: [],
     },
     friday: {
-      instances: [makeInstance("lecture", "8:00 AM", "10:00 AM")],
+      instances: [],
     },
     saturday: {
-      instances: [makeInstance("lecture", "8:00 AM", "10:00 AM")],
+      instances: [],
     },
   });
 
-  const [specialDates, setSpecialDates] = useState<SpecialDate[]>([{ id: makeId(), dateText: `${nowYear}-06-05`, reason: "" }]);
+  const [specialDates, setSpecialDates] = useState<SpecialDate[]>([{ id: makeId(), dateText: "", reason: "" }]);
   const [examSchedules, setExamSchedules] = useState<ExamSchedule[]>([{ id: makeId(), dateText: "" }]);
 
   const selectedInstitution = useMemo(
@@ -518,7 +746,7 @@ export default function LessonplanScreen() {
     }
   }, []);
 
-  const loadChapters = useCallback(async (subjectId: string) => {
+  const loadChapters = useCallback(async (subjectId: string, options?: { openModal?: boolean; autoSelectAll?: boolean }) => {
     if (!subjectId) {
       setChapters([]);
       setSelectedChapterIds(new Set());
@@ -530,7 +758,7 @@ export default function LessonplanScreen() {
       const { data, error } = await supabase
         .from("chapters")
         .select(
-          "chapter_id, title, sequence_no, unit:units(unit_id, title, sequence_no), lessons(lesson_id, chapter_id, title, sequence_no, content, learning_objectives, estimated_minutes)"
+          "chapter_id, title, sequence_no, unit:units(unit_id, title, sequence_no), lessons(lesson_id, chapter_id, title, sequence_no, content, learning_objectives, estimated_minutes, complexity_score)"
         )
         .eq("subject_id", subjectId)
         .order("sequence_no", { ascending: true });
@@ -553,14 +781,20 @@ export default function LessonplanScreen() {
             learning_objectives: lesson?.learning_objectives ? String(lesson.learning_objectives) : null,
             estimated_minutes:
               typeof lesson?.estimated_minutes === "number" ? Number(lesson.estimated_minutes) : null,
+            complexity_score:
+              typeof lesson?.complexity_score === "number" ? Number(lesson.complexity_score) : null,
           }))
           .sort((a: LessonOption, b: LessonOption) => a.sequence_no - b.sequence_no),
       }));
 
       setChapters(mapped);
-      setSelectedChapterIds(new Set(mapped.map((item) => item.chapter_id)));
-      setSelectedLessonIds(new Set(mapped.flatMap((item) => item.lessons.map((lesson) => lesson.lesson_id))));
-      setChapterModalOpen(true);
+      if (options?.autoSelectAll ?? true) {
+        setSelectedChapterIds(new Set(mapped.map((item) => item.chapter_id)));
+        setSelectedLessonIds(new Set(mapped.flatMap((item) => item.lessons.map((lesson) => lesson.lesson_id))));
+      }
+      if (options?.openModal ?? true) {
+        setChapterModalOpen(true);
+      }
     } catch (err: any) {
       Alert.alert("Unable to load units/chapters", err?.message ?? "Please try again.");
       setChapters([]);
@@ -572,6 +806,161 @@ export default function LessonplanScreen() {
   useEffect(() => {
     loadBase();
   }, [loadBase]);
+
+  useEffect(() => {
+    if (loading || !duplicateFromPlanId || hydratedDuplicateIdRef.current === duplicateFromPlanId) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const hydrateDuplicate = async () => {
+      try {
+        const [{ data: planRow, error: planError }, { data: slotRows, error: slotsError }, { data: blockRows, error: blocksError }, { data: contentRows, error: contentError }] =
+          await Promise.all([
+            supabase
+              .from("lesson_plans")
+              .select("lesson_plan_id, title, academic_year, term, start_date, end_date, notes, school_id, subject_id, section_id")
+              .eq("lesson_plan_id", duplicateFromPlanId)
+              .maybeSingle(),
+            supabase
+              .from("slots")
+              .select("series_key, weekday, start_time, end_time, meeting_type, room, slot_number")
+              .eq("lesson_plan_id", duplicateFromPlanId),
+            supabase
+              .from("blocks")
+              .select("session_category, slot_id, metadata")
+              .eq("lesson_plan_id", duplicateFromPlanId),
+            supabase
+              .from("plan_subject_content")
+              .select("content_level, chapter_id, lesson_id")
+              .eq("lesson_plan_id", duplicateFromPlanId),
+          ]);
+
+        if (planError) throw planError;
+        if (slotsError) throw slotsError;
+        if (blocksError) throw blocksError;
+        if (contentError) throw contentError;
+        if (!planRow) throw new Error("The source lesson plan could not be found.");
+
+        const sourcePlan = planRow as DuplicatedPlanRow;
+        const institutionExists = institutions.some((item) => item.school_id === sourcePlan.school_id);
+        const subjectExists = subjects.some((item) => item.subject_id === sourcePlan.subject_id);
+        const sectionExists = sections.some((item) => item.section_id === sourcePlan.section_id);
+
+        if (!institutionExists || !subjectExists || !sectionExists) {
+          throw new Error("Some source plan references are no longer available in your account.");
+        }
+
+        const sourceSlots = (slotRows ?? []) as DuplicatedSlotRow[];
+        const sourceBlocks = (blockRows ?? []) as DuplicatedBlockRow[];
+        const sourceContent = (contentRows ?? []) as DuplicatedContentRow[];
+
+        const nextDaySchedules: Record<WeekdayName, DaySchedule> = {
+          monday: { instances: [] },
+          tuesday: { instances: [] },
+          wednesday: { instances: [] },
+          thursday: { instances: [] },
+          friday: { instances: [] },
+          saturday: { instances: [] },
+        };
+
+        const seenSeriesKeys = new Set<string>();
+        for (const row of sourceSlots) {
+          const dayKey = String(row.weekday ?? "").toLowerCase();
+          const seriesKey = String(row.series_key ?? "");
+          if (!DAY_OPTIONS.some((day) => day.key === dayKey)) continue;
+          if (seriesKey && seenSeriesKeys.has(seriesKey)) continue;
+          if (seriesKey) seenSeriesKeys.add(seriesKey);
+
+          const normalizedDay = dayKey as WeekdayName;
+          const room = row.room === "laboratory" || row.meeting_type === "laboratory" ? "laboratory" : "lecture";
+          nextDaySchedules[normalizedDay].instances.push({
+            id: makeId(),
+            room,
+            start: sqlTimeToDisplay(row.start_time),
+            end: sqlTimeToDisplay(row.end_time),
+          });
+        }
+
+        for (const day of DAY_OPTIONS) {
+          nextDaySchedules[day.key].instances.sort((a, b) => {
+            const startCompare = (toSqlTime(a.start) ?? "").localeCompare(toSqlTime(b.start) ?? "");
+            if (startCompare !== 0) return startCompare;
+            return (toSqlTime(a.end) ?? "").localeCompare(toSqlTime(b.end) ?? "");
+          });
+        }
+
+        const selectedDays = new Set(
+          DAY_OPTIONS.filter((day) => nextDaySchedules[day.key].instances.length > 0).map((day) => day.key)
+        );
+
+        const writtenWorkCount = sourceBlocks.filter((row) => row.session_category === "written_work").length;
+        const performanceTaskCount = sourceBlocks.filter((row) => row.session_category === "performance_task").length;
+        const examRows = sourceBlocks
+          .filter((row) => row.session_category === "exam")
+          .map((row) => ({
+            scheduled_date:
+              typeof row.metadata?.preferredDate === "string"
+                ? String(row.metadata.preferredDate)
+                : null,
+          }))
+          .sort((a, b) => (a.scheduled_date ?? "9999-99-99").localeCompare(b.scheduled_date ?? "9999-99-99"));
+
+        const chapterIds = new Set(
+          sourceContent
+            .filter((row) => row.content_level === "chapter" && row.chapter_id)
+            .map((row) => String(row.chapter_id))
+        );
+        const lessonIds = new Set(
+          sourceContent
+            .filter((row) => row.content_level === "lesson" && row.lesson_id)
+            .map((row) => String(row.lesson_id))
+        );
+
+        await loadChapters(sourcePlan.subject_id, { openModal: false, autoSelectAll: false });
+        if (cancelled) return;
+
+        setSelectedInstitutionId(sourcePlan.school_id);
+        setSelectedSubjectId(sourcePlan.subject_id);
+        setSelectedSectionId(sourcePlan.section_id);
+        setPlanName(`${sourcePlan.title} Copy`);
+        lastAutoPlanNameRef.current = "";
+        setTerm((sourcePlan.term === "quarter" || sourcePlan.term === "trimester" || sourcePlan.term === "semester")
+          ? sourcePlan.term
+          : "quarter");
+        setAcademicYearStart(parseAcademicStartYear(sourcePlan.academic_year) ?? new Date(`${sourcePlan.start_date}T00:00:00`).getFullYear());
+        setStartDate(sourcePlan.start_date);
+        setEndDate(sourcePlan.end_date);
+        setExtraRequirements(sourcePlan.notes ?? "");
+        setRequirementCounts({
+          written_work: String(Math.max(1, writtenWorkCount || 1)),
+          performance_task: String(Math.max(1, performanceTaskCount || 1)),
+          exam: String(Math.max(1, examRows.length || 1)),
+        });
+        setActiveDays(selectedDays);
+        setDaySchedules(nextDaySchedules);
+        setSelectedChapterIds(chapterIds);
+        setSelectedLessonIds(lessonIds);
+        setExamSchedules(
+          examRows.length > 0
+            ? examRows.map((row) => ({ id: makeId(), dateText: row.scheduled_date ?? "" }))
+            : [{ id: makeId(), dateText: "" }]
+        );
+        setSpecialDates([{ id: makeId(), dateText: "", reason: "" }]);
+        hydratedDuplicateIdRef.current = duplicateFromPlanId;
+      } catch (err: any) {
+        if (cancelled) return;
+        Alert.alert("Could not duplicate lesson plan", err?.message ?? "Please try again.");
+      }
+    };
+
+    void hydrateDuplicate();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [duplicateFromPlanId, institutions, loadChapters, loading, sections, subjects]);
 
   useEffect(() => {
     if (!autoPlanName) return;
@@ -647,6 +1036,31 @@ export default function LessonplanScreen() {
         ...prev,
         [day]: {
           instances: remaining.length > 0 ? remaining : [makeInstance()],
+        },
+      };
+    });
+  };
+
+  const duplicateInstance = (day: WeekdayName, instanceId: string) => {
+    animateIn();
+    setDaySchedules((prev) => {
+      const current = prev[day];
+      const index = current.instances.findIndex((item) => item.id === instanceId);
+      if (index === -1) return prev;
+
+      const source = current.instances[index];
+      const duplicated: ClassInstance = {
+        ...source,
+        id: makeId(),
+      };
+
+      const nextInstances = [...current.instances];
+      nextInstances.splice(index + 1, 0, duplicated);
+
+      return {
+        ...prev,
+        [day]: {
+          instances: nextInstances,
         },
       };
     });
@@ -857,6 +1271,14 @@ export default function LessonplanScreen() {
       Alert.alert("Schedule required", "Set valid class times for each selected day, with end time after start time.");
       return;
     }
+
+    const draftRecurringSlots = collectDraftRecurringSlots({ activeDays, daySchedules });
+    const draftConflict = findDraftScheduleOverlap(draftRecurringSlots);
+    if (draftConflict) {
+      Alert.alert("Schedule conflict", draftConflict.message);
+      return;
+    }
+
     if (!hasRequirementCounts) {
       Alert.alert("Requirements required", "Fill in Written Work, Performance Task, and Exam counts.");
       return;
@@ -875,6 +1297,77 @@ export default function LessonplanScreen() {
       } = await supabase.auth.getUser();
       if (userError) throw userError;
       if (!user) throw new Error("No signed-in user found.");
+
+      const { data: overlappingPlans, error: overlappingPlansError } = await supabase
+        .from("lesson_plans")
+        .select("lesson_plan_id, title, start_date, end_date")
+        .eq("user_id", user.id)
+        .lte("start_date", normalizedEnd)
+        .gte("end_date", normalizedStart);
+      if (overlappingPlansError) throw overlappingPlansError;
+
+      const overlappingPlanIds = (overlappingPlans ?? []).map((row: any) => String(row.lesson_plan_id)).filter(Boolean);
+      if (overlappingPlanIds.length > 0) {
+        const titleByPlanId = new Map(
+          (overlappingPlans ?? []).map((row: any) => [
+            String(row.lesson_plan_id),
+            {
+              title: String(row.title ?? "Untitled Plan"),
+              start_date: String(row.start_date),
+              end_date: String(row.end_date),
+            },
+          ])
+        );
+
+        const { data: existingSlots, error: existingSlotsError } = await supabase
+          .from("slots")
+          .select("lesson_plan_id, weekday, start_time, end_time, series_key")
+          .in("lesson_plan_id", overlappingPlanIds);
+        if (existingSlotsError) throw existingSlotsError;
+
+        const seenExistingSeries = new Set<string>();
+        const existingRecurringRows: ExistingRecurringClass[] = (existingSlots ?? [])
+          .map((row: any) => {
+            const planId = String(row.lesson_plan_id ?? "");
+            const meta = titleByPlanId.get(planId);
+            const day = row?.weekday ? String(row.weekday).toLowerCase() : "";
+            const start = row?.start_time ? String(row.start_time) : "";
+            const end = row?.end_time ? String(row.end_time) : "";
+            const seriesKey = String(row?.series_key ?? `${planId}_${day}_${start}_${end}`);
+            if (
+              !meta ||
+              !DAY_OPTIONS.some((item) => item.key === day) ||
+              !start ||
+              !end
+            ) {
+              return null;
+            }
+            if (seenExistingSeries.has(seriesKey)) return null;
+            seenExistingSeries.add(seriesKey);
+
+            return {
+              lesson_plan_id: planId,
+              title: meta.title,
+              start_date: meta.start_date,
+              end_date: meta.end_date,
+              day: day as WeekdayName,
+              start_time: start,
+              end_time: end,
+            };
+          })
+          .filter((row: ExistingRecurringClass | null): row is ExistingRecurringClass => Boolean(row));
+
+        const existingConflict = findExistingScheduleOverlap({
+          slots: draftRecurringSlots,
+          existingRows: existingRecurringRows,
+          nextPlanStart: normalizedStart,
+          nextPlanEnd: normalizedEnd,
+        });
+        if (existingConflict) {
+          Alert.alert("Schedule conflict", existingConflict.message);
+          return;
+        }
+      }
 
       const title = planName.trim();
       const yearText = formatAcademicYear(academicYearStart).trim() || buildAcademicYearFallback(normalizedStart, normalizedEnd);
@@ -917,127 +1410,120 @@ export default function LessonplanScreen() {
           return a.lesson.sequence_no - b.lesson.sequence_no;
         });
 
-      const defaultLessonSubtype: "lecture" = "lecture";
+      const recurringSchedules = buildRecurringSchedules(activeDays, daySchedules);
+      const generatedSlots = buildSlots({
+        courseId: lessonPlanId,
+        startDate: normalizedStart,
+        endDate: normalizedEnd,
+        rawMeetingSchedules: recurringSchedules,
+      });
 
-      const lessonRows =
-        selectedLessons.length > 0
-          ? selectedLessons.map(({ chapter, lesson }, index) => ({
-              lesson_plan_id: lessonPlanId,
-              lesson_id: lesson.lesson_id,
-              entry_type: "planned_item",
-              session_category: "lesson",
-              session_subcategory: defaultLessonSubtype,
-              scheduled_date: null,
-              is_locked: false,
-              title: `Lesson ${index + 1}: ${lesson.title}`,
-              description:
-                lesson.learning_objectives || lesson.content ||
-                (chapter.unit_title
-                  ? `${chapter.unit_title} • Chapter ${chapter.sequence_no}`
-                  : `Chapter ${chapter.sequence_no}`),
-            }))
-          : selectedChapters.map((chapter, index) => ({
-              lesson_plan_id: lessonPlanId,
-              entry_type: "planned_item",
-              session_category: "lesson",
-              session_subcategory: defaultLessonSubtype,
-              scheduled_date: null,
-              is_locked: false,
-              title: `Lesson ${index + 1}: ${chapter.title}`,
-              description: chapter.unit_title
-                ? `${chapter.unit_title} • Chapter ${chapter.sequence_no}`
-                : `Chapter ${chapter.sequence_no}`,
-            }));
+      const slotRows = generatedSlots.map((slot) => {
+        const sourceSchedule = recurringSchedules.find(
+          (candidate) =>
+            candidate.dayOfWeek === new Date(`${slot.date}T00:00:00`).getDay() &&
+            candidate.startTime === slot.startTime &&
+            candidate.endTime === slot.endTime &&
+            candidate.sessionType === slot.sessionType
+        );
+        const seriesKey = sourceSchedule?.id ?? `${slot.date}_${slot.startTime}_${slot.endTime}`;
+        const weekday = DAY_OPTIONS.find((day) => {
+          const dayIndex = DAY_OPTIONS.findIndex((item) => item.key === day.key) + 1;
+          return dayIndex === new Date(`${slot.date}T00:00:00`).getDay();
+        })?.key ?? "monday";
 
-      const recurringRows = Array.from(activeDays)
-        .map((day) => {
-          const schedule = daySchedules[day];
-          if (!schedule) return [];
-
-          return schedule.instances
-            .map((instance, idx) => {
-              const parsedStart = toSqlTime(instance.start);
-              const parsedEnd = toSqlTime(instance.end);
-              if (!parsedStart || !parsedEnd || parsedEnd <= parsedStart) return null;
-
-              return {
-                lesson_plan_id: lessonPlanId,
-                entry_type: "recurring_class",
-                day,
-                start_time: parsedStart,
-                end_time: parsedEnd,
-                meeting_type: instance.room,
-                session_category: "lesson",
-                session_subcategory: instance.room,
-                room: instance.room,
-                instance_no: idx + 1,
-                is_locked: false,
-                title: `${DAY_OPTIONS.find((item) => item.key === day)?.label ?? day} ${idx + 1} (${instance.room === "lecture" ? "Lecture" : "Laboratory"})`,
-              };
-            })
-            .filter((row): row is NonNullable<typeof row> => Boolean(row));
-        })
-        .flat();
-
-      const wwCount = Math.max(1, Number(requirementCounts.written_work || "1"));
-      const ptCount = Math.max(1, Number(requirementCounts.performance_task || "1"));
-      const examCount = Math.max(1, Number(requirementCounts.exam || "1"));
-
-      const writtenWorkRows = Array.from({ length: wwCount }, (_, index) => {
-        const subtype: "assignment" | "seatwork" | "quiz" = index % 3 === 0 ? "assignment" : index % 3 === 1 ? "seatwork" : "quiz";
-        const label = subtype[0].toUpperCase() + subtype.slice(1);
         return {
+          slot_id: slot.id,
           lesson_plan_id: lessonPlanId,
-          entry_type: "planned_item",
-          session_category: "written_work",
-          session_subcategory: subtype,
-          scheduled_date: null,
+          title: null,
+          slot_date: slot.date,
+          weekday,
+          start_time: `${slot.startTime}:00`,
+          end_time: `${slot.endTime}:00`,
+          meeting_type: slot.sessionType === "lecture" || slot.sessionType === "laboratory" ? slot.sessionType : null,
+          room: slot.sessionType === "lecture" || slot.sessionType === "laboratory" ? slot.sessionType : null,
+          slot_number: sourceSchedule?.slotNumber ?? 1,
+          series_key: seriesKey,
           is_locked: false,
-          title: `${label} ${index + 1}`,
-          description: null,
-          ww_subtype: subtype,
         };
       });
 
-      const performanceTaskRows = Array.from({ length: ptCount }, (_, index) => {
-        const subtype: "activity" | "project" = ptCount > 1 && index === ptCount - 1 ? "project" : "activity";
-        const label = subtype[0].toUpperCase() + subtype.slice(1);
-        return {
-          lesson_plan_id: lessonPlanId,
-          entry_type: "planned_item",
-          session_category: "performance_task",
-          session_subcategory: subtype === "project" ? "project" : "activity",
-          scheduled_date: null,
-          is_locked: false,
-          title: `${label} ${index + 1}`,
-          description: null,
-          pt_subtype: subtype,
-        };
-      });
+      if (slotRows.length > 0) {
+        const { error: slotsError } = await supabase.from("slots").insert(slotRows);
+        if (slotsError) throw slotsError;
+      }
 
-      const examRows = Array.from({ length: examCount }, (_, index) => {
-        const examDefinition = getExamDefinition(index, examCount);
-        const rawExamDate = examSchedules[index]?.dateText ?? "";
-        const normalizedExamDate = normalizeDateInput(rawExamDate);
-        const scheduledDate =
-          /^\d{4}-\d{2}-\d{2}$/.test(normalizedExamDate) ? normalizedExamDate : null;
-
+      const tocUnits = buildTocUnitsFromSelections(lessonPlanId, selectedLessons, selectedChapters);
+      const teacherRules = buildTeacherRulesFromCounts(requirementCounts);
+      const examTemplates = examSchedules.map((row, index) => {
+        const examDefinition = getExamDefinition(index, examSchedules.length);
+        const normalizedExamDate = normalizeDateInput(row.dateText);
         return {
-          lesson_plan_id: lessonPlanId,
-          entry_type: "planned_item",
-          session_category: "exam",
-          session_subcategory: examDefinition.subcategory,
-          scheduled_date: scheduledDate,
-          is_locked: Boolean(scheduledDate),
+          id: `exam_template_${index + 1}`,
           title: examDefinition.title,
-          description: null,
+          estimatedMinutes: 90,
+          subcategory: examDefinition.subcategory,
+          preferredDate: /^\d{4}-\d{2}-\d{2}$/.test(normalizedExamDate) ? normalizedExamDate : null,
+          required: true,
         };
       });
 
-      const entryPayload = [...recurringRows, ...lessonRows, ...writtenWorkRows, ...performanceTaskRows, ...examRows];
-      if (entryPayload.length > 0) {
-        const { error: entriesError } = await supabase.from("plan_entries").insert(entryPayload);
-        if (entriesError) throw entriesError;
+      const generatedBlocks = buildBlocks({
+        courseId: lessonPlanId,
+        tocUnits,
+        teacherRules,
+        examBlockTemplates: examTemplates,
+      });
+
+      const lessonDetailsById = new Map(
+        selectedLessons.map(({ chapter, lesson }) => [
+          lesson.lesson_id,
+          {
+            lessonId: lesson.lesson_id,
+            description:
+              lesson.learning_objectives || lesson.content ||
+              (chapter.unit_title ? `${chapter.unit_title} • Chapter ${chapter.sequence_no}` : `Chapter ${chapter.sequence_no}`),
+          },
+        ])
+      );
+
+      const blockRows = generatedBlocks.map((block) => {
+        const lessonDetails =
+          typeof block.sourceTocId === "string" ? lessonDetailsById.get(block.sourceTocId) ?? null : null;
+        return {
+          lesson_plan_id: lessonPlanId,
+          slot_id: null,
+          root_block_id: null,
+          lesson_id: lessonDetails?.lessonId ?? null,
+          algorithm_block_key: block.id,
+          block_key: block.id,
+          title: block.title,
+          description: lessonDetails?.description ?? null,
+          session_category: block.type,
+          session_subcategory: block.subcategory,
+          meeting_type:
+            block.preferredSessionType === "lecture" || block.preferredSessionType === "laboratory"
+              ? block.preferredSessionType
+              : null,
+          estimated_minutes: block.estimatedMinutes,
+          min_minutes: block.minMinutes ?? null,
+          max_minutes: block.maxMinutes ?? null,
+          required: block.required,
+          splittable: block.splittable,
+          overlay_mode: block.overlayMode,
+          preferred_session_type: block.preferredSessionType,
+          dependency_keys: block.dependencies,
+          order_no: 1,
+          is_locked: false,
+          ww_subtype: block.type === "written_work" ? block.subcategory : null,
+          pt_subtype: block.type === "performance_task" ? block.subcategory : null,
+          metadata: block.metadata ?? {},
+        };
+      });
+
+      if (blockRows.length > 0) {
+        const { error: blocksError } = await supabase.from("blocks").insert(blockRows);
+        if (blocksError) throw blocksError;
       }
 
       const subjectContentRows = selectedSubjectOutline
@@ -1113,7 +1599,10 @@ export default function LessonplanScreen() {
         if (eventsError) throw eventsError;
       }
 
-      Alert.alert("Lesson plan created", "Your lesson plan was saved.", [{ text: "OK", onPress: () => router.push("/calendar") }]);
+      emitLessonPlanRefresh();
+      Alert.alert("Lesson plan created", "Your lesson plan was saved.", [
+        { text: "OK", onPress: () => router.push("/(tabs)/calendar") },
+      ]);
     } catch (err: any) {
       Alert.alert("Could not create lesson plan", err?.message ?? "Please try again.");
     } finally {
@@ -1361,7 +1850,7 @@ export default function LessonplanScreen() {
                   return (
                     <View key={instance.id} style={[styles.instanceWrap, { borderColor }]}> 
                       <View style={styles.instanceHeaderRow}>
-                        <Text style={styles.instanceLabel}>Meeting {index + 1}</Text>
+                        <Text style={styles.instanceLabel}>Slot {index + 1}</Text>
                         <View style={styles.instanceHeaderRight}>
                           <View style={styles.instanceRoomSwitch}>
                             <Pressable
@@ -1389,11 +1878,16 @@ export default function LessonplanScreen() {
                               {instance.room === "laboratory" ? <Text style={styles.roomChipTextActive}>Laboratory</Text> : null}
                             </Pressable>
                           </View>
-                          {row.instances.length > 1 ? (
-                            <Pressable style={styles.removeBtn} onPress={() => removeInstance(day.key, instance.id)}>
-                              <Ionicons name="close" size={16} color="#8A8A8A" />
+                          <View style={styles.instanceActionRow}>
+                            <Pressable style={styles.removeBtn} onPress={() => duplicateInstance(day.key, instance.id)}>
+                              <Ionicons name="copy-outline" size={14} color="#8A8A8A" />
                             </Pressable>
-                          ) : null}
+                            {row.instances.length > 1 ? (
+                              <Pressable style={styles.removeBtn} onPress={() => removeInstance(day.key, instance.id)}>
+                                <Ionicons name="close" size={16} color="#8A8A8A" />
+                              </Pressable>
+                            ) : null}
+                          </View>
                         </View>
                       </View>
 
@@ -1904,6 +2398,11 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     gap: 8,
+  },
+  instanceActionRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
   },
   instanceRoomSwitch: {
     flexDirection: "row",

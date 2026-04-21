@@ -2,7 +2,7 @@ import { LockedDateInput, SessionSlot, SessionType } from "./types";
 
 export type RawMeetingSchedule = {
   id?: string;
-  instanceNo?: number | null;
+  slotNumber?: number | null;
   dayOfWeek: number; // 0 = Sunday, 1 = Monday, ... 6 = Saturday
   startTime: string; // HH:mm
   endTime: string; // HH:mm
@@ -78,7 +78,7 @@ function buildLockedDateMap(lockedDates: LockedDateInput[] = []): Map<string, Lo
 function buildStableSlotId(courseId: string, date: string, schedule: RawMeetingSchedule): string {
   const stableSuffix =
     schedule.id ??
-    `${schedule.dayOfWeek}_${schedule.instanceNo ?? 1}_${schedule.startTime}_${schedule.endTime}_${schedule.sessionType}`;
+    `${schedule.dayOfWeek}_${schedule.slotNumber ?? 1}_${schedule.startTime}_${schedule.endTime}_${schedule.sessionType}`;
 
   return `${courseId}__${date}__${stableSuffix}`;
 }

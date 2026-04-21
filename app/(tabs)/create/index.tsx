@@ -19,7 +19,7 @@ const OPTIONS: CreateOption[] = [
     route: "/(tabs)/create/lessonplan",
   },
   { key: "subject", label: "Subject", icon: "book-outline", route: "/(tabs)/create/subject" },
-  { key: "notes", label: "Notes", icon: "create-outline", route: "/(tabs)/create/notes" },
+  { key: "lesson", label: "Lesson", icon: "create-outline", route: "/(tabs)/create/lesson" },
   {
     key: "activities",
     label: "Activities",
@@ -60,7 +60,7 @@ export default function CreateScreen() {
       border: isDark ? "#5A4D6E" : "#E4D1E5",
       fg: isDark ? "#DDD1EB" : "#59446A",
     },
-    notes: {
+    lesson: {
       bg: isDark ? "#2D4634" : "#DFF2DE",
       border: isDark ? "#3E6049" : "#CFE2CD",
       fg: isDark ? "#C9E7D1" : "#3F6449",

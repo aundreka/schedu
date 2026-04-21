@@ -36,22 +36,12 @@ type PlanDetail = {
 
 type PlanEntryItem = {
   plan_entry_id: string;
-  title: string;
-  category: string;
-  entry_type: string;
   day: string | null;
-  scheduled_date: string | null;
   start_time: string | null;
   end_time: string | null;
   meeting_type: string | null;
-  session_category: string | null;
-  session_subcategory: string | null;
   room: string | null;
   instance_no: number | null;
-  description: string | null;
-  lesson_title: string | null;
-  ww_subtype: string | null;
-  pt_subtype: string | null;
 };
 
 type PlanDraft = {
@@ -85,6 +75,11 @@ const DAY_ORDER: Record<string, number> = {
 
 const TERM_OPTIONS = ["quarter", "trimester", "semester"] as const;
 const DAY_OPTIONS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"] as const;
+
+function makeId() {
+  if (typeof globalThis.crypto?.randomUUID === "function") return globalThis.crypto.randomUUID();
+  return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
 
 function toTitleCase(value: string) {
   return value
@@ -154,41 +149,47 @@ function toPlanDraft(plan: PlanDetail): PlanDraft {
   };
 }
 
-function inferWrittenWorkSubtype(title: string, description: string | null) {
-  const text = `${title} ${description ?? ""}`.toLowerCase();
-  if (text.includes("quiz")) return "quiz";
-  if (text.includes("seatwork")) return "seatwork";
-  return "assignment";
+function addDays(isoDate: string, days: number) {
+  const [year, month, day] = isoDate.split("-").map(Number);
+  const next = new Date(year, (month ?? 1) - 1, day ?? 1);
+  next.setDate(next.getDate() + days);
+  const yyyy = next.getFullYear();
+  const mm = String(next.getMonth() + 1).padStart(2, "0");
+  const dd = String(next.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
 }
 
-function inferPerformanceTaskSubtype(title: string, description: string | null) {
-  const text = `${title} ${description ?? ""}`.toLowerCase();
-  if (text.includes("project") || text.includes("preparation")) return "project";
-  return "activity";
+function buildSlotDatesForDay(startDate: string, endDate: string, weekday: string) {
+  const dates: string[] = [];
+  for (let cursor = startDate; cursor <= endDate; cursor = addDays(cursor, 1)) {
+    const date = new Date(`${cursor}T00:00:00`);
+    const label = DAY_OPTIONS[(date.getDay() + 6) % 7];
+    if (label === weekday) dates.push(cursor);
+  }
+  return dates;
 }
 
-function normalizeEntryCategory(
-  sessionCategory: string | null | undefined,
-  sessionSubcategory: string | null | undefined
-) {
-  const normalizedCategory = (sessionCategory ?? "").trim().toLowerCase();
-  const normalizedSubcategory = (sessionSubcategory ?? "").trim().toLowerCase();
+function makeDraftSchedule(): PlanEntryItem {
+  const key = `draft_${makeId()}`;
+  return {
+    plan_entry_id: key,
+    day: "monday",
+    start_time: "08:00:00",
+    end_time: "10:00:00",
+    meeting_type: "lecture",
+    room: "lecture",
+    instance_no: null,
+  };
+}
 
-  if (
-    normalizedCategory === "lesson" ||
-    normalizedCategory === "written_work" ||
-    normalizedCategory === "performance_task" ||
-    normalizedCategory === "exam" ||
-    normalizedCategory === "buffer"
-  ) {
-    return normalizedCategory;
-  }
-
-  if (normalizedSubcategory === "review" || normalizedSubcategory === "preparation") {
-    return "buffer";
-  }
-
-  return "lesson";
+function withInstanceNumbers(entries: PlanEntryItem[]) {
+  const daySlotCounts = new Map<string, number>();
+  return entries.map((entry) => {
+    const dayKey = entry.day ?? "";
+    const nextSlotNumber = (daySlotCounts.get(dayKey) ?? 0) + 1;
+    daySlotCounts.set(dayKey, nextSlotNumber);
+    return { ...entry, instance_no: nextSlotNumber };
+  });
 }
 
 function mapPlanDetail(row: any): PlanDetail | null {
@@ -227,35 +228,19 @@ function mapPlanDetail(row: any): PlanDetail | null {
 }
 
 function mapPlanEntry(row: any): PlanEntryItem | null {
-  const lessonRaw = row?.lesson;
-  const lesson = Array.isArray(lessonRaw) ? lessonRaw[0] : lessonRaw;
-  const planEntryId = String(row?.plan_entry_id ?? "");
-  const title = String(row?.title ?? "");
-  const sessionCategory = row?.session_category ? String(row.session_category) : null;
-  const sessionSubcategory = row?.session_subcategory ? String(row.session_subcategory) : null;
-  const category = normalizeEntryCategory(sessionCategory, sessionSubcategory);
-  const entryType = String(row?.entry_type ?? "planned_item");
+  const planEntryId = String(row?.series_key ?? "");
+  const meetingType = row?.meeting_type ? String(row.meeting_type) : row?.room ? String(row.room) : null;
 
-  if (!planEntryId || !title) return null;
+  if (!planEntryId) return null;
 
   return {
     plan_entry_id: planEntryId,
-    title,
-    category,
-    entry_type: entryType,
-    day: row?.day ? String(row.day) : null,
-    scheduled_date: row?.scheduled_date ? String(row.scheduled_date) : null,
+    day: row?.weekday ? String(row.weekday) : null,
     start_time: row?.start_time ? String(row.start_time) : null,
     end_time: row?.end_time ? String(row.end_time) : null,
-    meeting_type: row?.meeting_type ? String(row.meeting_type) : null,
-    session_category: sessionCategory,
-    session_subcategory: sessionSubcategory,
+    meeting_type: meetingType,
     room: row?.room ? String(row.room) : null,
-    instance_no: typeof row?.instance_no === "number" ? Number(row.instance_no) : null,
-    description: row?.description ? String(row.description) : null,
-    lesson_title: lesson?.title ? String(lesson.title) : null,
-    ww_subtype: row?.ww_subtype ? String(row.ww_subtype) : null,
-    pt_subtype: row?.pt_subtype ? String(row.pt_subtype) : null,
+    instance_no: typeof row?.slot_number === "number" ? Number(row.slot_number) : null,
   };
 }
 
@@ -315,27 +300,30 @@ export default function PlanDetailScreen() {
       }
 
       const { data: entryRows, error: entriesError } = await supabase
-        .from("plan_entries")
+        .from("slots")
         .select(
-          "plan_entry_id, title, entry_type, day, scheduled_date, start_time, end_time, meeting_type, session_category, session_subcategory, room, instance_no, description, ww_subtype, pt_subtype, lesson:lessons(title)"
+          "slot_id, title, weekday, slot_date, start_time, end_time, meeting_type, room, slot_number, series_key"
         )
         .eq("lesson_plan_id", mappedPlan.lesson_plan_id)
-        .order("scheduled_date", { ascending: true })
-        .order("day", { ascending: true })
+        .order("slot_date", { ascending: true })
         .order("start_time", { ascending: true });
       if (entriesError) throw entriesError;
 
+      const seenSeriesKeys = new Set<string>();
       const mappedEntries = (entryRows ?? [])
+        .filter((row: any) => {
+          const seriesKey = String(row?.series_key ?? "");
+          if (!seriesKey || seenSeriesKeys.has(seriesKey)) return false;
+          seenSeriesKeys.add(seriesKey);
+          return true;
+        })
         .map(mapPlanEntry)
         .filter((item: PlanEntryItem | null): item is PlanEntryItem => Boolean(item));
 
-      setEntries(mappedEntries);
+      const numberedEntries = withInstanceNumbers(mappedEntries);
+      setEntries(numberedEntries);
       if (!isEditing) {
-        setDraftEntries(
-          mappedEntries
-            .filter((entry) => entry.entry_type === "recurring_class")
-            .map((entry) => ({ ...entry }))
-        );
+        setDraftEntries(numberedEntries.map((entry) => ({ ...entry })));
       }
     } catch {
       setPlan(null);
@@ -354,32 +342,67 @@ export default function PlanDetailScreen() {
   const handleEdit = useCallback(() => {
     if (!plan) return;
     setDraft(toPlanDraft(plan));
-    setDraftEntries(
-      entries
-        .filter((entry) => entry.entry_type === "recurring_class")
-        .map((entry) => ({ ...entry }))
-    );
+    setDraftEntries(withInstanceNumbers(entries.map((entry) => ({ ...entry }))));
     setIsEditing(true);
   }, [entries, plan]);
 
+  const handleDuplicate = useCallback(() => {
+    if (!plan) return;
+    router.push({
+      pathname: "/(tabs)/create/lessonplan",
+      params: { duplicateFromPlanId: plan.lesson_plan_id },
+    });
+  }, [plan]);
+
   const handleCancelEdit = useCallback(() => {
     if (plan) setDraft(toPlanDraft(plan));
-    setDraftEntries(
-      entries
-        .filter((entry) => entry.entry_type === "recurring_class")
-        .map((entry) => ({ ...entry }))
-    );
+    setDraftEntries(withInstanceNumbers(entries.map((entry) => ({ ...entry }))));
     setIsEditing(false);
   }, [entries, plan]);
 
   const setEntryField = useCallback(
     <K extends keyof PlanEntryItem>(planEntryId: string, key: K, value: PlanEntryItem[K]) => {
       setDraftEntries((prev) =>
-        prev.map((entry) => (entry.plan_entry_id === planEntryId ? { ...entry, [key]: value } : entry))
+        withInstanceNumbers(
+          prev.map((entry) => (entry.plan_entry_id === planEntryId ? { ...entry, [key]: value } : entry))
+        )
       );
     },
     []
   );
+
+  const addDraftSchedule = useCallback((day: (typeof DAY_OPTIONS)[number] = "monday") => {
+    setDraftEntries((prev) => withInstanceNumbers([...prev, { ...makeDraftSchedule(), day }]));
+  }, []);
+
+  const duplicateDraftSchedule = useCallback((planEntryId: string) => {
+    setDraftEntries((prev) => {
+      const index = prev.findIndex((entry) => entry.plan_entry_id === planEntryId);
+      if (index === -1) return prev;
+      const source = prev[index];
+      const next = [...prev];
+      next.splice(index + 1, 0, {
+        ...source,
+        plan_entry_id: `draft_${makeId()}`,
+        instance_no: null,
+      });
+      return withInstanceNumbers(next);
+    });
+  }, []);
+
+  const removeDraftSchedule = useCallback((planEntryId: string) => {
+    setDraftEntries((prev) => withInstanceNumbers(prev.filter((entry) => entry.plan_entry_id !== planEntryId)));
+  }, []);
+
+  const toggleDraftDay = useCallback((day: (typeof DAY_OPTIONS)[number]) => {
+    setDraftEntries((prev) => {
+      const hasDay = prev.some((entry) => entry.day === day);
+      if (hasDay) {
+        return withInstanceNumbers(prev.filter((entry) => entry.day !== day));
+      }
+      return withInstanceNumbers([...prev, { ...makeDraftSchedule(), day }]);
+    });
+  }, []);
 
   const handleSave = useCallback(async () => {
     if (!plan || !draft) return;
@@ -410,25 +433,13 @@ export default function PlanDetailScreen() {
 
     const normalizedEntries: PlanEntryItem[] = [];
     for (const entry of draftEntries) {
-      const entryTitle = entry.title.trim();
-      const category = entry.category.trim().toLowerCase();
       const day = entry.day?.trim().toLowerCase() ?? "";
       const room = entry.room?.trim() ?? "";
-      const scheduledDateRaw = entry.scheduled_date?.trim() ?? "";
       const startTimeRaw = entry.start_time?.trim() ?? "";
       const endTimeRaw = entry.end_time?.trim() ?? "";
       const startTime = startTimeRaw ? parseSqlTime(startTimeRaw) : null;
       const endTime = endTimeRaw ? parseSqlTime(endTimeRaw) : null;
-      const scheduledDate = scheduledDateRaw ? scheduledDateRaw : null;
 
-      if (!entryTitle) {
-        Alert.alert("Entry title required", "Every plan entry must have a title.");
-        return;
-      }
-      if (scheduledDate && !isIsoDate(scheduledDate)) {
-        Alert.alert("Invalid entry date", "Planned entry dates must use YYYY-MM-DD.");
-        return;
-      }
       if (startTimeRaw && !startTime) {
         Alert.alert("Invalid start time", "Use 24-hour HH:MM (example: 13:30).");
         return;
@@ -437,38 +448,23 @@ export default function PlanDetailScreen() {
         Alert.alert("Invalid end time", "Use 24-hour HH:MM (example: 15:00).");
         return;
       }
-      if (entry.entry_type === "recurring_class") {
-        if (!DAY_OPTIONS.includes(day as (typeof DAY_OPTIONS)[number])) {
-          Alert.alert("Invalid meeting day", "Recurring meetings must have a valid day.");
-          return;
-        }
-        if (!startTime || !endTime) {
-          Alert.alert("Meeting time required", "Recurring meetings must have start and end times.");
-          return;
-        }
+      if (!DAY_OPTIONS.includes(day as (typeof DAY_OPTIONS)[number])) {
+        Alert.alert("Invalid meeting day", "Recurring meetings must have a valid day.");
+        return;
+      }
+      if (!startTime || !endTime) {
+        Alert.alert("Slot time required", "Recurring slots must have start and end times.");
+        return;
       }
 
       normalizedEntries.push({
         ...entry,
-        title: entryTitle,
-        category: category || "lesson",
         day: day || null,
-        meeting_type: entry.entry_type === "recurring_class" ? (room || null) : entry.meeting_type ?? null,
-        session_category:
-          entry.entry_type === "recurring_class"
-            ? "lesson"
-            : ["lesson", "written_work", "performance_task", "exam", "buffer"].includes(category)
-              ? category
-              : null,
-        session_subcategory:
-          entry.entry_type === "recurring_class"
-            ? (room || null)
-            : entry.session_subcategory ?? null,
+        meeting_type: room || null,
         room: room || null,
-        scheduled_date: scheduledDate,
         start_time: startTime,
         end_time: endTime,
-        description: entry.description?.trim() || null,
+        instance_no: null,
       });
     }
 
@@ -495,38 +491,59 @@ export default function PlanDetailScreen() {
         .eq("user_id", user.id);
       if (updateError) throw updateError;
 
-      for (const entry of normalizedEntries) {
-        const wwSubtype =
-          entry.category === "written_work"
-            ? inferWrittenWorkSubtype(entry.title, entry.description)
-            : null;
-        const ptSubtype =
-          entry.category === "performance_task"
-            ? inferPerformanceTaskSubtype(entry.title, entry.description)
-            : null;
+      const existingSeriesKeys = new Set(entries.map((entry) => entry.plan_entry_id));
+      const nextSeriesKeys = new Set(normalizedEntries.map((entry) => entry.plan_entry_id));
+      const removedSeriesKeys = Array.from(existingSeriesKeys).filter((seriesKey) => !nextSeriesKeys.has(seriesKey));
 
-        const payload = {
-          title: entry.title,
-          day: entry.day,
-          scheduled_date: entry.scheduled_date,
+      if (removedSeriesKeys.length > 0) {
+        const { error: deleteRemovedError } = await supabase
+          .from("slots")
+          .delete()
+          .eq("lesson_plan_id", plan.lesson_plan_id)
+          .in("series_key", removedSeriesKeys);
+        if (deleteRemovedError) throw deleteRemovedError;
+      }
+
+      const slotDatesBySeriesKey = new Map<string, string[]>();
+      for (const entry of normalizedEntries) {
+        const slotDates = buildSlotDatesForDay(startDate, endDate, entry.day ?? "");
+        if (slotDates.length === 0) {
+          Alert.alert("Schedule day out of range", `No ${entry.day ?? "selected"} dates fall within the current plan range.`);
+          return;
+        }
+        slotDatesBySeriesKey.set(entry.plan_entry_id, slotDates);
+      }
+
+      const daySlotCounts = new Map<string, number>();
+      for (const entry of normalizedEntries) {
+        const { error: deleteSeriesError } = await supabase
+          .from("slots")
+          .delete()
+          .eq("lesson_plan_id", plan.lesson_plan_id)
+          .eq("series_key", entry.plan_entry_id);
+        if (deleteSeriesError) throw deleteSeriesError;
+
+        const dayKey = entry.day ?? "";
+        const nextSlotNumber = (daySlotCounts.get(dayKey) ?? 0) + 1;
+        daySlotCounts.set(dayKey, nextSlotNumber);
+
+        const slotDates = slotDatesBySeriesKey.get(entry.plan_entry_id) ?? [];
+        const slotRows = slotDates.map((slotDate) => ({
+          lesson_plan_id: plan.lesson_plan_id,
+          title: null,
+          slot_date: slotDate,
+          weekday: entry.day,
           start_time: entry.start_time,
           end_time: entry.end_time,
-          meeting_type: entry.entry_type === "recurring_class" ? entry.room : entry.meeting_type,
-          session_category: entry.session_category,
-          session_subcategory: entry.session_subcategory,
+          meeting_type: entry.room,
           room: entry.room,
-          instance_no: entry.instance_no,
-          description: entry.description,
-          ww_subtype: wwSubtype,
-          pt_subtype: ptSubtype,
-        };
+          slot_number: nextSlotNumber,
+          series_key: entry.plan_entry_id,
+          is_locked: false,
+        }));
 
-        const { error: entryError } = await supabase
-          .from("plan_entries")
-          .update(payload)
-          .eq("plan_entry_id", entry.plan_entry_id)
-          .eq("lesson_plan_id", plan.lesson_plan_id);
-        if (entryError) throw entryError;
+        const { error: insertSeriesError } = await supabase.from("slots").insert(slotRows);
+        if (insertSeriesError) throw insertSeriesError;
       }
 
       setPlan((prev) =>
@@ -542,21 +559,17 @@ export default function PlanDetailScreen() {
             }
           : prev
       );
-      setEntries((prev) =>
-        prev.map((entry) => {
-          const updated = normalizedEntries.find((item) => item.plan_entry_id === entry.plan_entry_id);
-          return updated ? { ...updated } : entry;
-        })
-      );
-      setDraftEntries(normalizedEntries.map((entry) => ({ ...entry })));
+      const numberedEntries = withInstanceNumbers(normalizedEntries);
+      setEntries(numberedEntries.map((entry) => ({ ...entry })));
+      setDraftEntries(numberedEntries.map((entry) => ({ ...entry })));
       setIsEditing(false);
-      Alert.alert("Saved", "Lesson plan and entries have been updated.");
+      Alert.alert("Saved", "Lesson plan and schedule have been updated.");
     } catch (error: any) {
       Alert.alert("Update failed", error?.message ?? "Could not save lesson plan changes.");
     } finally {
       setSaving(false);
     }
-  }, [draft, draftEntries, plan]);
+  }, [draft, draftEntries, entries, plan]);
 
   const handleDeletePlan = useCallback(async () => {
     if (!plan || deleting) return;
@@ -606,7 +619,6 @@ export default function PlanDetailScreen() {
   const recurringEntries = useMemo(
     () =>
       (isEditing ? draftEntries : entries)
-        .filter((entry) => entry.entry_type === "recurring_class")
         .sort((a, b) => {
           const dayA = DAY_ORDER[a.day ?? ""] ?? 99;
           const dayB = DAY_ORDER[b.day ?? ""] ?? 99;
@@ -618,6 +630,16 @@ export default function PlanDetailScreen() {
         }),
     [draftEntries, entries, isEditing]
   );
+  const visibleDays = useMemo(
+    () =>
+      DAY_OPTIONS.filter((day) => recurringEntries.some((entry) => entry.day === day)),
+    [recurringEntries]
+  );
+
+  const filledFieldBg = c.card;
+  const emptyFieldBg = c.card;
+  const filledText = c.text;
+  const emptyFieldText = c.mutedText;
 
   return (
     <View style={[styles.page, { backgroundColor: c.background }]}> 
@@ -633,8 +655,8 @@ export default function PlanDetailScreen() {
         >
           <View style={styles.headingRow}>
             <View style={styles.headingLeft}>
-              <Pressable style={styles.backBtn} onPress={() => router.back()}>
-                <Ionicons name="chevron-back" size={18} color={c.text} />
+              <Pressable onPress={() => router.back()} hitSlop={10}>
+                <Ionicons name="caret-back" size={15} color={c.text} />
               </Pressable>
               <Text style={[styles.pageTitle, { color: c.text }]}>Plan Details</Text>
             </View>
@@ -660,18 +682,31 @@ export default function PlanDetailScreen() {
                 ) : (
                   <>
                     <Pressable
-                      style={[styles.actionBtn, styles.actionDanger, { opacity: deleting ? 0.7 : 1 }]}
+                      style={[styles.actionIconBtn, styles.actionDanger, { opacity: deleting ? 0.7 : 1 }]}
                       onPress={confirmDeletePlan}
                       disabled={deleting}
+                      accessibilityRole="button"
+                      accessibilityLabel="Delete lesson plan"
                     >
-                      <Text style={styles.actionPrimaryText}>{deleting ? "Deleting..." : "Delete"}</Text>
+                      <Ionicons name="trash-outline" size={16} color="#FFFFFF" />
                     </Pressable>
                     <Pressable
-                      style={[styles.actionBtn, styles.actionPrimary, { opacity: deleting ? 0.7 : 1 }]}
+                      style={[styles.actionIconBtn, styles.actionNeutral, { borderColor: c.border, opacity: deleting ? 0.7 : 1 }]}
+                      onPress={handleDuplicate}
+                      disabled={deleting}
+                      accessibilityRole="button"
+                      accessibilityLabel="Duplicate lesson plan"
+                    >
+                      <Ionicons name="copy-outline" size={16} color={c.text} />
+                    </Pressable>
+                    <Pressable
+                      style={[styles.actionIconBtn, styles.actionPrimary, { opacity: deleting ? 0.7 : 1 }]}
                       onPress={handleEdit}
                       disabled={deleting}
+                      accessibilityRole="button"
+                      accessibilityLabel="Edit lesson plan"
                     >
-                      <Text style={styles.actionPrimaryText}>Edit</Text>
+                      <Ionicons name="create-outline" size={16} color="#FFFFFF" />
                     </Pressable>
                   </>
                 )}
@@ -680,309 +715,271 @@ export default function PlanDetailScreen() {
           </View>
 
           {!plan ? (
-            <View style={[styles.cardWrap, { borderColor: c.border, backgroundColor: c.card }]}> 
+            <View style={[styles.emptyState, { borderColor: c.border, backgroundColor: c.card }]}> 
               <Text style={[styles.emptyText, { color: c.mutedText }]}>Plan not found.</Text>
             </View>
           ) : (
             <>
-              <View style={[styles.cardWrap, { borderColor: c.border, backgroundColor: c.card }]}>
-                <Text style={[styles.sectionTitle, { color: c.text }]}>Overview</Text>
+              <Text style={[styles.sectionTitle, { color: c.text }]}>Overview</Text>
 
-                <View style={styles.fieldGroup}>
-                  <Text style={[styles.fieldLabel, { color: c.text }]}>Title</Text>
-                  {isEditing && draft ? (
+              <TextInput
+                value={draft?.title ?? ""}
+                onChangeText={(value) => setDraft((prev) => (prev ? { ...prev, title: value } : prev))}
+                editable={isEditing}
+                placeholder="Lesson Plan Name"
+                placeholderTextColor="#B0B0B0"
+                style={[
+                  styles.nameInput,
+                  {
+                    backgroundColor: (draft?.title ?? "").trim() ? filledFieldBg : emptyFieldBg,
+                    color: (draft?.title ?? "").trim() ? filledText : emptyFieldText,
+                  },
+                ]}
+              />
+
+              <View style={styles.row2}>
+                <View style={[styles.boxField, { backgroundColor: filledFieldBg }]}>
+                  {isEditing ? (
                     <TextInput
-                      value={draft.title}
-                      onChangeText={(value) => setDraft((prev) => (prev ? { ...prev, title: value } : prev))}
-                      placeholder="Lesson plan title"
-                      placeholderTextColor={c.mutedText}
-                      style={[styles.formInput, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}
-                    />
-                  ) : (
-                    <Text style={[styles.formValue, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}>
-                      {plan.title}
-                    </Text>
-                  )}
-                </View>
-
-                <View style={styles.fieldGroup}>
-                  <Text style={[styles.fieldLabel, { color: c.text }]}>Term</Text>
-                  {isEditing && draft ? (
-                    <View style={styles.optionRow}>
-                      {TERM_OPTIONS.map((option) => (
-                        <Pressable
-                          key={option}
-                          style={[
-                            styles.optionChip,
-                            { borderColor: c.border, backgroundColor: c.card },
-                            draft.term === option ? { borderColor: c.tint, backgroundColor: `${c.tint}22` } : null,
-                          ]}
-                          onPress={() => setDraft((prev) => (prev ? { ...prev, term: option } : prev))}
-                        >
-                          <Text style={[styles.optionChipText, { color: draft.term === option ? c.tint : c.text }]}>
-                            {toTitleCase(option)}
-                          </Text>
-                        </Pressable>
-                      ))}
-                    </View>
-                  ) : (
-                    <Text style={[styles.formValue, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}>
-                      {toTitleCase(plan.term)}
-                    </Text>
-                  )}
-                </View>
-
-                <View style={styles.fieldRow}>
-                  <View style={[styles.fieldGroup, styles.fieldHalf]}>
-                    <Text style={[styles.fieldLabel, { color: c.text }]}>Start Date</Text>
-                    {isEditing && draft ? (
-                      <TextInput
-                        value={draft.start_date}
-                        onChangeText={(value) => setDraft((prev) => (prev ? { ...prev, start_date: value } : prev))}
-                        placeholder="YYYY-MM-DD"
-                        placeholderTextColor={c.mutedText}
-                        autoCapitalize="none"
-                        style={[styles.formInput, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}
-                      />
-                    ) : (
-                      <Text style={[styles.formValue, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}>
-                        {formatIsoDate(plan.start_date)}
-                      </Text>
-                    )}
-                  </View>
-                  <View style={[styles.fieldGroup, styles.fieldHalf]}>
-                    <Text style={[styles.fieldLabel, { color: c.text }]}>End Date</Text>
-                    {isEditing && draft ? (
-                      <TextInput
-                        value={draft.end_date}
-                        onChangeText={(value) => setDraft((prev) => (prev ? { ...prev, end_date: value } : prev))}
-                        placeholder="YYYY-MM-DD"
-                        placeholderTextColor={c.mutedText}
-                        autoCapitalize="none"
-                        style={[styles.formInput, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}
-                      />
-                    ) : (
-                      <Text style={[styles.formValue, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}>
-                        {formatIsoDate(plan.end_date)}
-                      </Text>
-                    )}
-                  </View>
-                </View>
-
-                <View style={styles.fieldRow}>
-                  <View style={[styles.fieldGroup, styles.fieldHalf]}>
-                    <Text style={[styles.fieldLabel, { color: c.text }]}>Section</Text>
-                    <Text style={[styles.formValue, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}>
-                      {plan.section_name}
-                    </Text>
-                  </View>
-                  <View style={[styles.fieldGroup, styles.fieldHalf]}>
-                    <Text style={[styles.fieldLabel, { color: c.text }]}>Grade Level</Text>
-                    <Text style={[styles.formValue, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}>
-                      {plan.section_grade_level ? `Grade ${plan.section_grade_level}` : "-"}
-                    </Text>
-                  </View>
-                </View>
-
-                <View style={styles.fieldGroup}>
-                  <Text style={[styles.fieldLabel, { color: c.text }]}>Academic Year</Text>
-                  {isEditing && draft ? (
-                    <TextInput
-                      value={draft.academic_year}
+                      value={draft?.academic_year ?? ""}
                       onChangeText={(value) => setDraft((prev) => (prev ? { ...prev, academic_year: value } : prev))}
-                      placeholder="Academic year"
-                      placeholderTextColor={c.mutedText}
-                      style={[styles.formInput, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}
+                      editable={isEditing}
+                      placeholder="Academic Year"
+                      placeholderTextColor="#B0B0B0"
+                      style={[styles.boxFieldInput, { color: (draft?.academic_year ?? "").trim() ? filledText : emptyFieldText }]}
                     />
                   ) : (
-                    <Text style={[styles.formValue, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}>
-                      {plan.academic_year || "No academic year"}
-                    </Text>
+                    <Text style={[styles.fieldText, { color: filledText }]}>{plan.academic_year || "Academic Year"}</Text>
                   )}
                 </View>
 
-                <View style={styles.fieldRow}>
-                  <View style={[styles.fieldGroup, styles.fieldHalf]}>
-                    <Text style={[styles.fieldLabel, { color: c.text }]}>Subject Code</Text>
-                    <Text style={[styles.formValue, styles.fieldStrong, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}>
-                      {plan.subject_code || "-"}
-                    </Text>
-                  </View>
-                  <View style={[styles.fieldGroup, styles.fieldHalf]}>
-                    <Text style={[styles.fieldLabel, { color: c.text }]}>Status</Text>
-                    <Text style={[styles.formValue, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}>
-                      {toTitleCase(plan.status)}
-                    </Text>
-                  </View>
+                <View style={[styles.boxField, { backgroundColor: filledFieldBg }]}>
+                  {isEditing ? (
+                    <Pressable onPress={() => setDraft((prev) => (prev ? { ...prev, term: prev.term === "quarter" ? "trimester" : prev.term === "trimester" ? "semester" : "quarter" } : prev))}>
+                      <Text style={[styles.fieldText, { color: filledText }]}>{TERM_OPTIONS.includes((draft?.term ?? "") as (typeof TERM_OPTIONS)[number]) ? toTitleCase(draft?.term ?? "") : "Term"}</Text>
+                    </Pressable>
+                  ) : (
+                    <Text style={[styles.fieldText, { color: filledText }]}>{toTitleCase(plan.term)}</Text>
+                  )}
+                </View>
+              </View>
+
+              <View style={styles.dateRow}>
+                <Text style={styles.fromToText}>from</Text>
+                <View style={[styles.datePill, { backgroundColor: filledFieldBg }]}>
+                  {isEditing ? (
+                    <TextInput
+                      value={draft?.start_date ?? ""}
+                      onChangeText={(value) => setDraft((prev) => (prev ? { ...prev, start_date: value } : prev))}
+                      editable={isEditing}
+                      placeholder="YYYY-MM-DD"
+                      placeholderTextColor="#B0B0B0"
+                      autoCapitalize="none"
+                      style={[styles.dateInputEditable, { color: (draft?.start_date ?? "").trim() ? filledText : emptyFieldText }]}
+                    />
+                  ) : (
+                    <Text style={[styles.dateInput, { color: filledText }]}>{formatIsoDate(plan.start_date)}</Text>
+                  )}
+                </View>
+                <Text style={styles.fromToText}>to</Text>
+                <View style={[styles.datePill, { backgroundColor: filledFieldBg }]}>
+                  {isEditing ? (
+                    <TextInput
+                      value={draft?.end_date ?? ""}
+                      onChangeText={(value) => setDraft((prev) => (prev ? { ...prev, end_date: value } : prev))}
+                      editable={isEditing}
+                      placeholder="YYYY-MM-DD"
+                      placeholderTextColor="#B0B0B0"
+                      autoCapitalize="none"
+                      style={[styles.dateInputEditable, { color: (draft?.end_date ?? "").trim() ? filledText : emptyFieldText }]}
+                    />
+                  ) : (
+                    <Text style={[styles.dateInput, { color: filledText }]}>{formatIsoDate(plan.end_date)}</Text>
+                  )}
+                </View>
+              </View>
+
+              <View style={styles.row2}>
+                <View style={[styles.boxField, { backgroundColor: filledFieldBg }]}>
+                  <Text style={[styles.fieldText, { color: filledText }]} numberOfLines={1}>
+                    {plan.subject_code ? `${plan.subject_code} - ${plan.subject_title}` : plan.subject_title}
+                  </Text>
                 </View>
 
-                <View style={styles.fieldGroup}>
-                  <Text style={[styles.fieldLabel, { color: c.text }]}>School</Text>
-                  <Text style={[styles.formValue, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}>
+                <View style={[styles.boxField, { backgroundColor: filledFieldBg }]}>
+                  <Text style={[styles.fieldText, { color: filledText }]} numberOfLines={1}>
+                    {plan.section_name}
+                  </Text>
+                </View>
+              </View>
+
+              <View style={styles.row2}>
+                <View style={[styles.boxField, { backgroundColor: filledFieldBg }]}>
+                  <Text style={[styles.fieldText, { color: filledText }]} numberOfLines={1}>
                     {plan.school_name}
                   </Text>
                 </View>
 
-                <View style={styles.fieldGroup}>
-                  <Text style={[styles.fieldLabel, { color: c.text }]}>Subject</Text>
-                  <Text style={[styles.formValue, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}>
-                    {plan.subject_title}
+                <View style={[styles.boxField, { backgroundColor: filledFieldBg }]}>
+                  <Text style={[styles.fieldText, { color: filledText }]} numberOfLines={1}>
+                    {plan.section_grade_level ? `Grade ${plan.section_grade_level}` : toTitleCase(plan.status)}
                   </Text>
                 </View>
-
-                <View style={styles.fieldGroup}>
-                  <Text style={[styles.fieldLabel, { color: c.text }]}>Notes</Text>
-                  {isEditing && draft ? (
-                    <TextInput
-                      value={draft.notes}
-                      onChangeText={(value) => setDraft((prev) => (prev ? { ...prev, notes: value } : prev))}
-                      placeholder="Type notes..."
-                      placeholderTextColor={c.mutedText}
-                      multiline
-                      style={[styles.formInput, styles.notesInput, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}
-                    />
-                  ) : (
-                    <Text style={[styles.formValue, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}>
-                      {plan.notes || "No notes"}
-                    </Text>
-                  )}
-                </View>
               </View>
 
-              <View style={[styles.cardWrap, { borderColor: c.border, backgroundColor: c.card }]}> 
-                <Text style={[styles.sectionTitle, { color: c.text }]}>Weekly Meetings</Text>
-                {recurringEntries.length === 0 ? (
-                  <Text style={[styles.emptyText, { color: c.mutedText }]}>No recurring meetings.</Text>
-                ) : (
-                  recurringEntries.map((entry) => (
-                    <View key={entry.plan_entry_id} style={[styles.entryItem, { borderColor: c.border }]}> 
+              <Pressable style={styles.scheduleBar}>
+                <Text style={styles.scheduleBarText}>Schedule</Text>
+              </Pressable>
+
+              <View style={styles.dayChipRow}>
+                {DAY_OPTIONS.map((day) => {
+                  const active = recurringEntries.some((entry) => entry.day === day);
+                  return isEditing ? (
+                    <Pressable
+                      key={day}
+                      style={[styles.dayChipPill, active ? styles.dayChipPillActive : undefined]}
+                      onPress={() => toggleDraftDay(day)}
+                    >
+                      <Text style={[styles.dayChipPillText, { color: active ? c.card : c.mutedText }]}>{DAY_LABEL[day].slice(0, 3)}</Text>
+                    </Pressable>
+                  ) : (
+                    <View
+                      key={day}
+                      style={[styles.dayChipPill, active ? styles.dayChipPillActive : undefined]}
+                    >
+                      <Text style={[styles.dayChipPillText, { color: active ? c.card : c.mutedText }]}>{DAY_LABEL[day].slice(0, 3)}</Text>
+                    </View>
+                  );
+                })}
+              </View>
+
+              {visibleDays.map((day) => {
+                const rows = recurringEntries.filter((entry) => entry.day === day);
+
+                return (
+                  <View key={day} style={styles.scheduleCard}>
+                    <View style={styles.scheduleCardHeader}>
+                      <Text style={styles.dayLabel}>{DAY_LABEL[day]}</Text>
                       {isEditing ? (
-                        <>
-                          <View style={styles.fieldGroupCompact}>
-                            <Text style={[styles.entryFieldLabel, { color: c.mutedText }]}>Title</Text>
-                            <TextInput
-                              value={entry.title}
-                              onChangeText={(value) => setEntryField(entry.plan_entry_id, "title", value)}
-                              placeholder="Meeting title"
-                              placeholderTextColor={c.mutedText}
-                              style={[styles.entryInput, styles.entryTitleInput, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}
-                            />
-                          </View>
-                          <View style={styles.fieldGroupCompact}>
-                            <Text style={[styles.entryFieldLabel, { color: c.mutedText }]}>Category</Text>
-                            <TextInput
-                              value={entry.category}
-                              onChangeText={(value) => setEntryField(entry.plan_entry_id, "category", value)}
-                              placeholder="Category"
-                              placeholderTextColor={c.mutedText}
-                              autoCapitalize="none"
-                              style={[styles.entryInput, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}
-                            />
-                          </View>
-                        </>
+                        <Pressable style={styles.iconAction} onPress={() => addDraftSchedule(day)}>
+                          <Text style={styles.plusText}>+</Text>
+                        </Pressable>
                       ) : (
-                        <View style={styles.entryTopRow}>
-                          <Text style={[styles.entryTitle, { color: c.text }]}>{entry.title}</Text>
-                          <Text style={[styles.entryChip, { backgroundColor: "#E7EEF5", color: "#1F2937" }]}>
-                            {toTitleCase(entry.category)}
-                          </Text>
-                        </View>
-                      )}
-                      {isEditing ? (
-                        <>
-                          <Text style={[styles.entryFieldLabel, { color: c.mutedText }]}>Day</Text>
-                          <View style={styles.entryEditRow}>
-                            <View style={styles.entryDayRow}>
-                              {DAY_OPTIONS.map((day) => (
-                                <Pressable
-                                  key={`${entry.plan_entry_id}_${day}`}
-                                  style={[
-                                    styles.dayChip,
-                                    entry.day === day ? styles.dayChipActive : null,
-                                  ]}
-                                  onPress={() => setEntryField(entry.plan_entry_id, "day", day)}
-                                >
-                                  <Text
-                                    style={[
-                                      styles.dayChipText,
-                                      entry.day === day ? styles.dayChipTextActive : null,
-                                    ]}
-                                  >
-                                    {DAY_LABEL[day].slice(0, 3)}
-                                  </Text>
-                                </Pressable>
-                              ))}
-                            </View>
-                          </View>
-                          <View style={styles.entryEditRow}>
-                            <TextInput
-                              value={entry.instance_no ? String(entry.instance_no) : ""}
-                              onChangeText={(value) => {
-                                const parsed = Number(value);
-                                setEntryField(
-                                  entry.plan_entry_id,
-                                  "instance_no",
-                                  Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : null
-                                );
-                              }}
-                              placeholder="Meeting #"
-                              keyboardType="number-pad"
-                              placeholderTextColor={c.mutedText}
-                              style={[styles.entryInput, styles.entryHalfInput, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}
-                            />
-                            <TextInput
-                              value={entry.room ?? ""}
-                              onChangeText={(value) => setEntryField(entry.plan_entry_id, "room", value)}
-                              placeholder="Room"
-                              placeholderTextColor={c.mutedText}
-                              style={[styles.entryInput, styles.entryHalfInput, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}
-                            />
-                          </View>
-                          <View style={styles.entryEditRow}>
-                            <TextInput
-                              value={toTimeInput(entry.start_time)}
-                              onChangeText={(value) => setEntryField(entry.plan_entry_id, "start_time", value)}
-                              placeholder="Start HH:MM"
-                              placeholderTextColor={c.mutedText}
-                              autoCapitalize="none"
-                              style={[styles.entryInput, styles.entryHalfInput, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}
-                            />
-                            <TextInput
-                              value={toTimeInput(entry.end_time)}
-                              onChangeText={(value) => setEntryField(entry.plan_entry_id, "end_time", value)}
-                              placeholder="End HH:MM"
-                              placeholderTextColor={c.mutedText}
-                              autoCapitalize="none"
-                              style={[styles.entryInput, styles.entryHalfInput, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}
-                            />
-                          </View>
-                          <TextInput
-                            value={entry.description ?? ""}
-                            onChangeText={(value) => setEntryField(entry.plan_entry_id, "description", value)}
-                            placeholder="Description"
-                            placeholderTextColor={c.mutedText}
-                            multiline
-                            style={[styles.entryInput, styles.entryDescriptionInput, { color: c.text, borderColor: c.border, backgroundColor: c.card }]}
-                          />
-                        </>
-                      ) : (
-                        <>
-                          <Text style={[styles.entryMeta, { color: c.mutedText }]}> 
-                            {DAY_LABEL[entry.day ?? ""] ?? "-"}
-                            {entry.instance_no ? ` • Meeting ${entry.instance_no}` : ""}
-                            {entry.room ? ` • ${toTitleCase(entry.room)}` : ""}
-                          </Text>
-                          <Text style={[styles.entryMeta, { color: c.mutedText }]}> 
-                            {[formatTime(entry.start_time), formatTime(entry.end_time)].filter(Boolean).join(" - ") || "No time"}
-                          </Text>
-                          {entry.description ? <Text style={[styles.entryDesc, { color: c.text }]}>{entry.description}</Text> : null}
-                        </>
+                        <View style={styles.iconAction} />
                       )}
                     </View>
-                  ))
-                )}
-              </View>
 
+                    <View style={styles.slotStack}>
+                      {rows.map((entry) => {
+                        const borderColor = entry.room === "laboratory" ? "#D9534F" : "#2D7BD8";
+                        return (
+                          <View key={entry.plan_entry_id} style={[styles.instanceWrap, { borderColor }]}>
+                            <View style={styles.instanceHeaderRow}>
+                              <Text style={styles.instanceLabel}>Slot {entry.instance_no ?? 1}</Text>
+                              <View style={styles.instanceHeaderRight}>
+                                <View style={styles.instanceRoomSwitch}>
+                                  {(["lecture", "laboratory"] as const).map((roomOption) => {
+                                    const selected = (entry.room ?? "lecture") === roomOption;
+                                    return (
+                                      <Pressable
+                                        key={`${entry.plan_entry_id}_${roomOption}`}
+                                        disabled={!isEditing}
+                                        style={({ pressed }) => [
+                                          styles.roomIconChip,
+                                          selected ? styles.roomIconChipActive : undefined,
+                                          roomOption === "lecture" ? styles.roomChipLecture : styles.roomChipLaboratory,
+                                          isEditing && pressed ? styles.pressScale : undefined,
+                                        ]}
+                                        onPress={() => setEntryField(entry.plan_entry_id, "room", roomOption)}
+                                      >
+                                        <Ionicons
+                                          name={roomOption === "lecture" ? "school-outline" : "flask-outline"}
+                                          size={14}
+                                          color={selected ? "#5E6B7A" : c.mutedText}
+                                        />
+                                        {selected ? <Text style={styles.roomChipTextActive}>{toTitleCase(roomOption)}</Text> : null}
+                                      </Pressable>
+                                    );
+                                  })}
+                                </View>
+                                {isEditing ? (
+                                  <View style={styles.instanceActionRow}>
+                                    <Pressable style={styles.removeBtn} onPress={() => duplicateDraftSchedule(entry.plan_entry_id)}>
+                                      <Ionicons name="copy-outline" size={14} color="#8A8A8A" />
+                                    </Pressable>
+                                    {rows.length > 1 ? (
+                                      <Pressable style={styles.removeBtn} onPress={() => removeDraftSchedule(entry.plan_entry_id)}>
+                                        <Ionicons name="close" size={16} color="#8A8A8A" />
+                                      </Pressable>
+                                    ) : null}
+                                  </View>
+                                ) : null}
+                              </View>
+                            </View>
+
+                            <View style={styles.timeRowCentered}>
+                              {isEditing ? (
+                                <>
+                                  <TextInput
+                                    value={toTimeInput(entry.start_time)}
+                                    onChangeText={(value) => setEntryField(entry.plan_entry_id, "start_time", value)}
+                                    placeholder="Start HH:MM"
+                                    placeholderTextColor="#B0B0B0"
+                                    autoCapitalize="none"
+                                    style={[styles.timeInputEditable, { borderColor, color: c.text }]}
+                                  />
+                                  <Text style={styles.toText}>to</Text>
+                                  <TextInput
+                                    value={toTimeInput(entry.end_time)}
+                                    onChangeText={(value) => setEntryField(entry.plan_entry_id, "end_time", value)}
+                                    placeholder="End HH:MM"
+                                    placeholderTextColor="#B0B0B0"
+                                    autoCapitalize="none"
+                                    style={[styles.timeInputEditable, { borderColor, color: c.text }]}
+                                  />
+                                </>
+                              ) : (
+                                <>
+                                  <View style={[styles.timeInputButton, { borderColor }]}>
+                                    <Text style={styles.timeInputText}>{formatTime(entry.start_time)}</Text>
+                                  </View>
+                                  <Text style={styles.toText}>to</Text>
+                                  <View style={[styles.timeInputButton, { borderColor }]}>
+                                    <Text style={styles.timeInputText}>{formatTime(entry.end_time)}</Text>
+                                  </View>
+                                </>
+                              )}
+                            </View>
+                          </View>
+                        );
+                      })}
+                    </View>
+                  </View>
+                );
+              })}
+
+              {recurringEntries.length === 0 ? (
+                <Text style={[styles.emptyText, { color: c.mutedText }]}>No schedule yet.</Text>
+              ) : null}
+
+              <View style={styles.divider} />
+
+              <Text style={[styles.sectionTitle, { color: c.text }]}>Extra Requirements</Text>
+              <TextInput
+                value={draft?.notes ?? ""}
+                onChangeText={(value) => setDraft((prev) => (prev ? { ...prev, notes: value } : prev))}
+                editable={isEditing}
+                placeholder="Type notes..."
+                placeholderTextColor="#B0B0B0"
+                multiline
+                style={[
+                  styles.extraBox,
+                  {
+                    backgroundColor: (draft?.notes ?? "").trim() ? filledFieldBg : emptyFieldBg,
+                    color: (draft?.notes ?? "").trim() ? filledText : emptyFieldText,
+                  },
+                ]}
+              />
             </>
           )}
         </ScrollView>
@@ -1011,11 +1008,24 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     gap: 8,
   },
+  emptyState: {
+    borderRadius: Radius.md,
+    borderWidth: 1,
+    padding: Spacing.md,
+  },
   actionBtn: {
     height: 32,
     minWidth: 66,
     borderRadius: Radius.sm,
     paddingHorizontal: 12,
+    alignItems: "center",
+    justifyContent: "center",
+    borderWidth: 1,
+  },
+  actionIconBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: Radius.sm,
     alignItems: "center",
     justifyContent: "center",
     borderWidth: 1,
@@ -1040,71 +1050,63 @@ const styles = StyleSheet.create({
     color: "#FFFFFF",
     fontWeight: "700",
   },
-  backBtn: {
-    width: 28,
-    height: 28,
-    borderRadius: Radius.sm,
-    alignItems: "center",
-    justifyContent: "center",
-  },
   pageTitle: { ...Typography.h1 },
-  cardWrap: {
-    borderRadius: Radius.md,
-    borderWidth: 1,
-    padding: Spacing.md,
-    gap: Spacing.sm,
-  },
   sectionTitle: { ...Typography.h2 },
-  fieldGroup: {
-    gap: 6,
-    marginTop: 4,
-  },
-  fieldGroupCompact: {
-    gap: 4,
-  },
-  fieldRow: {
-    flexDirection: "row",
-    gap: 8,
-  },
-  fieldHalf: {
+  row2: { flexDirection: "row", gap: 8 },
+  boxField: {
     flex: 1,
-  },
-  fieldLabel: {
-    ...Typography.caption,
-    fontWeight: "600",
-  },
-  formInput: {
-    ...Typography.body,
-    borderWidth: 1,
+    minHeight: 48,
     borderRadius: Radius.sm,
-    paddingHorizontal: 12,
-    paddingVertical: 11,
-  },
-  formValue: {
-    ...Typography.body,
     borderWidth: 1,
-    borderRadius: Radius.sm,
-    paddingHorizontal: 12,
-    paddingVertical: 11,
-  },
-  optionRow: {
-    flexDirection: "row",
-    gap: 6,
-    flexWrap: "wrap",
-  },
-  optionChip: {
-    borderRadius: Radius.round,
-    borderWidth: 1,
+    borderColor: "#D8DDE3",
+    justifyContent: "center",
+    alignItems: "center",
     paddingHorizontal: 10,
-    paddingVertical: 6,
   },
-  optionChipText: {
+  boxFieldInput: {
+    ...Typography.body,
+    textAlign: "center",
+    width: "100%",
+  },
+  fieldText: {
+    ...Typography.body,
+    textAlign: "center",
+    width: "100%",
+  },
+  nameInput: {
+    ...Typography.body,
+    minHeight: 48,
+    borderRadius: Radius.sm,
+    borderWidth: 1,
+    borderColor: "#D8DDE3",
+    paddingHorizontal: 12,
+    textAlign: "center",
+  },
+  dateRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  fromToText: {
     ...Typography.caption,
-    fontWeight: "600",
+    color: "#7E7E7E",
+    width: 30,
+    textAlign: "center",
   },
-  fieldStrong: {
-    ...Typography.h3,
-    fontStyle: "italic",
+  datePill: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: "#D8DDE3",
+    borderRadius: Radius.round,
+    minHeight: 42,
+    justifyContent: "center",
+    paddingHorizontal: 14,
+  },
+  dateInput: {
+    ...Typography.caption,
+    textAlign: "center",
+    paddingVertical: 0,
+  },
+  dateInputEditable: {
+    ...Typography.caption,
+    textAlign: "center",
+    paddingVertical: 0,
   },
   notesInput: {
     minHeight: 84,
@@ -1113,83 +1115,151 @@ const styles = StyleSheet.create({
   emptyText: {
     ...Typography.body,
   },
-  entryItem: {
-    borderWidth: 1,
+  scheduleBar: {
+    minHeight: 48,
     borderRadius: Radius.sm,
-    padding: Spacing.sm,
-    gap: 4,
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: "#D8DDE3",
+    alignItems: "center",
+    justifyContent: "center",
   },
-  entryTopRow: {
+  scheduleBarText: { ...Typography.h2, color: "#4B5563", fontWeight: "500" },
+  dayChipRow: { flexDirection: "row", gap: 8 },
+  dayChipPill: {
+    flex: 1,
+    minHeight: 46,
+    borderRadius: Radius.sm,
+    borderWidth: 1,
+    borderColor: "#D8DDE3",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#FFFFFF",
+  },
+  dayChipPillActive: { backgroundColor: "#6B7280", borderColor: "#6B7280" },
+  dayChipPillText: { ...Typography.h3, fontWeight: "500" },
+  scheduleCard: {
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: "#D8DDE3",
+    borderRadius: Radius.md,
+    padding: 10,
+    gap: 8,
+  },
+  scheduleCardHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  dayLabel: { ...Typography.body, color: "#7A7A7A", fontWeight: "600" },
+  slotStack: { gap: 8 },
+  instanceWrap: {
+    borderWidth: 2,
+    borderRadius: Radius.sm,
+    backgroundColor: "#FFFFFF",
+    padding: 8,
+    gap: 8,
+  },
+  instanceHeaderRow: {
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
-    gap: Spacing.sm,
   },
-  entryTitle: {
-    ...Typography.body,
-    flex: 1,
-    fontWeight: "600",
-  },
-  entryFieldLabel: {
-    ...Typography.caption,
-    fontWeight: "600",
-  },
-  entryInput: {
-    ...Typography.body,
-    borderWidth: 1,
-    borderRadius: Radius.sm,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-  },
-  entryTitleInput: {
-    fontWeight: "600",
-  },
-  entryEditRow: {
+  instanceLabel: { ...Typography.caption, color: "#5F5F5F", fontWeight: "600" },
+  instanceHeaderRight: {
     flexDirection: "row",
+    alignItems: "center",
     gap: 8,
   },
-  entryHalfInput: {
-    flex: 1,
-  },
-  entryDescriptionInput: {
-    minHeight: 64,
-    textAlignVertical: "top",
-  },
-  entryDayRow: {
+  instanceActionRow: {
     flexDirection: "row",
-    flexWrap: "wrap",
+    alignItems: "center",
     gap: 6,
   },
-  dayChip: {
+  instanceRoomSwitch: {
+    flexDirection: "row",
+    gap: 6,
+  },
+  roomIconChip: {
+    minHeight: 28,
+    minWidth: 28,
     borderRadius: Radius.round,
     borderWidth: 1,
-    paddingHorizontal: 9,
-    paddingVertical: 5,
+    borderColor: "#D8DDE3",
+    paddingHorizontal: 8,
+    alignItems: "center",
+    justifyContent: "center",
+    flexDirection: "row",
+    gap: 5,
+    backgroundColor: "#FFFFFF",
   },
-  dayChipActive: {
-    borderColor: "#1F2937",
-    backgroundColor: "#1F2937",
+  roomIconChipActive: {
+    minWidth: 108,
+    paddingHorizontal: 10,
   },
-  dayChipText: {
+  roomChipLecture: { borderColor: "#C5CCD6", backgroundColor: "#F7FAFC" },
+  roomChipLaboratory: { borderColor: "#C5CCD6", backgroundColor: "#F7FAFC" },
+  roomChipTextActive: {
     ...Typography.caption,
-    color: "#334155",
+    color: "#6B7280",
     fontWeight: "600",
   },
-  dayChipTextActive: {
-    color: "#FFFFFF",
+  pressScale: {
+    transform: [{ scale: 0.96 }],
   },
-  entryChip: {
-    ...Typography.caption,
-    paddingHorizontal: 8,
-    paddingVertical: 3,
+  timeRowCentered: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+  },
+  timeInputButton: {
+    minHeight: 36,
+    minWidth: 105,
+    borderWidth: 1,
     borderRadius: Radius.round,
-    overflow: "hidden",
+    backgroundColor: "#FFFFFF",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 12,
   },
-  entryMeta: {
+  timeInputEditable: {
     ...Typography.caption,
+    minHeight: 36,
+    minWidth: 105,
+    borderWidth: 1,
+    borderRadius: Radius.round,
+    backgroundColor: "#FFFFFF",
+    textAlign: "center",
+    paddingHorizontal: 12,
   },
-  entryDesc: {
+  timeInputText: { ...Typography.caption, color: "#1F2937", textAlign: "center" },
+  toText: { ...Typography.caption, color: "#666666" },
+  removeBtn: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#D8DDE3",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  iconAction: { width: 24, height: 24, alignItems: "center", justifyContent: "center" },
+  plusText: { ...Typography.h2, color: "#6B7280", fontWeight: "600" },
+  divider: {
+    height: 1,
+    backgroundColor: "#E5E7EB",
+    marginTop: 4,
+    marginBottom: 6,
+  },
+  extraBox: {
+    minHeight: 170,
+    borderRadius: Radius.sm,
+    paddingHorizontal: 10,
+    paddingVertical: 10,
     ...Typography.body,
-    marginTop: 2,
+    textAlignVertical: "top",
+    fontStyle: "italic",
+    fontWeight: "400",
   },
 });
