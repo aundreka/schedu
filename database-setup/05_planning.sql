@@ -82,7 +82,7 @@ create table if not exists public.blocks (
     or (session_category = 'written_work' and session_subcategory in ('assignment', 'seatwork', 'quiz'))
     or (session_category = 'performance_task' and session_subcategory in ('activity', 'lab_report', 'reporting', 'project'))
     or (session_category = 'exam' and session_subcategory in ('prelim', 'midterm', 'final'))
-    or (session_category = 'buffer' and session_subcategory in ('review', 'preparation', 'other'))
+    or (session_category = 'buffer' and session_subcategory in ('review', 'preparation', 'orientation', 'other'))
   )
 );
 

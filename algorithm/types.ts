@@ -1,9 +1,3 @@
-export type SessionType = "lecture" | "laboratory" | "any";
-
-export type Complexity = number; // 1 (easy) to 10 (hard)
-
-export type OverlayMode = "exclusive" | "major" | "minor";
-
 export type SessionCategory =
   | "lesson"
   | "written_work"
@@ -26,26 +20,61 @@ export type SessionSubcategory =
   | "final"
   | "review"
   | "preparation"
+  | "orientation"
   | "other";
 
-export type PlacementLane = "major" | "minor";
+export type SessionType = "lecture" | "laboratory" | "mixed" | "any";
+export type Difficulty = "easy" | "medium" | "high";
+export type WeekdayName =
+  | "monday"
+  | "tuesday"
+  | "wednesday"
+  | "thursday"
+  | "friday"
+  | "saturday"
+  | "sunday";
 
-export type ValidationSeverity = "info" | "warning" | "error";
+export type BlockOverlayMode = "exclusive" | "major" | "minor";
 
-export interface SessionSlot {
+export type Placement = {
+  id: string;
+  blockId: string;
+  slotId: string;
+  lane: "major" | "minor";
+  minutesUsed: number;
+  chainId: string;
+  segmentIndex: number;
+  segmentCount: number;
+  continuesFromPrevious: boolean;
+  continuesToNext: boolean;
+  startTime: string | null;
+  endTime: string | null;
+};
+
+export type SessionSlot = {
   id: string;
   courseId: string;
-  date: string; // YYYY-MM-DD
-  startTime: string | null; // HH:mm
-  endTime: string | null; // HH:mm
+  date: string;
+  weekday?: WeekdayName | null;
+  startTime: string | null;
+  endTime: string | null;
   sessionType: SessionType | null;
   minutes: number;
   locked: boolean;
-  lockReason?: string | null;
+  lockReason: string | null;
+  slotNumber?: number;
+  seriesKey?: string | null;
+  termIndex?: number;
+  termKey?: string;
+  termLabel?: string;
+  termSlotIndex?: number;
+  isTermStart?: boolean;
+  isTermEnd?: boolean;
+  reservedFor?: "orientation" | "lesson" | "exam" | null;
   placements: Placement[];
-}
+};
 
-export interface Lesson {
+export type TOCUnit = {
   id: string;
   courseId: string;
   chapterId?: string | null;
@@ -53,12 +82,64 @@ export interface Lesson {
   title: string;
   order: number;
   estimatedMinutes: number;
-  complexity?: Complexity;
-  preferredSessionType?: SessionType;
+  difficulty: Difficulty;
+  preferredSessionType: SessionType;
   required: boolean;
-}
+};
 
-export interface Block {
+export type TeacherRules = {
+  quizMode?: "none" | "hybrid" | "strict";
+  quizEveryNLessons?: number;
+  writtenWorkMode?: "total" | "per_term";
+  minWW?: number;
+  allowLessonWrittenWorkOverlay?: boolean;
+  preferLessonWrittenWorkOverlay?: boolean;
+  minPT?: number;
+  includeReviewBeforeExam?: boolean;
+  delays?: number;
+};
+
+export type ExamBlockTemplate = {
+  id: string;
+  title: string;
+  estimatedMinutes: number;
+  subcategory: Extract<SessionSubcategory, "prelim" | "midterm" | "final">;
+  preferredDate?: string | null;
+  required: boolean;
+};
+
+export type TermKey = "prelim" | "midterm" | "final";
+
+export type TermLessonAllocation = {
+  termIndex: number;
+  termKey: TermKey;
+  label: string;
+  tocUnits: TOCUnit[];
+  rawTermSlots: number;
+  initialDelayCount: number;
+  termLessons: number;
+  termWW: number;
+  termPT: number;
+  termQuizAmount: number;
+  lessonInterval: number;
+  termSlots: number;
+  extraTermSlots: number;
+  startDate: string | null;
+  endDate: string | null;
+  examDate: string | null;
+  hasOrientation: boolean;
+};
+
+export type PacingPlan = {
+  totalSlots: number;
+  lessonCount: number;
+  termCount: number;
+  minWrittenWorks: number;
+  minPerformanceTasks: number;
+  terms: TermLessonAllocation[];
+};
+
+export type Block = {
   id: string;
   courseId: string;
   type: SessionCategory;
@@ -70,81 +151,20 @@ export interface Block {
   maxMinutes?: number;
   required: boolean;
   splittable: boolean;
-  overlayMode: OverlayMode;
-  order: number;
+  overlayMode: BlockOverlayMode;
   preferredSessionType: SessionType;
-  dependencies: string[]; // block ids that must be scheduled before this block
-  metadata?: Record<string, unknown>;
-}
+  dependencies: string[];
+  metadata: Record<string, unknown>;
+};
 
-export interface Placement {
-  id: string;
-  blockId: string;
-  slotId: string;
-  lane: PlacementLane;
-  minutesUsed: number;
-  chainId?: string | null;
-  segmentIndex?: number;
-  segmentCount?: number;
-  continuesFromPrevious?: boolean;
-  continuesToNext?: boolean;
-  startTime?: string | null;
-  endTime?: string | null;
-}
-
-export interface CourseInfo {
-  id: string;
-  title: string;
-  startDate: string; // YYYY-MM-DD
-  endDate: string; // YYYY-MM-DD
-}
-
-export interface TeacherRules {
-  quizMode: "per_chapter" | "every_n_lessons" | "hybrid";
-  quizEveryNLessons?: number;
-  writtenWorkMode: "total" | "per_lesson";
-  minWW: number;
-  allowLessonWrittenWorkOverlay: boolean;
-  preferLessonWrittenWorkOverlay: boolean;
-  minPT: number;
-  includeReviewBeforeExam: boolean;
-}
-
-export interface LockedDateInput {
-  date: string; // YYYY-MM-DD
-  reason: string;
-  appliesToAllSlots?: boolean;
-  slotIds?: string[];
-}
-
-export interface LessonPlanInput {
-  course: CourseInfo;
-  sessionSlots: SessionSlot[];
-  Lesson: Lesson[];
-  teacherRules: TeacherRules;
-  lockedDates?: LockedDateInput[];
-}
-
-export interface ValidationIssue {
+export type ValidationIssue = {
   code: string;
-  severity: ValidationSeverity;
+  severity: "info" | "warning" | "error";
   message: string;
-  relatedIds?: string[];
-}
+  relatedIds: string[];
+};
 
-export interface LessonPlanSummary {
-  totalLessons: number;
-  scheduledLessons: number;
-  totalPerformanceTasks: number;
-  totalWrittenWorks: number;
-  emptySlots: number;
-  utilizationRate: number; // 0 to 1
-}
-
-export interface LessonPlanResult {
+export type PlacementResult = {
   slots: SessionSlot[];
-  blocks: Block[];
-  unscheduledBlocks: Block[];
-  validations: ValidationIssue[];
-  summary: LessonPlanSummary;
-}
+  unscheduledBlockIds: string[];
+};

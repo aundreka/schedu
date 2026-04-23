@@ -48,6 +48,7 @@ begin
       'final',
       'review',
       'preparation',
+      'orientation',
       'other'
     );
   end if;

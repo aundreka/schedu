@@ -56,6 +56,16 @@ type PlanItem = {
   title: string;
 };
 
+type PlanEntryRow = {
+  block_id: string;
+  root_block_id: string | null;
+  block_key: string | null;
+  algorithm_block_key: string | null;
+  lesson_id: string | null;
+  session_category: string | null;
+  title: string | null;
+};
+
 type LessonPlanSummary = {
   lesson_plan_id: string;
   academic_year: string | null;
@@ -89,6 +99,67 @@ function isHttpUrl(value: string) {
 
 function sanitizeFileName(name: string) {
   return name.replace(/[^\w.\-]+/g, "_");
+}
+
+function isUuid(value: string | null | undefined) {
+  if (!value) return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function normalizePlanEntryTitle(title: string) {
+  return title
+    .replace(/\s*\(part\s*\d+\s*\/\s*\d+\)\s*$/i, "")
+    .replace(/\s*\(cont\.\s*\d+\s*\/\s*\d+\)\s*$/i, "")
+    .trim();
+}
+
+function buildPlanEntryKey(row: PlanEntryRow, category: PlanEntryCategory, normalizedTitle: string) {
+  return (
+    row.root_block_id ??
+    row.block_key ??
+    row.algorithm_block_key ??
+    row.lesson_id ??
+    `${category}|${normalizedTitle.toLowerCase()}`
+  );
+}
+
+function dedupePlanEntries(rows: PlanEntryRow[]) {
+  const written = new Map<string, PlanItem>();
+  const performance = new Map<string, PlanItem>();
+
+  for (const row of rows) {
+    const category = String(row.session_category) as PlanEntryCategory;
+    if (category !== "written_work" && category !== "performance_task") continue;
+
+    const normalizedTitle = normalizePlanEntryTitle(String(row.title ?? "Untitled")) || "Untitled";
+    const preferredId =
+      (isUuid(row.root_block_id) ? row.root_block_id : null) ??
+      (isUuid(row.block_id) ? row.block_id : null) ??
+      String(row.block_id);
+    const item: PlanItem = {
+      plan_entry_id: preferredId,
+      category,
+      title: normalizedTitle,
+    };
+
+    const key = buildPlanEntryKey(row, category, normalizedTitle);
+    const bucket = category === "written_work" ? written : performance;
+    const existing = bucket.get(key);
+
+    if (!existing) {
+      bucket.set(key, item);
+      continue;
+    }
+
+    if (isUuid(row.root_block_id) && existing.plan_entry_id !== row.root_block_id) {
+      bucket.set(key, item);
+    }
+  }
+
+  return {
+    written: Array.from(written.values()),
+    performance: Array.from(performance.values()),
+  };
 }
 
 function guessExtension(mimeType?: string | null) {
@@ -310,22 +381,15 @@ export default function SubjectDetailScreen() {
       if (selectedPlan?.lesson_plan_id) {
         const { data: entryRows, error: entriesError } = await supabase
           .from("blocks")
-          .select("block_id, session_category, title")
+          .select("block_id, root_block_id, block_key, algorithm_block_key, lesson_id, session_category, title")
           .eq("lesson_plan_id", selectedPlan.lesson_plan_id)
           .in("session_category", ["written_work", "performance_task"])
           .order("created_at", { ascending: true });
         if (entriesError) throw entriesError;
 
-        for (const row of entryRows ?? []) {
-          const category = String(row.session_category) as PlanEntryCategory;
-          const item: PlanItem = {
-            plan_entry_id: String(row.block_id),
-            category,
-            title: String(row.title ?? "Untitled"),
-          };
-          if (category === "written_work") written.push(item);
-          if (category === "performance_task") performance.push(item);
-        }
+        const dedupedEntries = dedupePlanEntries((entryRows ?? []) as PlanEntryRow[]);
+        written = dedupedEntries.written;
+        performance = dedupedEntries.performance;
       }
 
       setSubject(normalizedSubject);

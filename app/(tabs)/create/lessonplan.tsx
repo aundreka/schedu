@@ -24,6 +24,7 @@ import {
   deriveLessonComplexityScore,
 } from "../../../algorithm/buildPacingPlan";
 import { buildSlots, type RawMeetingSchedule } from "../../../algorithm/buildSlots";
+import { placeBlocks } from "../../../algorithm/placeBlocks";
 import type { TeacherRules, TOCUnit } from "../../../algorithm/types";
 import { Radius, Spacing, Typography } from "../../../constants/fonts";
 import { useAppTheme } from "../../../context/theme";
@@ -148,6 +149,8 @@ type DuplicatedContentRow = {
   lesson_id: string | null;
 };
 
+type FormFieldErrorKey = "institution" | "subject" | "section" | "startDate" | "endDate";
+
 const TERM_LABEL: Record<AcademicTerm, string> = {
   quarter: "Quarter",
   trimester: "Trimester",
@@ -209,6 +212,45 @@ function normalizeDateInput(value: string) {
     return toLocalDateString(parsed);
   }
   return value;
+}
+
+function parseIsoDate(value: string) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const [year, month, day] = value.split("-").map(Number);
+  const parsed = new Date(year, month - 1, day);
+  if (
+    Number.isNaN(parsed.getTime()) ||
+    parsed.getFullYear() !== year ||
+    parsed.getMonth() !== month - 1 ||
+    parsed.getDate() !== day
+  ) {
+    return null;
+  }
+  return parsed;
+}
+
+function addMonths(date: Date, months: number) {
+  const next = new Date(date);
+  next.setMonth(next.getMonth() + months);
+  return next;
+}
+
+function normalizeBlockSubcategory(
+  category: "lesson" | "written_work" | "performance_task" | "exam" | "buffer",
+  subcategory: string | null | undefined
+) {
+  const normalized = (subcategory ?? "").trim().toLowerCase();
+  const allowed = {
+    lesson: ["lecture", "laboratory"],
+    written_work: ["assignment", "seatwork", "quiz"],
+    performance_task: ["activity", "lab_report", "reporting", "project"],
+    exam: ["prelim", "midterm", "final"],
+    buffer: ["review", "preparation", "orientation", "other"],
+  } as const;
+
+  return allowed[category].includes(normalized as never)
+    ? (normalized as (typeof allowed)[typeof category][number])
+    : allowed[category][0];
 }
 
 function toSqlTime(value: string) {
@@ -455,10 +497,10 @@ function buildTeacherRulesFromCounts(requirementCounts: Record<RequirementKey, s
     quizMode: "hybrid",
     quizEveryNLessons: 3,
     writtenWorkMode: "total",
-    writtenWorkTarget: Math.max(1, Number(requirementCounts.written_work || "1")),
+    minWW: Math.max(1, Number(requirementCounts.written_work || "1")),
     allowLessonWrittenWorkOverlay: true,
     preferLessonWrittenWorkOverlay: true,
-    performanceTaskMin: Math.max(1, Number(requirementCounts.performance_task || "1")),
+    minPT: Math.max(1, Number(requirementCounts.performance_task || "1")),
     includeReviewBeforeExam: Math.max(1, Number(requirementCounts.exam || "1")) > 0,
   };
 }
@@ -496,7 +538,6 @@ function getRoomBorderColor(room: RoomType) {
 export default function LessonplanScreen() {
   const { colors: c } = useAppTheme();
   const createInFlightRef = useRef(false);
-  const lastAutoPlanNameRef = useRef("");
   const hydratedDuplicateIdRef = useRef("");
   const params = useLocalSearchParams<{ duplicateFromPlanId?: string | string[] }>();
   const duplicateFromPlanId = useMemo(() => {
@@ -538,11 +579,11 @@ export default function LessonplanScreen() {
   const [selectedChapterIds, setSelectedChapterIds] = useState<Set<string>>(new Set());
   const [selectedLessonIds, setSelectedLessonIds] = useState<Set<string>>(new Set());
 
-  const [planName, setPlanName] = useState("");
   const [term, setTerm] = useState<AcademicTerm>("quarter");
   const [academicYearStart, setAcademicYearStart] = useState(nowYear);
   const [startDate, setStartDate] = useState(`${nowYear}-06-05`);
   const [endDate, setEndDate] = useState(`${nowYear + 1}-04-02`);
+  const [fieldErrors, setFieldErrors] = useState<Partial<Record<FormFieldErrorKey, string>>>({});
   const [extraRequirements, setExtraRequirements] = useState("");
   const [requirementCounts, setRequirementCounts] = useState<Record<RequirementKey, string>>({
     written_work: "1",
@@ -591,9 +632,9 @@ export default function LessonplanScreen() {
   );
 
   const autoPlanName = useMemo(() => {
-    if (!selectedSubject || !selectedSection) return "";
-    return `${selectedSubject.code} ${selectedSubject.title} - ${selectedSection.name} Lesson Plan`;
-  }, [selectedSubject, selectedSection]);
+    if (!selectedSubject || !selectedSection || !selectedInstitution) return "";
+    return `${selectedSubject.title}_${selectedSection.name}_${selectedInstitution.name}`;
+  }, [selectedInstitution, selectedSection, selectedSubject]);
 
   const selectableSubjects = useMemo(() => {
     if (!selectedInstitutionId) return subjects;
@@ -924,8 +965,6 @@ export default function LessonplanScreen() {
         setSelectedInstitutionId(sourcePlan.school_id);
         setSelectedSubjectId(sourcePlan.subject_id);
         setSelectedSectionId(sourcePlan.section_id);
-        setPlanName(`${sourcePlan.title} Copy`);
-        lastAutoPlanNameRef.current = "";
         setTerm((sourcePlan.term === "quarter" || sourcePlan.term === "trimester" || sourcePlan.term === "semester")
           ? sourcePlan.term
           : "quarter");
@@ -961,18 +1000,6 @@ export default function LessonplanScreen() {
       cancelled = true;
     };
   }, [duplicateFromPlanId, institutions, loadChapters, loading, sections, subjects]);
-
-  useEffect(() => {
-    if (!autoPlanName) return;
-    setPlanName((prev) => {
-      const current = prev.trim();
-      if (!current || prev === lastAutoPlanNameRef.current) {
-        lastAutoPlanNameRef.current = autoPlanName;
-        return autoPlanName;
-      }
-      return prev;
-    });
-  }, [autoPlanName]);
 
   useEffect(() => {
     const examCount = Math.max(1, Number(requirementCounts.exam || "1"));
@@ -1159,6 +1186,25 @@ export default function LessonplanScreen() {
     setExamSchedules((prev) => prev.map((row) => (row.id === id ? { ...row, dateText: value } : row)));
   };
 
+  const addExamScheduleRow = () => {
+    animateIn();
+    setExamSchedules((prev) => {
+      const next = [...prev, { id: makeId(), dateText: "" }];
+      setRequirementCounts((counts) => ({ ...counts, exam: String(next.length) }));
+      return next;
+    });
+  };
+
+  const removeExamScheduleRow = (id: string) => {
+    animateIn();
+    setExamSchedules((prev) => {
+      if (prev.length <= 1) return prev;
+      const next = prev.filter((row) => row.id !== id);
+      setRequirementCounts((counts) => ({ ...counts, exam: String(next.length) }));
+      return next;
+    });
+  };
+
   const removeSpecialDateRow = (id: string) => {
     animateIn();
     setSpecialDates((prev) => prev.filter((row) => row.id !== id));
@@ -1183,8 +1229,14 @@ export default function LessonplanScreen() {
     const iso = `${datePickerYear}-${String(datePickerMonth).padStart(2, "0")}-${String(safeDay).padStart(2, "0")}`;
 
     if (dateTarget.type === "duration") {
-      if (dateTarget.field === "start") setStartDate(iso);
-      if (dateTarget.field === "end") setEndDate(iso);
+      if (dateTarget.field === "start") {
+        setStartDate(iso);
+        setFieldErrors((prev) => ({ ...prev, startDate: undefined }));
+      }
+      if (dateTarget.field === "end") {
+        setEndDate(iso);
+        setFieldErrors((prev) => ({ ...prev, endDate: undefined }));
+      }
     } else if (dateTarget.type === "exam") {
       setExamScheduleField(dateTarget.id, iso);
     } else {
@@ -1197,6 +1249,7 @@ export default function LessonplanScreen() {
 
   const handlePickInstitution = (schoolId: string) => {
     setSelectedInstitutionId(schoolId);
+    setFieldErrors((prev) => ({ ...prev, institution: undefined }));
     setInstitutionMenuOpen(false);
 
     if (selectedSubject && selectedSubject.school_id !== schoolId) {
@@ -1212,6 +1265,7 @@ export default function LessonplanScreen() {
 
   const handlePickSubject = async (subjectId: string) => {
     setSelectedSubjectId(subjectId);
+    setFieldErrors((prev) => ({ ...prev, subject: undefined }));
     setSubjectMenuOpen(false);
 
     const subject = subjects.find((item) => item.subject_id === subjectId);
@@ -1229,6 +1283,34 @@ export default function LessonplanScreen() {
     return Number.isFinite(parsed) && parsed > 0;
   });
 
+  const validateRequiredFields = useCallback(() => {
+    const errors: Partial<Record<FormFieldErrorKey, string>> = {};
+    if (!selectedInstitution) errors.institution = "Institution is required.";
+    if (!selectedSubject) errors.subject = "Subject is required.";
+    if (!selectedSection) errors.section = "Section is required.";
+
+    const normalizedStart = normalizeDateInput(startDate);
+    const normalizedEnd = normalizeDateInput(endDate);
+    const parsedStart = parseIsoDate(normalizedStart);
+    const parsedEnd = parseIsoDate(normalizedEnd);
+
+    if (!normalizedStart) errors.startDate = "Start date is required.";
+    else if (!parsedStart) errors.startDate = "Start date is invalid.";
+
+    if (!normalizedEnd) errors.endDate = "End date is required.";
+    else if (!parsedEnd) errors.endDate = "End date is invalid.";
+
+    if (parsedStart && parsedEnd) {
+      if (normalizedEnd < normalizedStart) {
+        errors.endDate = "End date must be after start date.";
+      } else if (parsedEnd > addMonths(parsedStart, 6)) {
+        errors.endDate = "Duration must not exceed 6 months.";
+      }
+    }
+
+    return errors;
+  }, [endDate, selectedInstitution, selectedSection, selectedSubject, startDate]);
+
   const hasValidSchedule = activeDays.size > 0 && Array.from(activeDays).every((day) => {
     const schedule = daySchedules[day];
     return schedule.instances.length > 0 && schedule.instances.every((instance) => hasValidTimeRange(instance.start, instance.end));
@@ -1240,31 +1322,25 @@ export default function LessonplanScreen() {
     if (createInFlightRef.current || saving) {
       return;
     }
-    if (!selectedInstitution) {
-      Alert.alert("Institution required", "Select an institution first.");
-      return;
-    }
-    if (!selectedSubject) {
-      Alert.alert("Subject required", "Select a subject first.");
-      return;
-    }
-    if (!selectedSection) {
-      Alert.alert("Section required", "Select a section first.");
-      return;
-    }
-    if (!planName.trim()) {
-      Alert.alert("Plan name required", "Enter a name for this lesson plan.");
+    const nextFieldErrors = validateRequiredFields();
+    setFieldErrors(nextFieldErrors);
+    if (Object.keys(nextFieldErrors).length > 0) {
+      const durationError = nextFieldErrors.startDate ?? nextFieldErrors.endDate;
+      if (durationError) {
+        Alert.alert("Invalid lesson plan duration", durationError);
+      } else {
+        Alert.alert("Missing required fields", "Complete the highlighted fields before creating the lesson plan.");
+      }
       return;
     }
 
     const normalizedStart = normalizeDateInput(startDate);
     const normalizedEnd = normalizeDateInput(endDate);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(normalizedStart) || !/^\d{4}-\d{2}-\d{2}$/.test(normalizedEnd)) {
-      Alert.alert("Invalid dates", "Use a valid date for start/end.");
-      return;
-    }
-    if (normalizedEnd < normalizedStart) {
-      Alert.alert("Invalid range", "End date must be after start date.");
+    const institution = selectedInstitution;
+    const subject = selectedSubject;
+    const section = selectedSection;
+    if (!institution || !subject || !section) {
+      Alert.alert("Missing required fields", "Complete the highlighted fields before creating the lesson plan.");
       return;
     }
     if (!hasValidSchedule) {
@@ -1281,6 +1357,21 @@ export default function LessonplanScreen() {
 
     if (!hasRequirementCounts) {
       Alert.alert("Requirements required", "Fill in Written Work, Performance Task, and Exam counts.");
+      return;
+    }
+    if (examSchedules.some((row) => !/^\d{4}-\d{2}-\d{2}$/.test(normalizeDateInput(row.dateText)))) {
+      Alert.alert("Exam dates required", "Pick a valid date for every exam.");
+      return;
+    }
+    const normalizedStartDate = normalizeDateInput(startDate);
+    const normalizedEndDate = normalizeDateInput(endDate);
+    const examDates = examSchedules.map((row) => normalizeDateInput(row.dateText));
+    if (new Set(examDates).size !== examDates.length) {
+      Alert.alert("Duplicate exam dates", "Each exam date must be different.");
+      return;
+    }
+    if (examDates.some((date) => date < normalizedStartDate || date > normalizedEndDate)) {
+      Alert.alert("Exam dates out of range", "Each exam date must be within the lesson plan duration.");
       return;
     }
     if (!hasSelectedSubjectContent) {
@@ -1369,16 +1460,16 @@ export default function LessonplanScreen() {
         }
       }
 
-      const title = planName.trim();
+      const title = autoPlanName.trim();
       const yearText = formatAcademicYear(academicYearStart).trim() || buildAcademicYearFallback(normalizedStart, normalizedEnd);
 
       const { data: planRow, error: planError } = await supabase
         .from("lesson_plans")
         .insert({
           user_id: user.id,
-          school_id: selectedInstitution.school_id,
-          subject_id: selectedSubject.subject_id,
-          section_id: selectedSection.section_id,
+          school_id: institution.school_id,
+          subject_id: subject.subject_id,
+          section_id: section.section_id,
           title,
           academic_year: yearText,
           term,
@@ -1411,47 +1502,19 @@ export default function LessonplanScreen() {
         });
 
       const recurringSchedules = buildRecurringSchedules(activeDays, daySchedules);
+      const blockedDates = specialDates
+        .map((row) => normalizeDateInput(row.dateText))
+        .filter((value) => /^\d{4}-\d{2}-\d{2}$/.test(value));
+      const examDates = examSchedules.map((row) => normalizeDateInput(row.dateText));
+
       const generatedSlots = buildSlots({
         courseId: lessonPlanId,
         startDate: normalizedStart,
         endDate: normalizedEnd,
         rawMeetingSchedules: recurringSchedules,
+        holidays: blockedDates,
+        termBoundaryDates: examDates,
       });
-
-      const slotRows = generatedSlots.map((slot) => {
-        const sourceSchedule = recurringSchedules.find(
-          (candidate) =>
-            candidate.dayOfWeek === new Date(`${slot.date}T00:00:00`).getDay() &&
-            candidate.startTime === slot.startTime &&
-            candidate.endTime === slot.endTime &&
-            candidate.sessionType === slot.sessionType
-        );
-        const seriesKey = sourceSchedule?.id ?? `${slot.date}_${slot.startTime}_${slot.endTime}`;
-        const weekday = DAY_OPTIONS.find((day) => {
-          const dayIndex = DAY_OPTIONS.findIndex((item) => item.key === day.key) + 1;
-          return dayIndex === new Date(`${slot.date}T00:00:00`).getDay();
-        })?.key ?? "monday";
-
-        return {
-          slot_id: slot.id,
-          lesson_plan_id: lessonPlanId,
-          title: null,
-          slot_date: slot.date,
-          weekday,
-          start_time: `${slot.startTime}:00`,
-          end_time: `${slot.endTime}:00`,
-          meeting_type: slot.sessionType === "lecture" || slot.sessionType === "laboratory" ? slot.sessionType : null,
-          room: slot.sessionType === "lecture" || slot.sessionType === "laboratory" ? slot.sessionType : null,
-          slot_number: sourceSchedule?.slotNumber ?? 1,
-          series_key: seriesKey,
-          is_locked: false,
-        };
-      });
-
-      if (slotRows.length > 0) {
-        const { error: slotsError } = await supabase.from("slots").insert(slotRows);
-        if (slotsError) throw slotsError;
-      }
 
       const tocUnits = buildTocUnitsFromSelections(lessonPlanId, selectedLessons, selectedChapters);
       const teacherRules = buildTeacherRulesFromCounts(requirementCounts);
@@ -1473,7 +1536,69 @@ export default function LessonplanScreen() {
         tocUnits,
         teacherRules,
         examBlockTemplates: examTemplates,
+        slots: generatedSlots,
+        initialDelayDates: [],
       });
+      const placedPlan = placeBlocks({
+        slots: generatedSlots,
+        blocks: generatedBlocks,
+      });
+      const slotRows = placedPlan.slots.map((slot) => {
+        const sourceSchedule = recurringSchedules.find(
+          (candidate) =>
+            candidate.dayOfWeek === new Date(`${slot.date}T00:00:00`).getDay() &&
+            candidate.startTime === slot.startTime &&
+            candidate.endTime === slot.endTime &&
+            candidate.sessionType === slot.sessionType
+        );
+        const seriesKey = sourceSchedule?.id ?? `${slot.date}_${slot.startTime}_${slot.endTime}`;
+        const weekday = DAY_OPTIONS.find((day) => {
+          const dayIndex = DAY_OPTIONS.findIndex((item) => item.key === day.key) + 1;
+          return dayIndex === new Date(`${slot.date}T00:00:00`).getDay();
+        })?.key ?? "monday";
+
+        return {
+          lesson_plan_id: lessonPlanId,
+          title: null,
+          slot_date: slot.date,
+          weekday,
+          start_time: `${slot.startTime}:00`,
+          end_time: `${slot.endTime}:00`,
+          meeting_type: slot.sessionType === "lecture" || slot.sessionType === "laboratory" ? slot.sessionType : null,
+          room: slot.sessionType === "lecture" || slot.sessionType === "laboratory" ? slot.sessionType : null,
+          slot_number: sourceSchedule?.slotNumber ?? 1,
+          series_key: seriesKey,
+          is_locked: false,
+        };
+      });
+
+      const persistedSlotIdByPlannerKey = new Map<string, string>();
+      if (slotRows.length > 0) {
+        const { data: insertedSlots, error: slotsError } = await supabase
+          .from("slots")
+          .insert(slotRows)
+          .select("slot_id, slot_date, slot_number");
+        if (slotsError) throw slotsError;
+
+        for (const row of insertedSlots ?? []) {
+          const slotDate = String((row as { slot_date: string }).slot_date);
+          const slotNumber = Number((row as { slot_number: number }).slot_number ?? 1);
+          const slotId = String((row as { slot_id: string }).slot_id);
+          persistedSlotIdByPlannerKey.set(`${slotDate}__${slotNumber}`, slotId);
+        }
+      }
+
+      const placementByBlockId = new Map(
+        placedPlan.slots.flatMap((slot) =>
+          slot.placements.map((placement, index) => [
+            placement.blockId,
+            {
+              slotId: persistedSlotIdByPlannerKey.get(`${slot.date}__${slot.slotNumber ?? 1}`) ?? null,
+              orderNo: index + 1,
+            },
+          ] as const)
+        )
+      );
 
       const lessonDetailsById = new Map(
         selectedLessons.map(({ chapter, lesson }) => [
@@ -1490,9 +1615,10 @@ export default function LessonplanScreen() {
       const blockRows = generatedBlocks.map((block) => {
         const lessonDetails =
           typeof block.sourceTocId === "string" ? lessonDetailsById.get(block.sourceTocId) ?? null : null;
+        const normalizedSubcategory = normalizeBlockSubcategory(block.type, block.subcategory);
         return {
           lesson_plan_id: lessonPlanId,
-          slot_id: null,
+          slot_id: placementByBlockId.get(block.id)?.slotId ?? null,
           root_block_id: null,
           lesson_id: lessonDetails?.lessonId ?? null,
           algorithm_block_key: block.id,
@@ -1500,7 +1626,7 @@ export default function LessonplanScreen() {
           title: block.title,
           description: lessonDetails?.description ?? null,
           session_category: block.type,
-          session_subcategory: block.subcategory,
+          session_subcategory: normalizedSubcategory,
           meeting_type:
             block.preferredSessionType === "lecture" || block.preferredSessionType === "laboratory"
               ? block.preferredSessionType
@@ -1513,10 +1639,10 @@ export default function LessonplanScreen() {
           overlay_mode: block.overlayMode,
           preferred_session_type: block.preferredSessionType,
           dependency_keys: block.dependencies,
-          order_no: 1,
+          order_no: placementByBlockId.get(block.id)?.orderNo ?? 1,
           is_locked: false,
-          ww_subtype: block.type === "written_work" ? block.subcategory : null,
-          pt_subtype: block.type === "performance_task" ? block.subcategory : null,
+          ww_subtype: block.type === "written_work" ? normalizedSubcategory : null,
+          pt_subtype: block.type === "performance_task" ? normalizedSubcategory : null,
           metadata: block.metadata ?? {},
         };
       });
@@ -1531,7 +1657,7 @@ export default function LessonplanScreen() {
           const rows: any[] = [];
           rows.push({
             lesson_plan_id: lessonPlanId,
-            subject_id: selectedSubject.subject_id,
+            subject_id: subject.subject_id,
             unit_id: unitGroup.group.key !== "ungrouped" ? unitGroup.group.key : null,
             content_level: "unit",
             sequence_no: unitIndex + 1,
@@ -1542,7 +1668,7 @@ export default function LessonplanScreen() {
           unitGroup.pickedChapters.forEach((row, chapterIndex) => {
             rows.push({
               lesson_plan_id: lessonPlanId,
-              subject_id: selectedSubject.subject_id,
+              subject_id: subject.subject_id,
               unit_id: row.chapter.unit_id,
               chapter_id: row.chapter.chapter_id,
               content_level: "chapter",
@@ -1554,7 +1680,7 @@ export default function LessonplanScreen() {
             row.pickedLessons.forEach((lesson, lessonIndex) => {
               rows.push({
                 lesson_plan_id: lessonPlanId,
-                subject_id: selectedSubject.subject_id,
+                subject_id: subject.subject_id,
                 unit_id: row.chapter.unit_id,
                 chapter_id: row.chapter.chapter_id,
                 lesson_id: lesson.lesson_id,
@@ -1583,9 +1709,9 @@ export default function LessonplanScreen() {
       if (specialEvents.length > 0) {
         const { error: eventsError } = await supabase.from("school_calendar_events").insert(
           specialEvents.map((row) => ({
-            school_id: selectedInstitution.school_id,
-            section_id: selectedSection.section_id,
-            subject_id: selectedSubject.subject_id,
+            school_id: institution.school_id,
+            section_id: section.section_id,
+            subject_id: subject.subject_id,
             event_type: "other",
             blackout_reason: "event",
             title: row.reason.trim(),
@@ -1623,16 +1749,8 @@ export default function LessonplanScreen() {
   const emptyFieldBg = c.card;
   const filledText = c.text;
   const emptyText = c.mutedText;
-  const isFormComplete =
-    Boolean(selectedInstitution) &&
-    Boolean(selectedSubject) &&
-    Boolean(selectedSection) &&
-    Boolean(planName.trim()) &&
-    Boolean(startDate) &&
-    Boolean(endDate) &&
-    hasRequirementCounts &&
-    hasValidSchedule &&
-    hasSelectedSubjectContent;
+  const errorColor = "#D9534F";
+  const dateErrorMessage = fieldErrors.startDate ?? fieldErrors.endDate;
 
   return (
     <View style={[styles.page, { backgroundColor: c.background }]}> 
@@ -1647,23 +1765,35 @@ export default function LessonplanScreen() {
             </Pressable>
             <Text style={[styles.pageTitle, { color: c.text }]}>Create Lessonplan</Text>
           </View>
-          <Pressable onPress={handleCreatePlan} disabled={saving || !isFormComplete} style={({ pressed }) => ({ opacity: pressed ? 0.7 : (isFormComplete ? 1 : 0.4) })}>
+          <Pressable onPress={handleCreatePlan} disabled={saving} style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}>
             {saving ? <ActivityIndicator color={c.text} /> : <Ionicons name="checkmark" size={15} color={c.text} />}
           </Pressable>
         </View>
 
         <Text style={[styles.sectionTitle, { color: c.text }]}>Overview</Text>
 
-        <TextInput
-          value={planName}
-          onChangeText={setPlanName}
-          placeholder="Lesson Plan Name"
-          placeholderTextColor="#B0B0B0"
+        <View
           style={[
             styles.nameInput,
-            { backgroundColor: planName.trim() ? filledFieldBg : emptyFieldBg, color: planName.trim() ? filledText : emptyText },
+            {
+              backgroundColor: autoPlanName ? filledFieldBg : emptyFieldBg,
+              borderColor: "#D8DDE3",
+              justifyContent: "center",
+            },
           ]}
-        />
+        >
+          <Text
+            style={[
+              styles.fieldText,
+              {
+                color: autoPlanName ? filledText : emptyText,
+              },
+            ]}
+            numberOfLines={1}
+          >
+            {autoPlanName || "Subject_Section_School"}
+          </Text>
+        </View>
 
         <View style={styles.row3}>
           <Pressable
@@ -1688,22 +1818,23 @@ export default function LessonplanScreen() {
 
         <View style={styles.dateRow}>
           <Text style={styles.fromToText}>from</Text>
-          <Pressable style={[styles.datePill, { backgroundColor: startDate ? filledFieldBg : emptyFieldBg }]} onPress={() => {
+          <Pressable style={[styles.datePill, { backgroundColor: startDate ? filledFieldBg : emptyFieldBg, borderColor: fieldErrors.startDate ? errorColor : "#D8DDE3" }]} onPress={() => {
             animateIn();
             openDatePicker({ type: "duration", field: "start" }, startDate);
           }}>
             <Text style={[styles.dateInput, { color: startDate ? filledText : emptyText }]}>{startDate ? formatIsoDisplay(startDate) : "Pick date"}</Text>
           </Pressable>
           <Text style={styles.fromToText}>to</Text>
-          <Pressable style={[styles.datePill, { backgroundColor: endDate ? filledFieldBg : emptyFieldBg }]} onPress={() => {
+          <Pressable style={[styles.datePill, { backgroundColor: endDate ? filledFieldBg : emptyFieldBg, borderColor: fieldErrors.endDate ? errorColor : "#D8DDE3" }]} onPress={() => {
             animateIn();
             openDatePicker({ type: "duration", field: "end" }, endDate);
           }}>
             <Text style={[styles.dateInput, { color: endDate ? filledText : emptyText }]}>{endDate ? formatIsoDisplay(endDate) : "Pick date"}</Text>
           </Pressable>
         </View>
+        {dateErrorMessage ? <Text style={[styles.fieldErrorText, { color: errorColor }]}>{dateErrorMessage}</Text> : null}
 
-        <Pressable style={[styles.boxField, { backgroundColor: selectedSubject ? filledFieldBg : emptyFieldBg }]} onPress={() => {
+        <Pressable style={[styles.boxField, { backgroundColor: selectedSubject ? filledFieldBg : emptyFieldBg, borderColor: fieldErrors.subject ? errorColor : "#D8DDE3" }]} onPress={() => {
           animateIn();
           setSubjectMenuOpen((v) => !v);
         }}>
@@ -1767,7 +1898,7 @@ export default function LessonplanScreen() {
         ) : null}
 
         <View style={styles.row2}>
-          <Pressable style={[styles.boxField, { backgroundColor: selectedInstitution ? filledFieldBg : emptyFieldBg }]} onPress={() => {
+          <Pressable style={[styles.boxField, { backgroundColor: selectedInstitution ? filledFieldBg : emptyFieldBg, borderColor: fieldErrors.institution ? errorColor : "#D8DDE3" }]} onPress={() => {
             animateIn();
             setInstitutionMenuOpen((v) => !v);
           }}>
@@ -1776,7 +1907,7 @@ export default function LessonplanScreen() {
             </Text>
           </Pressable>
 
-          <Pressable style={[styles.boxField, { backgroundColor: selectedSection ? filledFieldBg : emptyFieldBg }]} onPress={() => {
+          <Pressable style={[styles.boxField, { backgroundColor: selectedSection ? filledFieldBg : emptyFieldBg, borderColor: fieldErrors.section ? errorColor : "#D8DDE3" }]} onPress={() => {
             animateIn();
             setSectionMenuOpen((v) => !v);
           }}>
@@ -1804,6 +1935,7 @@ export default function LessonplanScreen() {
                 style={styles.dropdownItem}
                 onPress={() => {
                   setSelectedSectionId(section.section_id);
+                  setFieldErrors((prev) => ({ ...prev, section: undefined }));
                   setSectionMenuOpen(false);
                 }}
               >
@@ -1935,7 +2067,13 @@ export default function LessonplanScreen() {
 
         {examSchedules.length > 0 ? (
           <View style={styles.examScheduleWrap}>
-            <Text style={[styles.sectionTitle, { color: c.text }]}>Exam Dates</Text>
+            <View style={styles.examScheduleHeader}>
+              <Text style={[styles.sectionTitle, { color: c.text }]}>Exam Dates</Text>
+              <Pressable style={styles.addExamDateBtn} onPress={addExamScheduleRow}>
+                <Ionicons name="add" size={14} color="#4B5563" />
+                <Text style={styles.addExamDateText}>Add Exam Date</Text>
+              </Pressable>
+            </View>
             {examSchedules.map((row, index) => {
               const examDefinition = getExamDefinition(index, examSchedules.length);
               return (
@@ -1948,9 +2086,16 @@ export default function LessonplanScreen() {
                     onPress={() => openDatePicker({ type: "exam", id: row.id }, row.dateText)}
                   >
                     <Text style={[styles.dateInput, { color: row.dateText ? filledText : emptyText }]}>
-                      {row.dateText ? formatIsoDisplay(row.dateText) : "Optional date"}
+                      {row.dateText ? formatIsoDisplay(row.dateText) : "Pick date"}
                     </Text>
                   </Pressable>
+                  {examSchedules.length > 1 ? (
+                    <Pressable style={styles.iconAction} onPress={() => removeExamScheduleRow(row.id)}>
+                      <Ionicons name="close" size={16} color="#8A8A8A" />
+                    </Pressable>
+                  ) : (
+                    <View style={styles.iconAction} />
+                  )}
                 </View>
               );
             })}
@@ -2266,6 +2411,10 @@ const styles = StyleSheet.create({
     textAlign: "center",
     paddingVertical: 0,
   },
+  fieldErrorText: {
+    ...Typography.caption,
+    marginTop: -6,
+  },
   subjectPreviewBox: {
     borderRadius: Radius.sm,
     padding: 12,
@@ -2497,6 +2646,12 @@ const styles = StyleSheet.create({
     gap: 8,
     marginTop: 10,
   },
+  examScheduleHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+  },
   examLabelBox: {
     width: "42%",
     minHeight: 44,
@@ -2509,6 +2664,23 @@ const styles = StyleSheet.create({
   examLabelText: {
     ...Typography.caption,
     textAlign: "center",
+    fontWeight: "600",
+  },
+  addExamDateBtn: {
+    minHeight: 34,
+    borderRadius: Radius.round,
+    borderWidth: 1,
+    borderColor: "#D8DDE3",
+    backgroundColor: "#FFFFFF",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    paddingHorizontal: 10,
+  },
+  addExamDateText: {
+    ...Typography.caption,
+    color: "#4B5563",
     fontWeight: "600",
   },
   extraBox: {

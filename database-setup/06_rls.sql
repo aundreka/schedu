@@ -17,6 +17,7 @@ alter table public.lessons enable row level security;
 alter table public.lesson_plans enable row level security;
 alter table public.slots enable row level security;
 alter table public.blocks enable row level security;
+alter table public.plan_subject_content enable row level security;
 alter table public.school_calendar_events enable row level security;
 alter table public.delays enable row level security;
 
@@ -339,6 +340,39 @@ with check (
     select 1
     from public.lesson_plans lp
     where lp.lesson_plan_id = blocks.lesson_plan_id
+      and lp.user_id = auth.uid()
+  )
+);
+
+-- plan_subject_content
+drop policy if exists "users can read subject content from own lesson plans" on public.plan_subject_content;
+create policy "users can read subject content from own lesson plans"
+on public.plan_subject_content for select
+using (
+  exists (
+    select 1
+    from public.lesson_plans lp
+    where lp.lesson_plan_id = plan_subject_content.lesson_plan_id
+      and lp.user_id = auth.uid()
+  )
+);
+
+drop policy if exists "users can manage subject content from own lesson plans" on public.plan_subject_content;
+create policy "users can manage subject content from own lesson plans"
+on public.plan_subject_content for all
+using (
+  exists (
+    select 1
+    from public.lesson_plans lp
+    where lp.lesson_plan_id = plan_subject_content.lesson_plan_id
+      and lp.user_id = auth.uid()
+  )
+)
+with check (
+  exists (
+    select 1
+    from public.lesson_plans lp
+    where lp.lesson_plan_id = plan_subject_content.lesson_plan_id
       and lp.user_id = auth.uid()
   )
 );

@@ -144,7 +144,11 @@ export function normalizeBlockCategory(
     return normalizedCategory;
   }
 
-  if (normalizedSubcategory === "review" || normalizedSubcategory === "preparation") {
+  if (
+    normalizedSubcategory === "review" ||
+    normalizedSubcategory === "preparation" ||
+    normalizedSubcategory === "orientation"
+  ) {
     return "buffer";
   }
 
@@ -163,7 +167,7 @@ function toSessionSubcategory(value: string | null | undefined, category: Sessio
     written_work: ["assignment", "seatwork", "quiz"],
     performance_task: ["activity", "lab_report", "reporting", "project"],
     exam: ["prelim", "midterm", "final"],
-    buffer: ["review", "preparation", "other"],
+    buffer: ["review", "preparation", "orientation", "other"],
   };
   return allowed[category].includes(normalized as SessionSubcategory)
     ? (normalized as SessionSubcategory)
@@ -234,7 +238,7 @@ export function buildPlacementSeed(
 
   const placementsBySlotId: Record<string, Placement[]> = {};
 
-  for (const [slotId, rows] of grouped.entries()) {
+  for (const [slotId, rows] of Array.from(grouped.entries())) {
     const placements = [...rows]
       .sort((a, b) => (a.order_no ?? 999) - (b.order_no ?? 999) || a.title.localeCompare(b.title))
       .map((row, index) => ({

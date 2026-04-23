@@ -1,517 +1,571 @@
-import { Block, SessionSubcategory, TeacherRules, TOCUnit } from "./types";
-
-export type ExamBlockTemplate = {
-  id: string;
-  title: string;
-  estimatedMinutes: number;
-  subcategory?: Extract<SessionSubcategory, "prelim" | "midterm" | "final">;
-  preferredDate?: string | null;
-  required?: boolean;
-};
+import { buildPacingPlan } from "./buildPacingPlan";
+import type {
+  Block,
+  ExamBlockTemplate,
+  PacingPlan,
+  SessionSlot,
+  SessionSubcategory,
+  TeacherRules,
+  TOCUnit,
+} from "./types";
 
 export type BuildBlocksInput = {
   courseId: string;
   tocUnits: TOCUnit[];
   teacherRules: TeacherRules;
-  examBlockTemplates?: ExamBlockTemplate[];
+  examBlockTemplates: ExamBlockTemplate[];
+  slots?: SessionSlot[];
+  initialDelayDates?: string[];
 };
 
-function sortTOCUnits(tocUnits: TOCUnit[]): TOCUnit[] {
-  return [...tocUnits].sort((a, b) => a.order - b.order);
+const PT_SUBCATEGORIES: Extract<SessionSubcategory, "activity" | "lab_report" | "reporting">[] = [
+  "activity",
+  "lab_report",
+  "reporting",
+];
+
+const WW_SUBCATEGORIES: Extract<SessionSubcategory, "assignment" | "seatwork">[] = [
+  "assignment",
+  "seatwork",
+];
+
+function difficultyWeight(difficulty: TOCUnit["difficulty"]) {
+  if (difficulty === "high") return 3;
+  if (difficulty === "medium") return 2;
+  return 1;
 }
 
-function getPreferredSessionType(unit: TOCUnit): Block["preferredSessionType"] {
-  return unit.preferredSessionType ?? "any";
+function makeId(prefix: string, ...parts: (string | number)[]) {
+  return [prefix, ...parts].join("__").replace(/[^a-zA-Z0-9_-]+/g, "_");
 }
 
-function getDifficulty(unit: TOCUnit): NonNullable<TOCUnit["difficulty"]> {
-  return unit.difficulty ?? "medium";
+function groupSlotsByTerm(slots: SessionSlot[]) {
+  const grouped = new Map<number, SessionSlot[]>();
+  for (const slot of slots) {
+    const key = slot.termIndex ?? 0;
+    const current = grouped.get(key) ?? [];
+    current.push(slot);
+    grouped.set(key, current);
+  }
+  return grouped;
 }
 
-function isLabPreferred(unit: TOCUnit): boolean {
-  return unit.preferredSessionType === "laboratory";
+function countLabShare(termSlots: SessionSlot[]) {
+  if (termSlots.length === 0) return 0;
+  const labLike = termSlots.filter(
+    (slot) => slot.sessionType === "laboratory" || slot.sessionType === "mixed"
+  ).length;
+  return labLike / termSlots.length;
 }
 
-function lessonBlockId(unitId: string): string {
-  return `block__lesson__${unitId}`;
+function buildChapterEndingLessonOrders(tocUnits: TOCUnit[]) {
+  const endingOrders = new Set<number>();
+  for (let index = 0; index < tocUnits.length; index += 1) {
+    const current = tocUnits[index]!;
+    const next = tocUnits[index + 1];
+    if (!next || next.chapterId !== current.chapterId) {
+      endingOrders.add(index + 1);
+    }
+  }
+  return endingOrders;
 }
 
-function writtenWorkBlockId(unitId: string, index: number): string {
-  return `block__ww__${unitId}__${index}`;
+function pickBalancedPerformanceTaskSubtype(input: {
+  counts: Record<string, number>;
+  termSlots: SessionSlot[];
+  termLessons: TOCUnit[];
+  ptOrder: number;
+  chapterEndingOrders: Set<number>;
+}): Extract<SessionSubcategory, "activity" | "lab_report" | "reporting"> {
+  const { counts, termSlots, termLessons, ptOrder, chapterEndingOrders } = input;
+  const labShare = countLabShare(termSlots);
+  const anchorIndex =
+    termLessons.length === 0
+      ? 0
+      : Math.min(
+          termLessons.length - 1,
+          Math.max(0, Math.floor(((ptOrder - 0.5) / Math.max(1, counts.__targetTotal ?? 1)) * termLessons.length))
+        );
+  const anchorLesson = termLessons[anchorIndex] ?? null;
+  const anchorDifficulty = difficultyWeight(anchorLesson?.difficulty ?? "medium");
+  const anchorOrder = anchorIndex + 1;
+  const nearChapterEnd = chapterEndingOrders.has(anchorOrder) || chapterEndingOrders.has(anchorOrder + 1);
+
+  let best = PT_SUBCATEGORIES[0]!;
+  let bestScore = -Infinity;
+  for (const subtype of PT_SUBCATEGORIES) {
+    const countPenalty = counts[subtype] ?? 0;
+    let score = -countPenalty * 10;
+    if (subtype === "lab_report") score += labShare * 8 + (anchorLesson?.preferredSessionType === "laboratory" ? 5 : 0);
+    if (subtype === "reporting") score += (anchorDifficulty >= 3 ? 7 : 0) + (nearChapterEnd ? 4 : 0);
+    if (subtype === "activity") score += anchorDifficulty <= 2 ? 3 : 0;
+    if (score > bestScore) {
+      best = subtype;
+      bestScore = score;
+    }
+  }
+
+  counts[best] = (counts[best] ?? 0) + 1;
+  return best;
 }
 
-function quizChapterBlockId(chapterId: string): string {
-  return `block__quiz__chapter__${chapterId}`;
+function pickBalancedWrittenWorkSubtype(input: {
+  counts: Record<string, number>;
+  termLessons: TOCUnit[];
+  wwOrder: number;
+}): Extract<SessionSubcategory, "assignment" | "seatwork"> {
+  const { counts, termLessons, wwOrder } = input;
+  const anchorIndex =
+    termLessons.length === 0
+      ? 0
+      : Math.min(
+          termLessons.length - 1,
+          Math.max(0, Math.floor(((wwOrder - 0.5) / Math.max(1, counts.__targetTotal ?? 1)) * termLessons.length))
+        );
+  const anchorLesson = termLessons[anchorIndex] ?? null;
+  const anchorDifficulty = difficultyWeight(anchorLesson?.difficulty ?? "medium");
+
+  let best = WW_SUBCATEGORIES[0]!;
+  let bestScore = -Infinity;
+  for (const subtype of WW_SUBCATEGORIES) {
+    const countPenalty = counts[subtype] ?? 0;
+    let score = -countPenalty * 10;
+    if (subtype === "assignment") score += anchorDifficulty >= 2 ? 4 : 0;
+    if (subtype === "seatwork") score += anchorDifficulty <= 2 ? 4 : 0;
+    if (score > bestScore) {
+      best = subtype;
+      bestScore = score;
+    }
+  }
+
+  counts[best] = (counts[best] ?? 0) + 1;
+  return best;
 }
 
-function quizIntervalBlockId(index: number): string {
-  return `block__quiz__interval__${index}`;
-}
-
-function ptBlockId(index: number): string {
-  return `block__pt__${index}`;
-}
-
-function ptPrepBlockId(index: number): string {
-  return `block__pt_prep__${index}`;
-}
-
-function reviewBlockId(index: number): string {
-  return `block__review__${index}`;
-}
-
-function bufferBlockId(index: number): string {
-  return `block__buffer__${index}`;
-}
-
-function examBlockId(templateId: string): string {
-  return `block__exam__${templateId}`;
-}
-
-function createLessonBlock(unit: TOCUnit): Block {
-  const lessonSubcategory = isLabPreferred(unit) ? "laboratory" : "lecture";
+function buildQuizCoverage(termLessons: TOCUnit[], lessonInterval: number, quizOrder: number, quizCount: number) {
+  const endOrder =
+    quizOrder === quizCount
+      ? termLessons.length
+      : Math.min(termLessons.length, lessonInterval * quizOrder);
+  const startOrder =
+    quizOrder === 1 ? 1 : Math.min(endOrder, Math.max(1, lessonInterval * (quizOrder - 1) + 1));
+  const coveredLessons = termLessons.slice(startOrder - 1, endOrder);
+  const weights = coveredLessons.map((lesson) => difficultyWeight(lesson.difficulty));
+  const maxComplexity = weights.length > 0 ? Math.max(...weights) : 1;
+  const averageComplexity =
+    weights.length > 0 ? weights.reduce((sum, value) => sum + value, 0) / weights.length : 1;
+  const sameDifficulty = weights.every((value) => value === weights[0]);
+  const endsChapter =
+    coveredLessons.length > 0 &&
+    (() => {
+      const last = coveredLessons[coveredLessons.length - 1]!;
+      const next = termLessons[endOrder] ?? null;
+      return !next || next.chapterId !== last.chapterId;
+    })();
+  const unresolvedHardRegionCount = termLessons
+    .slice(endOrder)
+    .filter((lesson) => difficultyWeight(lesson.difficulty) >= 3).length;
+  const chapterBoundaryWeight = sameDifficulty && endsChapter ? 1 : 0;
 
   return {
-    id: lessonBlockId(unit.id),
-    courseId: unit.courseId,
-    type: "lesson",
-    subcategory: lessonSubcategory,
-    title: unit.title,
-    sourceTocId: unit.id,
-    estimatedMinutes: unit.estimatedMinutes,
-    minMinutes: Math.max(15, Math.floor(unit.estimatedMinutes * 0.75)),
-    maxMinutes: Math.max(unit.estimatedMinutes, Math.ceil(unit.estimatedMinutes * 1.5)),
-    required: unit.required,
-    splittable: unit.estimatedMinutes > 90,
-    overlayMode: "major",
-    preferredSessionType: getPreferredSessionType(unit),
-    dependencies: [],
-    metadata: {
-      chapterId: unit.chapterId ?? null,
-      chapterTitle: unit.chapterTitle ?? null,
-      difficulty: getDifficulty(unit),
-      tocOrder: unit.order,
-    },
+    startOrder,
+    endOrder,
+    coveredLessons,
+    maxComplexity,
+    averageComplexity,
+    unresolvedHardRegionCount,
+    chapterBoundaryWeight,
   };
 }
 
-function getWrittenWorkSubtype(unit: TOCUnit): Extract<SessionSubcategory, "assignment" | "seatwork"> {
-  const difficulty = getDifficulty(unit);
-  if (difficulty === "light") return "seatwork";
-  return "assignment";
-}
-
-function createWrittenWorkBlock(unit: TOCUnit, index: number, sequenceLabel?: string): Block {
-  const difficulty = getDifficulty(unit);
-  const subtype = getWrittenWorkSubtype(unit);
-  const titleBySubtype: Record<typeof subtype, string> = {
-    assignment: difficulty === "heavy" ? "Assignment / Reflection" : "Written Work",
-    seatwork: "Seatwork",
-  };
-
-  const estimatedMinutes =
-    difficulty === "light" ? 15 : difficulty === "heavy" ? 30 : 20;
-
-  return {
-    id: writtenWorkBlockId(unit.id, index),
-    courseId: unit.courseId,
-    type: "written_work",
-    subcategory: subtype,
-    title: `${titleBySubtype[subtype]}: ${unit.title}${sequenceLabel ? ` (${sequenceLabel})` : ""}`,
-    sourceTocId: unit.id,
-    estimatedMinutes,
-    minMinutes: 10,
-    maxMinutes: 45,
-    required: unit.required,
-    splittable: false,
-    overlayMode: "minor",
-    preferredSessionType: "any",
-    dependencies: [lessonBlockId(unit.id)],
-    metadata: {
-      linkedLessonBlockId: lessonBlockId(unit.id),
-      chapterId: unit.chapterId ?? null,
-      chapterTitle: unit.chapterTitle ?? null,
-      difficulty,
-      sequence: index,
-    },
-  };
-}
-
-function createWrittenWorkBlocks(
-  units: TOCUnit[],
-  teacherRules: TeacherRules
-): Block[] {
-  const target = Math.max(0, teacherRules.writtenWorkTarget);
-  if (target === 0 || units.length === 0) {
-    return [];
-  }
-
-  if (teacherRules.writtenWorkMode === "per_lesson") {
-    return units.flatMap((unit) =>
-      Array.from({ length: target }, (_, index) =>
-        createWrittenWorkBlock(unit, index + 1, target > 1 ? String(index + 1) : undefined)
-      )
-    );
-  }
-
-  return Array.from({ length: target }, (_, index) => {
-    const ratio = target === 1 ? 0 : index / (target - 1);
-    const unitIndex = Math.min(
-      units.length - 1,
-      Math.max(0, Math.round(ratio * (units.length - 1)))
-    );
-    const unit = units[unitIndex];
-    return createWrittenWorkBlock(unit, index + 1, `Plan ${index + 1}`);
+function toPacingPlan(input: BuildBlocksInput): PacingPlan {
+  return buildPacingPlan({
+    slots: input.slots ?? [],
+    tocUnits: input.tocUnits,
+    teacherRules: input.teacherRules,
+    examBlockTemplates: input.examBlockTemplates,
+    initialDelayDates: input.initialDelayDates,
   });
-}
-
-function groupUnitsByChapter(units: TOCUnit[]): Map<string, TOCUnit[]> {
-  const chapterMap = new Map<string, TOCUnit[]>();
-
-  for (const unit of units) {
-    const key = unit.chapterId ?? `chapterless__${unit.id}`;
-    const existing = chapterMap.get(key) ?? [];
-    existing.push(unit);
-    chapterMap.set(key, existing);
-  }
-
-  return chapterMap;
-}
-
-function createChapterQuizBlock(courseId: string, chapterId: string, units: TOCUnit[]): Block {
-  const ordered = [...units].sort((a, b) => a.order - b.order);
-  const chapterTitle =
-    ordered[0]?.chapterTitle ??
-    (chapterId.startsWith("chapterless__") ? "Standalone Topic" : `Chapter ${chapterId}`);
-
-  return {
-    id: quizChapterBlockId(chapterId),
-    courseId,
-    type: "written_work",
-    subcategory: "quiz",
-    title: `Quiz: ${chapterTitle}`,
-    estimatedMinutes: 30,
-    minMinutes: 15,
-    maxMinutes: 60,
-    required: true,
-    splittable: false,
-    overlayMode: "major",
-    preferredSessionType: "lecture",
-    dependencies: ordered.map((unit) => lessonBlockId(unit.id)),
-    metadata: {
-      chapterId,
-      chapterTitle,
-      basedOn: "chapter_completion",
-      lessonCount: ordered.length,
-    },
-  };
-}
-
-function chunkArray<T>(items: T[], size: number): T[][] {
-  if (size <= 0) return [items];
-  const chunks: T[][] = [];
-
-  for (let i = 0; i < items.length; i += size) {
-    chunks.push(items.slice(i, i + size));
-  }
-
-  return chunks;
-}
-
-function createIntervalQuizBlocks(
-  courseId: string,
-  units: TOCUnit[],
-  teacherRules: TeacherRules
-): Block[] {
-  if (teacherRules.quizMode === "per_chapter") {
-    return [];
-  }
-
-  const interval = Math.max(1, teacherRules.quizEveryNLessons ?? 3);
-  const chunks = chunkArray(units, interval);
-
-  return chunks.map((chunk, index) => {
-    const start = chunk[0];
-    const end = chunk[chunk.length - 1];
-
-    return {
-      id: quizIntervalBlockId(index + 1),
-      courseId,
-      type: "written_work",
-      subcategory: "quiz",
-      title: `Quiz: Lessons ${start.order}-${end.order}`,
-      estimatedMinutes: 30,
-      minMinutes: 15,
-      maxMinutes: 60,
-      required: true,
-      splittable: false,
-      overlayMode: "major",
-      preferredSessionType: "lecture",
-      dependencies: chunk.map((unit) => lessonBlockId(unit.id)),
-      metadata: {
-        basedOn: "lesson_interval",
-        interval,
-        lessonOrders: chunk.map((unit) => unit.order),
-        sourceLessonIds: chunk.map((unit) => unit.id),
-      },
-    };
-  });
-}
-
-function pickPerformanceTaskAnchorUnits(units: TOCUnit[], performanceTaskMin: number): TOCUnit[] {
-  if (units.length === 0 || performanceTaskMin <= 0) return [];
-
-  const anchors: TOCUnit[] = [];
-  for (let i = 1; i <= performanceTaskMin; i += 1) {
-    const ratio = i / (performanceTaskMin + 1);
-    const index = Math.min(units.length - 1, Math.max(0, Math.round(ratio * (units.length - 1))));
-    anchors.push(units[index]);
-  }
-
-  return anchors;
-}
-
-function createPerformanceTaskBlocks(courseId: string, units: TOCUnit[], performanceTaskMin: number): Block[] {
-  const anchorUnits = pickPerformanceTaskAnchorUnits(units, performanceTaskMin);
-  const blocks: Block[] = [];
-
-  anchorUnits.forEach((unit, index) => {
-    const taskNumber = index + 1;
-    const difficulty = getDifficulty(unit);
-    const prepMinutes = difficulty === "heavy" ? 45 : difficulty === "light" ? 20 : 30;
-    const ptMinutes = difficulty === "heavy" ? 120 : difficulty === "light" ? 45 : 90;
-    const linkedLessonId = lessonBlockId(unit.id);
-
-    blocks.push({
-      id: ptPrepBlockId(taskNumber),
-      courseId,
-      type: "buffer",
-      subcategory: "preparation",
-      title: `PT Prep ${taskNumber}: ${unit.title}`,
-      sourceTocId: unit.id,
-      estimatedMinutes: prepMinutes,
-      minMinutes: 15,
-      maxMinutes: 60,
-      required: true,
-      splittable: false,
-      overlayMode: "minor",
-      preferredSessionType: "any",
-      dependencies: [linkedLessonId],
-      metadata: {
-        linkedLessonBlockId: linkedLessonId,
-        performanceTaskNumber: taskNumber,
-        chapterId: unit.chapterId ?? null,
-      },
-    });
-
-    blocks.push({
-      id: ptBlockId(taskNumber),
-      courseId,
-      type: "performance_task",
-      subcategory: getPreferredSessionType(unit) === "laboratory" ? "lab_report" : "activity",
-      title: `Performance Task ${taskNumber}: ${unit.title}`,
-      sourceTocId: unit.id,
-      estimatedMinutes: ptMinutes,
-      minMinutes: Math.max(30, Math.floor(ptMinutes * 0.75)),
-      maxMinutes: Math.max(ptMinutes, Math.ceil(ptMinutes * 1.5)),
-      required: true,
-      splittable: ptMinutes > 90,
-      overlayMode: "major",
-      preferredSessionType: getPreferredSessionType(unit),
-      dependencies: [linkedLessonId, ptPrepBlockId(taskNumber)],
-      metadata: {
-        linkedLessonBlockId: linkedLessonId,
-        performanceTaskNumber: taskNumber,
-        chapterId: unit.chapterId ?? null,
-        chapterTitle: unit.chapterTitle ?? null,
-      },
-    });
-  });
-
-  return blocks;
-}
-
-function buildCumulativeExamDependencies(
-  units: TOCUnit[],
-  examTemplates: ExamBlockTemplate[]
-): string[][] {
-  if (examTemplates.length === 0) {
-    return [];
-  }
-
-  const totalLessons = units.length;
-  const totalExams = examTemplates.length;
-  const baseChunk = Math.floor(totalLessons / totalExams);
-  const remainder = totalLessons % totalExams;
-
-  const dependencyGroups: string[][] = [];
-  let cursor = 0;
-
-  for (let examIndex = 0; examIndex < totalExams; examIndex += 1) {
-    const chunkSize = baseChunk + (examIndex < remainder ? 1 : 0);
-    cursor += chunkSize;
-    dependencyGroups.push(units.slice(0, cursor).map((unit) => lessonBlockId(unit.id)));
-  }
-
-  return dependencyGroups;
-}
-
-function createReviewAndPreparationBlocks(
-  courseId: string,
-  examTemplates: ExamBlockTemplate[],
-  includeReviewBeforeExam: boolean,
-  examDependencies: string[][]
-): Block[] {
-  if (!includeReviewBeforeExam || examTemplates.length === 0) {
-    return [];
-  }
-
-  const blocks: Block[] = [];
-
-  examTemplates.forEach((exam, index) => {
-    const number = index + 1;
-    const reviewId = reviewBlockId(number);
-    const dependencies = examDependencies[index] ?? [];
-
-    blocks.push({
-      id: reviewId,
-      courseId,
-      type: "buffer",
-      subcategory: "review",
-      title: `Review for ${exam.title}`,
-      estimatedMinutes: 45,
-      minMinutes: 20,
-      maxMinutes: 90,
-      required: true,
-      splittable: false,
-      overlayMode: "major",
-      preferredSessionType: "lecture",
-      dependencies,
-      metadata: {
-        targetExamTemplateId: exam.id,
-        reviewNumber: number,
-      },
-    });
-
-    blocks.push({
-      id: bufferBlockId(number),
-      courseId,
-      type: "buffer",
-      subcategory: "preparation",
-      title: `Preparation for ${exam.title}`,
-      estimatedMinutes: 20,
-      minMinutes: 10,
-      maxMinutes: 45,
-      required: false,
-      splittable: false,
-      overlayMode: "minor",
-      preferredSessionType: "any",
-      dependencies: [reviewId],
-      metadata: {
-        targetExamTemplateId: exam.id,
-        bufferNumber: number,
-      },
-    });
-  });
-
-  return blocks;
-}
-
-function createExamBlocks(
-  courseId: string,
-  examTemplates: ExamBlockTemplate[],
-  examDependencies: string[][]
-): Block[] {
-  return examTemplates.map((exam, index) => ({
-    id: examBlockId(exam.id),
-    courseId,
-    type: "exam",
-    subcategory: exam.subcategory ?? "final",
-    title: exam.title,
-    estimatedMinutes: exam.estimatedMinutes,
-    minMinutes: Math.max(30, Math.floor(exam.estimatedMinutes * 0.9)),
-    maxMinutes: exam.estimatedMinutes,
-    required: exam.required ?? true,
-    splittable: false,
-    overlayMode: "exclusive",
-    preferredSessionType: "lecture",
-    dependencies: examDependencies[index] ?? [],
-    metadata: {
-      examTemplateId: exam.id,
-      preferredDate: exam.preferredDate ?? null,
-      examIndex: index,
-      examCount: examTemplates.length,
-    },
-  }));
-}
-
-function dedupeQuizBlocks(quizzes: Block[]): Block[] {
-  const seen = new Set<string>();
-  const result: Block[] = [];
-
-  for (const quiz of quizzes) {
-    const key = JSON.stringify({
-      dependencies: [...quiz.dependencies].sort(),
-      title: quiz.title,
-    });
-
-    if (seen.has(key)) continue;
-    seen.add(key);
-    result.push(quiz);
-  }
-
-  return result;
 }
 
 export function buildBlocks(input: BuildBlocksInput): Block[] {
-  const { courseId, tocUnits, teacherRules, examBlockTemplates = [] } = input;
+  const pacingPlan = toPacingPlan(input);
+  const blocks: Block[] = [];
+  const slotsByTerm = groupSlotsByTerm(input.slots ?? []);
+  let globalLessonOrder = 0;
+  let globalPtOrder = 0;
+  let globalWwOrder = 0;
+  let globalQuizOrder = 0;
 
-  const orderedUnits = sortTOCUnits(tocUnits).filter((unit) => unit.required);
+  for (const term of pacingPlan.terms) {
+    const termPrefix = `${term.termKey}_${term.termIndex + 1}`;
+    const termSlots = slotsByTerm.get(term.termIndex) ?? [];
+    const chapterEndingOrders = buildChapterEndingLessonOrders(term.tocUnits);
+    const ptSubtypeCounts: Record<string, number> = { __targetTotal: term.termPT };
+    const wwSubtypeCounts: Record<string, number> = { __targetTotal: term.termWW };
 
-  const lessonBlocks = orderedUnits.map(createLessonBlock);
-  const writtenWorkBlocks = createWrittenWorkBlocks(orderedUnits, teacherRules);
+    if (term.hasOrientation) {
+      blocks.push({
+        id: makeId("buffer", input.courseId, termPrefix, "orientation"),
+        courseId: input.courseId,
+        type: "buffer",
+        subcategory: "orientation",
+        title: "Orientation",
+        estimatedMinutes: 60,
+        required: true,
+        splittable: false,
+        overlayMode: "exclusive",
+        preferredSessionType: "any",
+        dependencies: [],
+        metadata: {
+          termIndex: term.termIndex,
+          termKey: term.termKey,
+          anchoredSlot: "term_start",
+          lowPriority: false,
+        },
+      });
+    }
 
-  const chapterQuizBlocks =
-    teacherRules.quizMode === "every_n_lessons"
-      ? []
-      : Array.from(groupUnitsByChapter(orderedUnits).entries()).map(([chapterId, units]) =>
-          createChapterQuizBlock(courseId, chapterId, units)
+    term.tocUnits.forEach((lesson, lessonIndex) => {
+      const lessonOrder = lessonIndex + 1;
+      const globalOrder = globalLessonOrder + lessonIndex + 1;
+      blocks.push({
+        id: makeId("lesson", input.courseId, termPrefix, lesson.id),
+        courseId: input.courseId,
+        type: "lesson",
+        subcategory: lesson.preferredSessionType === "laboratory" ? "laboratory" : "lecture",
+        title: `L${globalOrder}`,
+        sourceTocId: lesson.id,
+        estimatedMinutes: Math.max(30, lesson.estimatedMinutes),
+        required: lesson.required,
+        splittable: false,
+        overlayMode: "major",
+        preferredSessionType: lesson.preferredSessionType,
+        dependencies: [],
+        metadata: {
+          termIndex: term.termIndex,
+          termKey: term.termKey,
+          lessonOrder,
+          globalLessonOrder: globalOrder,
+          lessonTitle: lesson.title,
+          lessonDifficulty: lesson.difficulty,
+          lessonInterval: term.lessonInterval,
+          highComplexity: lesson.difficulty === "high",
+          isFirstLessonOfTerm: lessonOrder === 1,
+          anchoredSlot:
+            lessonOrder === 1
+              ? term.termIndex === 0
+                ? "first_term_second_slot"
+                : "term_start"
+              : null,
+        },
+      });
+    });
+    globalLessonOrder += term.tocUnits.length;
+
+    for (let index = 0; index < term.termPT; index += 1) {
+      const ptOrder = globalPtOrder + index + 1;
+      const subcategory = pickBalancedPerformanceTaskSubtype({
+        counts: ptSubtypeCounts,
+        termSlots,
+        termLessons: term.tocUnits,
+        ptOrder: index + 1,
+        chapterEndingOrders,
+      });
+      blocks.push({
+        id: makeId("pt", input.courseId, termPrefix, index + 1),
+        courseId: input.courseId,
+        type: "performance_task",
+        subcategory,
+        title: `PT${ptOrder}`,
+        estimatedMinutes: 60,
+        required: true,
+        splittable: false,
+        overlayMode: "major",
+        preferredSessionType: subcategory === "lab_report" ? "laboratory" : "any",
+        dependencies: [],
+        metadata: {
+          termIndex: term.termIndex,
+          termKey: term.termKey,
+          ptOrder,
+          lowPriority: false,
+        },
+      });
+    }
+    globalPtOrder += term.termPT;
+
+    for (let index = 0; index < term.termWW; index += 1) {
+      const wwOrder = globalWwOrder + index + 1;
+      const subcategory = pickBalancedWrittenWorkSubtype({
+        counts: wwSubtypeCounts,
+        termLessons: term.tocUnits,
+        wwOrder: index + 1,
+      });
+      blocks.push({
+        id: makeId("ww", input.courseId, termPrefix, index + 1),
+        courseId: input.courseId,
+        type: "written_work",
+        subcategory,
+        title: `WW${wwOrder}`,
+        estimatedMinutes: 30,
+        required: true,
+        splittable: false,
+        overlayMode: "minor",
+        preferredSessionType: "any",
+        dependencies: [],
+        metadata: {
+          termIndex: term.termIndex,
+          termKey: term.termKey,
+          wwOrder,
+          lowPriority: false,
+        },
+      });
+    }
+    globalWwOrder += term.termWW;
+
+    for (let index = 0; index < term.termQuizAmount; index += 1) {
+      const quizOrder = globalQuizOrder + index + 1;
+      const coverage = buildQuizCoverage(
+        term.tocUnits,
+        term.lessonInterval,
+        index + 1,
+        term.termQuizAmount
+      );
+
+      blocks.push({
+        id: makeId("quiz", input.courseId, termPrefix, index + 1),
+        courseId: input.courseId,
+        type: "written_work",
+        subcategory: "quiz",
+        title: `Q${quizOrder}`,
+        estimatedMinutes: 30,
+        required: true,
+        splittable: false,
+        overlayMode: "major",
+        preferredSessionType: "any",
+        dependencies: [],
+        metadata: {
+          termIndex: term.termIndex,
+          termKey: term.termKey,
+          quizOrder,
+          termQuizOrder: index + 1,
+          afterLessonOrder: coverage.endOrder,
+          lessonInterval: term.lessonInterval,
+          coveredLessonStartOrder: coverage.startOrder,
+          coveredLessonEndOrder: coverage.endOrder,
+          coveredLessonOrders: coverage.coveredLessons.map((_, coveredIndex) => coverage.startOrder + coveredIndex),
+          coveredLessonIds: coverage.coveredLessons.map((lesson) => lesson.id),
+          quizMaxDifficulty: coverage.maxComplexity,
+          quizAverageDifficulty: coverage.averageComplexity,
+          unresolvedHardRegionCount: coverage.unresolvedHardRegionCount,
+          chapterBoundaryWeight: coverage.chapterBoundaryWeight,
+          lowPriority: false,
+        },
+        });
+      }
+      globalQuizOrder += term.termQuizAmount;
+
+      if (term.extraTermSlots > 0) {
+      blocks.push({
+        id: makeId("buffer", input.courseId, termPrefix, "review_before_exam"),
+        courseId: input.courseId,
+        type: "buffer",
+        subcategory: "review",
+        title: `${term.label} Review`,
+        estimatedMinutes: 30,
+        required: false,
+        splittable: false,
+        overlayMode: "major",
+        preferredSessionType: "any",
+        dependencies: [],
+        metadata: {
+          termIndex: term.termIndex,
+          termKey: term.termKey,
+          extraCandidateType: "review_before_exam",
+          lowPriority: true,
+        },
+      });
+
+      for (let quizIndex = 0; quizIndex < term.termQuizAmount; quizIndex += 1) {
+        const targetQuizOrder = globalQuizOrder - term.termQuizAmount + quizIndex + 1;
+        const linkedQuizCoverage = buildQuizCoverage(
+          term.tocUnits,
+          term.lessonInterval,
+          quizIndex + 1,
+          term.termQuizAmount
         );
+        blocks.push({
+          id: makeId("buffer", input.courseId, termPrefix, "review_before_quiz", quizIndex + 1),
+          courseId: input.courseId,
+          type: "buffer",
+          subcategory: "review",
+          title: `Q${targetQuizOrder} Review`,
+          estimatedMinutes: 30,
+          required: false,
+          splittable: false,
+          overlayMode: "major",
+          preferredSessionType: "any",
+          dependencies: [],
+          metadata: {
+            termIndex: term.termIndex,
+            termKey: term.termKey,
+            extraCandidateType: "review_before_quiz",
+            targetQuizOrder,
+            quizMaxDifficulty: linkedQuizCoverage.maxComplexity,
+            quizAverageDifficulty: linkedQuizCoverage.averageComplexity,
+            unresolvedHardRegionCount: linkedQuizCoverage.unresolvedHardRegionCount,
+            chapterBoundaryWeight: linkedQuizCoverage.chapterBoundaryWeight,
+            lowPriority: true,
+          },
+        });
+      }
 
-  const intervalQuizBlocks =
-    teacherRules.quizMode === "per_chapter"
-      ? []
-      : createIntervalQuizBlocks(courseId, orderedUnits, teacherRules);
+      term.tocUnits.forEach((lesson, lessonIndex) => {
+        blocks.push({
+          id: makeId("lesson_extension", input.courseId, termPrefix, lesson.id),
+          courseId: input.courseId,
+          type: "lesson",
+          subcategory: lesson.preferredSessionType === "laboratory" ? "laboratory" : "lecture",
+          title: `L${globalLessonOrder - term.tocUnits.length + lessonIndex + 1} Extension`,
+          sourceTocId: lesson.id,
+          estimatedMinutes: Math.max(15, Math.floor(Math.max(30, lesson.estimatedMinutes) / 2)),
+          required: false,
+          splittable: false,
+          overlayMode: "major",
+          preferredSessionType: lesson.preferredSessionType,
+          dependencies: [],
+          metadata: {
+            termIndex: term.termIndex,
+            termKey: term.termKey,
+            extraCandidateType: "lesson_extension",
+            lessonOrder: lessonIndex + 1,
+            globalLessonOrder: globalLessonOrder - term.tocUnits.length + lessonIndex + 1,
+            highComplexity: lesson.difficulty === "high",
+            lowPriority: true,
+          },
+        });
+      });
 
-  const quizBlocks =
-    teacherRules.quizMode === "hybrid"
-      ? dedupeQuizBlocks([...chapterQuizBlocks, ...intervalQuizBlocks])
-      : teacherRules.quizMode === "per_chapter"
-        ? chapterQuizBlocks
-        : intervalQuizBlocks;
+      for (let index = 0; index < term.termPT; index += 1) {
+        const ptOrder = globalPtOrder - term.termPT + index + 1;
+        const subcategory = pickBalancedPerformanceTaskSubtype({
+          counts: { activity: 0, lab_report: 0, reporting: 0, __targetTotal: Math.max(1, term.termPT) },
+          termSlots,
+          termLessons: term.tocUnits,
+          ptOrder: index + 1,
+          chapterEndingOrders,
+        });
+        blocks.push({
+          id: makeId("pt_extension", input.courseId, termPrefix, index + 1),
+          courseId: input.courseId,
+          type: "performance_task",
+          subcategory,
+          title: `PT${ptOrder} Extension`,
+          estimatedMinutes: 30,
+          required: false,
+          splittable: false,
+          overlayMode: "major",
+          preferredSessionType: subcategory === "lab_report" ? "laboratory" : "any",
+          dependencies: [],
+          metadata: {
+            termIndex: term.termIndex,
+            termKey: term.termKey,
+            extraCandidateType: "pt_extension",
+            ptOrder,
+            prioritizeReporting: subcategory === "reporting",
+            lowPriority: true,
+          },
+        });
+      }
 
-  const performanceTaskBlocks = createPerformanceTaskBlocks(
-    courseId,
-    orderedUnits,
-    Math.max(0, teacherRules.performanceTaskMin)
-  );
+      blocks.push({
+        id: makeId("ww_extra", input.courseId, termPrefix, "extra"),
+        courseId: input.courseId,
+        type: "written_work",
+        subcategory: pickBalancedWrittenWorkSubtype({
+          counts: { assignment: 0, seatwork: 0, __targetTotal: 1 },
+          termLessons: term.tocUnits,
+          wwOrder: Math.max(1, term.termWW + 1),
+        }),
+        title: "Additional Written Work",
+        estimatedMinutes: 30,
+        required: false,
+        splittable: false,
+        overlayMode: "minor",
+        preferredSessionType: "any",
+        dependencies: [],
+        metadata: {
+          termIndex: term.termIndex,
+          termKey: term.termKey,
+          extraCandidateType: "extra_written_work",
+          lowPriority: true,
+        },
+      });
 
-  const examDependencies = buildCumulativeExamDependencies(orderedUnits, examBlockTemplates);
-  const reviewAndPreparationBlocks = createReviewAndPreparationBlocks(
-    courseId,
-    examBlockTemplates,
-    teacherRules.includeReviewBeforeExam,
-    examDependencies
-  );
+      blocks.push({
+        id: makeId("pt_extra", input.courseId, termPrefix, "extra"),
+        courseId: input.courseId,
+        type: "performance_task",
+        subcategory: pickBalancedPerformanceTaskSubtype({
+          counts: { activity: 0, lab_report: 0, reporting: 0, __targetTotal: 1 },
+          termSlots,
+          termLessons: term.tocUnits,
+          ptOrder: Math.max(1, term.termPT + 1),
+          chapterEndingOrders,
+        }),
+        title: "Additional Performance Task",
+        estimatedMinutes: 45,
+        required: false,
+        splittable: false,
+        overlayMode: "major",
+        preferredSessionType: "any",
+        dependencies: [],
+        metadata: {
+          termIndex: term.termIndex,
+          termKey: term.termKey,
+          extraCandidateType: "extra_performance_task",
+          lowPriority: true,
+        },
+      });
+    }
 
-  const examBlocks = createExamBlocks(courseId, examBlockTemplates, examDependencies);
+    const examTemplate = input.examBlockTemplates[term.termIndex] ?? input.examBlockTemplates[input.examBlockTemplates.length - 1];
+    if (examTemplate) {
+      blocks.push({
+        id: makeId("exam", input.courseId, termPrefix, examTemplate.id),
+        courseId: input.courseId,
+        type: "exam",
+        subcategory: examTemplate.subcategory,
+        title: examTemplate.title,
+        estimatedMinutes: examTemplate.estimatedMinutes,
+        required: examTemplate.required,
+        splittable: false,
+        overlayMode: "exclusive",
+        preferredSessionType: "any",
+        dependencies: [],
+        metadata: {
+          termIndex: term.termIndex,
+          termKey: term.termKey,
+          anchoredSlot:
+            examTemplate.subcategory === "final" && examTemplate.preferredDate
+              ? "preferred_date"
+              : "term_end",
+          preferredDate: examTemplate.preferredDate ?? null,
+          rawTermSlots: term.rawTermSlots,
+          initialDelayCount: term.initialDelayCount,
+          termSlots: term.termSlots,
+          extraTermSlots: term.extraTermSlots,
+          futureDelayCount: 0,
+          lessonInterval: term.lessonInterval,
+          termLessons: term.termLessons,
+          termPT: term.termPT,
+          termWW: term.termWW,
+          termQuizAmount: term.termQuizAmount,
+          lowPriority: false,
+        },
+      });
+    }
+  }
 
-  return [
-    ...lessonBlocks,
-    ...writtenWorkBlocks,
-    ...quizBlocks,
-    ...performanceTaskBlocks,
-    ...reviewAndPreparationBlocks,
-    ...examBlocks,
-  ];
+  return blocks;
 }

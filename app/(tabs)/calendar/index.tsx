@@ -15,9 +15,13 @@ import {
   UIManager,
   View
 } from "react-native";
-import { State as GestureState, PinchGestureHandler } from "react-native-gesture-handler";
+import { State as GestureState, PinchGestureHandler, Swipeable } from "react-native-gesture-handler";
+import { buildBlocks, type BuildBlocksInput } from "../../../algorithm/buildBlocks";
+import { compressTermPlan } from "../../../algorithm/compressplan";
+import { buildSlots, type RawMeetingSchedule } from "../../../algorithm/buildSlots";
 import { buildPacingPlan } from "../../../algorithm/buildPacingPlan";
-import { placeBlocks } from "../../../algorithm/placeBlocks";
+import { extendTermPlan } from "../../../algorithm/extendplan";
+import type { Block, ExamBlockTemplate, SessionSlot, TeacherRules, TOCUnit } from "../../../algorithm/types";
 import { validatePlan } from "../../../algorithm/validatePlan";
 import { Radius, Spacing, Typography } from "../../../constants/fonts";
 import { useAppTheme } from "../../../context/theme";
@@ -155,7 +159,7 @@ const WEEKDAY_LONG = [
 
 const CATEGORY_STYLE: Record<string, { color: string; chipLabel: string }> = {
   lesson: { color: "#7FB6A1", chipLabel: "L" },
-  buffer: { color: "#67B8C7", chipLabel: "BF" },
+  buffer: { color: "#9CA3AF", chipLabel: "BF" },
   written_work: { color: "#8E9AE6", chipLabel: "WW" },
   performance_task: { color: "#CE6E73", chipLabel: "PT" },
   exam: { color: "#D49C49", chipLabel: "EX" },
@@ -231,6 +235,30 @@ function getChipLabel(entry: PlanEntry) {
     return matched ? matched[0].replace(/\s+/g, " ") : "L";
   }
   return CATEGORY_STYLE[entry.category]?.chipLabel ?? "PL";
+}
+
+function getDailySlotDisplayTitle(slot: ScheduledCalendarSlot) {
+  const primaryBlock = slot.blocks[0] ?? null;
+  if (primaryBlock?.title?.trim()) return primaryBlock.title.trim();
+  if (slot.title?.trim()) return slot.title.trim();
+  return `Slot ${slot.slotNumber ?? ""}`.trim();
+}
+
+function getDailySlotCardStyle(slot: ScheduledCalendarSlot, isDark: boolean, defaultCardBg: string) {
+  const primaryBlock = slot.blocks[0] ?? null;
+  if (primaryBlock?.category === "buffer") {
+    return isDark ? "#1F2937" : "#E5E7EB";
+  }
+  return defaultCardBg;
+}
+
+function stripHtmlTags(value: string | null | undefined) {
+  if (!value) return "";
+  return value
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function isUuid(value: string | null | undefined) {
@@ -349,89 +377,996 @@ function toCalendarDiagnostics(issues: CalendarConstraint[]) {
   } satisfies CalendarSchedulerDiagnostics;
 }
 
+function inferSessionType(value: string | null | undefined): "lecture" | "laboratory" {
+  return value === "laboratory" ? "laboratory" : "lecture";
+}
+
+function buildRecurringSchedulesFromSlotRows(slotRows: PlanSlotRow[]): RawMeetingSchedule[] {
+  const unique = new Map<string, RawMeetingSchedule>();
+
+  for (const slot of slotRows) {
+    if (!slot.weekday || !slot.start_time || !slot.end_time) continue;
+    if (slot.series_key?.startsWith("manual_slot__")) continue;
+
+    const weekday = normalizeWeekdayValue(slot.weekday);
+    if (!weekday) continue;
+    const dayOfWeek = WEEKDAY_LONG.findIndex((label) => label.toLowerCase() === weekday);
+    if (dayOfWeek < 0) continue;
+
+    const startTime = toHm(slot.start_time);
+    const endTime = toHm(slot.end_time);
+    if (!startTime || !endTime) continue;
+
+    const sessionType = inferSessionType(slot.meeting_type ?? slot.room);
+    const id = slot.series_key ?? `${weekday}_${startTime}_${endTime}_${sessionType}_${slot.slot_number ?? 1}`;
+    const key = `${dayOfWeek}|${startTime}|${endTime}|${sessionType}|${slot.slot_number ?? 1}|${id}`;
+    if (unique.has(key)) continue;
+
+    unique.set(key, {
+      id,
+      slotNumber: slot.slot_number ?? 1,
+      dayOfWeek,
+      startTime,
+      endTime,
+      sessionType,
+    });
+  }
+
+  return Array.from(unique.values());
+}
+
+function inferLessonOrder(title: string, fallback: number) {
+  const matched = title.match(/lesson\s+(\d+)/i);
+  return matched ? Number(matched[1]) : fallback;
+}
+
+function buildTocUnitsFromBlockRows(lessonPlanId: string, blockRows: PlanBlockRow[]): TOCUnit[] {
+  const requiredLessons = blockRows
+    .filter((block) => block.session_category === "lesson")
+    .filter((block) => Boolean(block.required))
+    .filter((block) => !Boolean(block.metadata?.manual))
+    .filter((block) => block.metadata?.extraCandidateType !== "lesson_extension");
+
+  const deduped = new Map<string, TOCUnit>();
+
+  requiredLessons.forEach((block, index) => {
+    const sourceId =
+      (typeof block.metadata?.sourceTocId === "string" && block.metadata.sourceTocId) ||
+      block.lesson_id ||
+      block.block_key ||
+      block.algorithm_block_key ||
+      block.block_id;
+    if (deduped.has(sourceId)) return;
+
+    const difficultyValue = block.metadata?.lessonDifficulty;
+    const difficulty =
+      difficultyValue === "easy" || difficultyValue === "medium" || difficultyValue === "high"
+        ? difficultyValue
+        : "medium";
+
+    deduped.set(sourceId, {
+      id: sourceId,
+      courseId: lessonPlanId,
+      chapterId: typeof block.metadata?.chapterId === "string" ? block.metadata.chapterId : null,
+      chapterTitle: typeof block.metadata?.chapterTitle === "string" ? block.metadata.chapterTitle : null,
+      title: block.title,
+      order:
+        typeof block.metadata?.lessonOrder === "number"
+          ? Number(block.metadata.lessonOrder)
+          : inferLessonOrder(block.title, index + 1),
+      estimatedMinutes: Math.max(30, Number(block.estimated_minutes ?? 60)),
+      difficulty,
+      preferredSessionType: inferSessionType(block.preferred_session_type ?? block.meeting_type),
+      required: true,
+    });
+  });
+
+  return Array.from(deduped.values()).sort((a, b) => a.order - b.order);
+}
+
+function buildExamTemplatesFromBlockRows(blockRows: PlanBlockRow[]): ExamBlockTemplate[] {
+  const templates = blockRows
+    .filter((block) => block.session_category === "exam")
+    .filter((block) => Boolean(block.required))
+    .filter((block) => !Boolean(block.metadata?.manual))
+    .map((block) => ({
+      id: block.block_key || block.algorithm_block_key || block.block_id,
+      title: block.title,
+      estimatedMinutes: Math.max(30, Number(block.estimated_minutes ?? 90)),
+      subcategory: (
+        block.session_subcategory === "prelim" ||
+        block.session_subcategory === "midterm" ||
+        block.session_subcategory === "final"
+          ? block.session_subcategory
+          : inferExamSubtype(block.title, block.description ?? null)
+      ) as ExamBlockTemplate["subcategory"],
+      preferredDate:
+        typeof block.metadata?.preferredDate === "string"
+          ? block.metadata.preferredDate
+          : null,
+      required: true,
+    }))
+    .sort((a, b) => a.title.localeCompare(b.title));
+
+  return templates.length > 0
+    ? templates
+    : [
+        {
+          id: "final_exam_fallback",
+          title: "Final Exam",
+          estimatedMinutes: 90,
+          subcategory: "final",
+          preferredDate: null,
+          required: true,
+        },
+      ];
+}
+
+function buildTeacherRulesFromBlockRows(blockRows: PlanBlockRow[]): TeacherRules {
+  const requiredWrittenWorks = blockRows.filter(
+    (block) =>
+      block.session_category === "written_work" &&
+      Boolean(block.required) &&
+      block.session_subcategory !== "quiz" &&
+      !Boolean(block.metadata?.lowPriority)
+  ).length;
+  const requiredPerformanceTasks = blockRows.filter(
+    (block) =>
+      block.session_category === "performance_task" &&
+      Boolean(block.required) &&
+      !Boolean(block.metadata?.lowPriority)
+  ).length;
+  const requiredExams = blockRows.filter(
+    (block) => block.session_category === "exam" && Boolean(block.required)
+  ).length;
+
+  return {
+    quizMode: "hybrid",
+    quizEveryNLessons: 3,
+    writtenWorkMode: "total",
+    minWW: Math.max(0, requiredWrittenWorks),
+    allowLessonWrittenWorkOverlay: true,
+    preferLessonWrittenWorkOverlay: true,
+    minPT: Math.max(0, requiredPerformanceTasks),
+    includeReviewBeforeExam: requiredExams > 0,
+  };
+}
+
+function buildGeneratedSlotKey(slot: {
+  date: string;
+  startTime: string | null | undefined;
+  endTime: string | null | undefined;
+  sessionType: string | null | undefined;
+  slotNumber?: number | null;
+  seriesKey?: string | null;
+}) {
+  return [
+    slot.date,
+    slot.startTime ?? "",
+    slot.endTime ?? "",
+    slot.sessionType ?? "",
+    String(slot.slotNumber ?? ""),
+    slot.seriesKey ?? "",
+  ].join("|");
+}
+
+function buildBlockMap(blocks: Block[]) {
+  return new Map(blocks.map((block) => [block.id, block]));
+}
+
+function getMajorPlacement(slot: SessionSlot) {
+  return slot.placements.find((placement) => placement.lane === "major") ?? null;
+}
+
+function rebuildSlotPlacementOrder(slot: SessionSlot, blockMap: Map<string, Block>) {
+  const rank = (placement: { blockId: string; lane: "major" | "minor" }) => {
+    const block = blockMap.get(placement.blockId);
+    if (!block) return 99;
+    if (block.type === "lesson") return 1;
+    if (block.type === "written_work" && block.subcategory !== "quiz") return 2;
+    if (block.type === "performance_task") return 3;
+    if (block.type === "written_work" && block.subcategory === "quiz") return 4;
+    if (block.type === "buffer") return 5;
+    if (block.type === "exam") return 6;
+    return 99;
+  };
+
+  slot.placements = [...slot.placements]
+    .sort((a, b) => rank(a) - rank(b) || a.blockId.localeCompare(b.blockId))
+    .map((placement, index) => ({
+      ...placement,
+      id: `placement__${placement.blockId}__${slot.id}__${index + 1}`,
+      slotId: slot.id,
+    }));
+}
+
+function makePlacementId(blockId: string, slotId: string, order: number) {
+  return `placement__${blockId}__${slotId}__${order}`;
+}
+
+function addRecoveredPlacement(
+  slot: SessionSlot,
+  block: Block,
+  lane: "major" | "minor"
+) {
+  slot.placements.push({
+    id: makePlacementId(block.id, slot.id, slot.placements.length + 1),
+    blockId: block.id,
+    slotId: slot.id,
+    lane,
+    minutesUsed: Math.min(slot.minutes || block.estimatedMinutes, block.estimatedMinutes),
+    chainId: block.id,
+    segmentIndex: 1,
+    segmentCount: 1,
+    continuesFromPrevious: false,
+    continuesToNext: false,
+    startTime: null,
+    endTime: null,
+  });
+}
+
+function createMajorGapAt(termSlots: SessionSlot[], targetIndex: number) {
+  const sortedTermSlots = [...termSlots].sort((a, b) => {
+    const dateCompare = a.date.localeCompare(b.date);
+    if (dateCompare !== 0) return dateCompare;
+    return (a.startTime ?? "").localeCompare(b.startTime ?? "");
+  });
+  const lastUsableIndex = Math.max(0, sortedTermSlots.length - 2);
+  if (targetIndex < 0 || targetIndex > lastUsableIndex) return false;
+  const targetSlot = sortedTermSlots[targetIndex];
+  if (!targetSlot || targetSlot.locked) return false;
+  if (!getMajorPlacement(targetSlot)) return true;
+
+  let emptyIndex = -1;
+  for (let index = lastUsableIndex; index >= targetIndex; index -= 1) {
+    const slot = sortedTermSlots[index];
+    if (!slot || slot.locked || getMajorPlacement(slot)) continue;
+    emptyIndex = index;
+    break;
+  }
+  if (emptyIndex === -1) return false;
+
+  for (let index = emptyIndex; index > targetIndex; index -= 1) {
+    swapMajorPlacements(sortedTermSlots, index - 1, index);
+  }
+
+  return !getMajorPlacement(sortedTermSlots[targetIndex]!);
+}
+
+function recoverMissingRequiredBlocks(termSlots: SessionSlot[], termBlocks: Block[]) {
+  const sortedTermSlots = [...termSlots].sort((a, b) => {
+    const dateCompare = a.date.localeCompare(b.date);
+    if (dateCompare !== 0) return dateCompare;
+    return (a.startTime ?? "").localeCompare(b.startTime ?? "");
+  });
+  const blockMap = buildBlockMap(termBlocks);
+  const placedIds = new Set(sortedTermSlots.flatMap((slot) => slot.placements.map((placement) => placement.blockId)));
+  const examIndex = sortedTermSlots.findIndex((slot) => {
+    const major = getMajorPlacement(slot);
+    const block = major ? blockMap.get(major.blockId) ?? null : null;
+    return block?.type === "exam";
+  });
+  const lastUsableIndex = examIndex >= 0 ? examIndex - 1 : sortedTermSlots.length - 1;
+
+  const findAnchorSlotIndex = (preferredOrderKey: string, preferredOrder: number) => {
+    const exact = sortedTermSlots.findIndex((slot) =>
+      slot.placements.some((placement) => {
+        const block = blockMap.get(placement.blockId);
+        return Number(block?.metadata[preferredOrderKey] ?? -1) === preferredOrder;
+      })
+    );
+    if (exact >= 0) return exact;
+
+    const lessonIndex = sortedTermSlots.findIndex((slot) => {
+      const major = getMajorPlacement(slot);
+      const block = major ? blockMap.get(major.blockId) ?? null : null;
+      return block?.type === "lesson" && Number(block.metadata.lessonOrder ?? -1) >= preferredOrder;
+    });
+    if (lessonIndex >= 0) return lessonIndex;
+
+    for (let index = 0; index <= lastUsableIndex; index += 1) {
+      const slot = sortedTermSlots[index]!;
+      const major = getMajorPlacement(slot);
+      const block = major ? blockMap.get(major.blockId) ?? null : null;
+      if (!slot.locked && block?.type !== "exam") return index;
+    }
+
+    return Math.max(0, lastUsableIndex);
+  };
+
+  const placeMinorFallback = (block: Block, preferredIndex: number) => {
+    const boundedIndex = Math.max(0, Math.min(preferredIndex, lastUsableIndex));
+    for (let offset = 0; offset <= lastUsableIndex; offset += 1) {
+      const leftIndex = boundedIndex - offset;
+      const rightIndex = boundedIndex + offset;
+      const candidates = [leftIndex, rightIndex].filter(
+        (index, candidateIndex, arr) =>
+          index >= 0 &&
+          index <= lastUsableIndex &&
+          arr.indexOf(index) === candidateIndex
+      );
+      for (const index of candidates) {
+        const slot = sortedTermSlots[index]!;
+        if (slot.locked) continue;
+        const major = getMajorPlacement(slot);
+        const majorBlock = major ? blockMap.get(major.blockId) ?? null : null;
+        if (majorBlock?.type === "exam") continue;
+        addRecoveredPlacement(slot, block, "minor");
+        placedIds.add(block.id);
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const placeMajorBlock = (
+    block: Block,
+    preferredIndex: number,
+    allowMinorFallback = false
+  ) => {
+    if (placedIds.has(block.id)) return;
+    const boundedIndex = Math.max(0, Math.min(preferredIndex, lastUsableIndex));
+    if (createMajorGapAt(sortedTermSlots, boundedIndex)) {
+      addRecoveredPlacement(sortedTermSlots[boundedIndex]!, block, "major");
+      placedIds.add(block.id);
+      return;
+    }
+
+    for (let index = 0; index <= lastUsableIndex; index += 1) {
+      const slot = sortedTermSlots[index]!;
+      if (slot.locked || getMajorPlacement(slot)) continue;
+      addRecoveredPlacement(slot, block, "major");
+      placedIds.add(block.id);
+      return;
+    }
+
+    if (allowMinorFallback) {
+      placeMinorFallback(block, boundedIndex);
+    }
+  };
+
+  const placeMinorBlock = (block: Block, preferredIndex: number) => {
+    if (placedIds.has(block.id)) return;
+    placeMinorFallback(block, preferredIndex);
+  };
+
+  const missingLessons = termBlocks
+    .filter((block) => block.type === "lesson" && !block.metadata.extraCandidateType && !placedIds.has(block.id))
+    .sort((a, b) => Number(a.metadata.lessonOrder ?? 0) - Number(b.metadata.lessonOrder ?? 0));
+  for (const block of missingLessons) {
+    const targetIndex = findAnchorSlotIndex("lessonOrder", Number(block.metadata.lessonOrder ?? 0));
+    placeMajorBlock(block, targetIndex);
+  }
+
+  const missingPerformanceTasks = termBlocks
+    .filter(
+      (block) =>
+        block.type === "performance_task" &&
+        !block.metadata.extraCandidateType &&
+        !placedIds.has(block.id)
+    )
+    .sort((a, b) => Number(a.metadata.ptOrder ?? 0) - Number(b.metadata.ptOrder ?? 0));
+  for (const block of missingPerformanceTasks) {
+    const targetIndex = findAnchorSlotIndex("ptOrder", Number(block.metadata.ptOrder ?? 0));
+    placeMajorBlock(block, targetIndex, true);
+  }
+
+  const missingWrittenWorks = termBlocks
+    .filter(
+      (block) =>
+        block.type === "written_work" &&
+        block.subcategory !== "quiz" &&
+        !block.metadata.extraCandidateType &&
+        !placedIds.has(block.id)
+    )
+    .sort((a, b) => Number(a.metadata.wwOrder ?? 0) - Number(b.metadata.wwOrder ?? 0));
+  for (const block of missingWrittenWorks) {
+    const targetIndex = findAnchorSlotIndex("wwOrder", Number(block.metadata.wwOrder ?? 0));
+    placeMinorBlock(block, targetIndex);
+  }
+
+  const missingQuizzes = termBlocks
+    .filter(
+      (block) =>
+        block.type === "written_work" &&
+        block.subcategory === "quiz" &&
+        !placedIds.has(block.id)
+    )
+    .sort((a, b) => Number(a.metadata.quizOrder ?? 0) - Number(b.metadata.quizOrder ?? 0));
+  const finalQuizId =
+    termBlocks
+      .filter((block) => block.type === "written_work" && block.subcategory === "quiz")
+      .sort((a, b) => Number(b.metadata.quizOrder ?? 0) - Number(a.metadata.quizOrder ?? 0))[0]?.id ??
+    null;
+  for (const block of missingQuizzes) {
+    const targetIndex = findAnchorSlotIndex("quizOrder", Number(block.metadata.quizOrder ?? 0));
+    placeMajorBlock(block, targetIndex, block.id !== finalQuizId);
+  }
+
+  sortedTermSlots.forEach((slot) => rebuildSlotPlacementOrder(slot, blockMap));
+}
+
+function swapMajorPlacements(termSlots: SessionSlot[], fromIndex: number, toIndex: number) {
+  const fromSlot = termSlots[fromIndex];
+  const toSlot = termSlots[toIndex];
+  if (!fromSlot || !toSlot) return false;
+  const fromMajor = getMajorPlacement(fromSlot);
+  const toMajor = getMajorPlacement(toSlot);
+  if (!fromMajor) return false;
+
+  fromSlot.placements = fromSlot.placements.filter((placement) => placement.blockId !== fromMajor.blockId);
+  if (toMajor) {
+    toSlot.placements = toSlot.placements.filter((placement) => placement.blockId !== toMajor.blockId);
+    fromSlot.placements.push({
+      ...toMajor,
+      slotId: fromSlot.id,
+      id: `placement__${toMajor.blockId}__${fromSlot.id}__${fromSlot.placements.length + 1}`,
+    });
+  }
+  toSlot.placements.push({
+    ...fromMajor,
+    slotId: toSlot.id,
+    id: `placement__${fromMajor.blockId}__${toSlot.id}__${toSlot.placements.length + 1}`,
+  });
+  return true;
+}
+
+function normalizeTermPlacements(termSlots: SessionSlot[], termBlocks: Block[]) {
+  const sortedTermSlots = [...termSlots].sort((a, b) => {
+    const dateCompare = a.date.localeCompare(b.date);
+    if (dateCompare !== 0) return dateCompare;
+    return (a.startTime ?? "").localeCompare(b.startTime ?? "");
+  });
+  const blockMap = buildBlockMap(termBlocks);
+
+  const reorderMajorsByKey = (matcher: (block: Block) => boolean, orderKey: string) => {
+    const indexes = sortedTermSlots
+      .map((slot, index) => {
+        const major = getMajorPlacement(slot);
+        const block = major ? blockMap.get(major.blockId) ?? null : null;
+        return block && matcher(block) ? index : -1;
+      })
+      .filter((index) => index >= 0);
+    const blocks = indexes
+      .map((index) => {
+        const major = getMajorPlacement(sortedTermSlots[index]!);
+        return major ? blockMap.get(major.blockId) ?? null : null;
+      })
+      .filter((block): block is Block => Boolean(block))
+      .sort((a, b) => Number(a.metadata[orderKey] ?? 0) - Number(b.metadata[orderKey] ?? 0));
+
+    indexes.forEach((slotIndex, blockIndex) => {
+      const targetBlock = blocks[blockIndex];
+      if (!targetBlock) return;
+      const currentIndex = sortedTermSlots.findIndex(
+        (slot) => getMajorPlacement(slot)?.blockId === targetBlock.id
+      );
+      if (currentIndex >= 0 && currentIndex !== slotIndex) {
+        swapMajorPlacements(sortedTermSlots, currentIndex, slotIndex);
+      }
+    });
+  };
+
+  const reorderMinorByKey = (matcher: (block: Block) => boolean, orderKey: string) => {
+    const carriers = sortedTermSlots
+      .map((slot) => ({
+        slot,
+        placements: slot.placements.filter((placement) => {
+          const block = blockMap.get(placement.blockId);
+          return block ? matcher(block) : false;
+        }),
+      }))
+      .filter((entry) => entry.placements.length > 0);
+    const orderedBlocks = carriers
+      .flatMap((entry) => entry.placements.map((placement) => blockMap.get(placement.blockId) ?? null))
+      .filter((block): block is Block => Boolean(block))
+      .sort((a, b) => Number(a.metadata[orderKey] ?? 0) - Number(b.metadata[orderKey] ?? 0));
+
+    let cursor = 0;
+    for (const carrier of carriers) {
+      carrier.slot.placements = carrier.slot.placements.filter((placement) => {
+        const block = blockMap.get(placement.blockId);
+        return block ? !matcher(block) : true;
+      });
+      for (let index = 0; index < carrier.placements.length; index += 1) {
+        const block = orderedBlocks[cursor];
+        if (!block) continue;
+        carrier.slot.placements.push({
+          id: `placement__${block.id}__${carrier.slot.id}__${carrier.slot.placements.length + 1}`,
+          blockId: block.id,
+          slotId: carrier.slot.id,
+          lane: "minor",
+          minutesUsed: Math.min(carrier.slot.minutes || block.estimatedMinutes, block.estimatedMinutes),
+          chainId: block.id,
+          segmentIndex: 1,
+          segmentCount: 1,
+          continuesFromPrevious: false,
+          continuesToNext: false,
+          startTime: null,
+          endTime: null,
+        });
+        cursor += 1;
+      }
+    }
+  };
+
+  reorderMajorsByKey((block) => block.type === "lesson", "lessonOrder");
+  reorderMajorsByKey((block) => block.type === "performance_task" && !block.metadata.extraCandidateType, "ptOrder");
+  reorderMajorsByKey((block) => block.type === "written_work" && block.subcategory === "quiz", "quizOrder");
+  reorderMinorByKey((block) => block.type === "written_work" && block.subcategory !== "quiz", "wwOrder");
+
+  const examIndex = sortedTermSlots.findIndex((slot) => {
+    const major = getMajorPlacement(slot);
+    const block = major ? blockMap.get(major.blockId) ?? null : null;
+    return block?.type === "exam";
+  });
+  const examReviewIndex = sortedTermSlots.findIndex((slot) => {
+    const major = getMajorPlacement(slot);
+    const block = major ? blockMap.get(major.blockId) ?? null : null;
+    return block?.metadata.extraCandidateType === "review_before_exam";
+  });
+  const quizBlocks = termBlocks
+    .filter((block) => block.type === "written_work" && block.subcategory === "quiz")
+    .sort((a, b) => Number(a.metadata.quizOrder ?? 0) - Number(b.metadata.quizOrder ?? 0));
+  const finalQuiz = quizBlocks[quizBlocks.length - 1] ?? null;
+
+  if (examIndex > 0 && finalQuiz) {
+    const targetQuizIndex = examReviewIndex === examIndex - 1 ? examIndex - 2 : examIndex - 1;
+    const currentQuizIndex = sortedTermSlots.findIndex(
+      (slot) => getMajorPlacement(slot)?.blockId === finalQuiz.id
+    );
+    if (targetQuizIndex >= 0 && currentQuizIndex >= 0 && currentQuizIndex !== targetQuizIndex) {
+      swapMajorPlacements(sortedTermSlots, currentQuizIndex, targetQuizIndex);
+    }
+  }
+
+  sortedTermSlots.forEach((slot) => rebuildSlotPlacementOrder(slot, blockMap));
+}
+
+function validateAdjustedTerm(termSlots: SessionSlot[], termBlocks: Block[]) {
+  const sortedTermSlots = [...termSlots].sort((a, b) => {
+    const dateCompare = a.date.localeCompare(b.date);
+    if (dateCompare !== 0) return dateCompare;
+    return (a.startTime ?? "").localeCompare(b.startTime ?? "");
+  });
+  const blockMap = buildBlockMap(termBlocks);
+  const examBlock = termBlocks.find((block) => block.type === "exam") ?? null;
+  if (!examBlock) return;
+
+  const placedIds = new Set(sortedTermSlots.flatMap((slot) => slot.placements.map((placement) => placement.blockId)));
+  const placedLessons = termBlocks.filter((block) => block.type === "lesson" && !block.metadata.extraCandidateType && placedIds.has(block.id)).length;
+  const placedWW = termBlocks.filter((block) => block.type === "written_work" && block.subcategory !== "quiz" && !block.metadata.extraCandidateType && placedIds.has(block.id)).length;
+  const placedPT = termBlocks.filter((block) => block.type === "performance_task" && !block.metadata.extraCandidateType && placedIds.has(block.id)).length;
+  const placedQuiz = termBlocks.filter((block) => block.type === "written_work" && block.subcategory === "quiz" && placedIds.has(block.id)).length;
+
+  const expectedLessons = Number(examBlock.metadata.termLessons ?? 0);
+  const expectedWW = Number(examBlock.metadata.termWW ?? 0);
+  const expectedPT = Number(examBlock.metadata.termPT ?? 0);
+  const expectedQuiz = Number(examBlock.metadata.termQuizAmount ?? 0);
+
+  if (
+    placedLessons !== expectedLessons ||
+    placedWW !== expectedWW ||
+    placedPT !== expectedPT ||
+    placedQuiz !== expectedQuiz
+  ) {
+    const missingParts: string[] = [];
+    if (placedLessons !== expectedLessons) {
+      missingParts.push(`lessons ${placedLessons}/${expectedLessons}`);
+    }
+    if (placedWW !== expectedWW) {
+      missingParts.push(`written works ${placedWW}/${expectedWW}`);
+    }
+    if (placedPT !== expectedPT) {
+      missingParts.push(`performance tasks ${placedPT}/${expectedPT}`);
+    }
+    if (placedQuiz !== expectedQuiz) {
+      missingParts.push(`quizzes ${placedQuiz}/${expectedQuiz}`);
+    }
+    throw new Error(
+      `Term requirements are no longer fully scheduled after this adjustment (${missingParts.join(", ")}).`
+    );
+  }
+
+  const placedBlocks = sortedTermSlots
+    .flatMap((slot) =>
+      slot.placements.map((placement) => ({
+        slot,
+        placement,
+        block: blockMap.get(placement.blockId) ?? null,
+      }))
+    )
+    .filter(
+      (item): item is { slot: SessionSlot; placement: SessionSlot["placements"][number]; block: Block } =>
+        Boolean(item.block)
+    );
+  const majorBlocks = sortedTermSlots
+    .map((slot) => {
+      const major = getMajorPlacement(slot);
+      return major ? blockMap.get(major.blockId) ?? null : null;
+    })
+    .filter((block): block is Block => Boolean(block));
+  const lessonsInOrder = majorBlocks
+    .filter((block) => block.type === "lesson")
+    .every((block, index, list) => index === 0 || Number(list[index - 1]!.metadata.lessonOrder ?? 0) <= Number(block.metadata.lessonOrder ?? 0));
+  const ptInOrder = majorBlocks
+    .filter((block) => block.type === "performance_task" && !block.metadata.extraCandidateType)
+    .every((block, index, list) => index === 0 || Number(list[index - 1]!.metadata.ptOrder ?? 0) <= Number(block.metadata.ptOrder ?? 0));
+  const quizInOrder = majorBlocks
+    .filter((block) => block.type === "written_work" && block.subcategory === "quiz")
+    .every((block, index, list) => index === 0 || Number(list[index - 1]!.metadata.quizOrder ?? 0) <= Number(block.metadata.quizOrder ?? 0));
+  const wwInOrder = placedBlocks
+    .map((item) => item.block)
+    .filter((block) => block.type === "written_work" && block.subcategory !== "quiz" && !block.metadata.extraCandidateType)
+    .every((block, index, list) => index === 0 || Number(list[index - 1]!.metadata.wwOrder ?? 0) <= Number(block.metadata.wwOrder ?? 0));
+  const ptPlacedInOrder = placedBlocks
+    .map((item) => item.block)
+    .filter((block) => block.type === "performance_task" && !block.metadata.extraCandidateType)
+    .every((block, index, list) => index === 0 || Number(list[index - 1]!.metadata.ptOrder ?? 0) <= Number(block.metadata.ptOrder ?? 0));
+
+  const examIndex = sortedTermSlots.findIndex((slot) => {
+    const major = getMajorPlacement(slot);
+    const block = major ? blockMap.get(major.blockId) ?? null : null;
+    return block?.type === "exam";
+  });
+  const examReviewIndex = sortedTermSlots.findIndex((slot) => {
+    const major = getMajorPlacement(slot);
+    const block = major ? blockMap.get(major.blockId) ?? null : null;
+    return block?.metadata.extraCandidateType === "review_before_exam";
+  });
+  const finalQuizIndex = sortedTermSlots.findIndex((slot) => {
+    const major = getMajorPlacement(slot);
+    return major?.blockId === termBlocks
+      .filter((block) => block.type === "written_work" && block.subcategory === "quiz")
+      .sort((a, b) => Number(b.metadata.quizOrder ?? 0) - Number(a.metadata.quizOrder ?? 0))[0]?.id;
+  });
+  const expectedFinalQuizIndex = examIndex >= 0
+    ? (examReviewIndex === examIndex - 1 ? examIndex - 2 : examIndex - 1)
+    : -1;
+  const hasLessonAfterFinalQuiz =
+    finalQuizIndex >= 0 &&
+    sortedTermSlots
+      .slice(finalQuizIndex + 1, examIndex >= 0 ? examIndex : undefined)
+      .some((slot) => {
+        const major = getMajorPlacement(slot);
+        const block = major ? blockMap.get(major.blockId) ?? null : null;
+        return block?.type === "lesson";
+      });
+
+  if (!lessonsInOrder || !ptInOrder || !ptPlacedInOrder || !quizInOrder || !wwInOrder) {
+    throw new Error("Term block ordering became invalid after this adjustment.");
+  }
+  if (expectedFinalQuizIndex >= 0 && finalQuizIndex !== expectedFinalQuizIndex) {
+    throw new Error("Final quiz placement is invalid for this term.");
+  }
+  if (hasLessonAfterFinalQuiz) {
+    throw new Error("Lessons cannot appear after the final quiz in a term.");
+  }
+}
+
+function collectPlacedCoreBlockIds(termSlots: SessionSlot[], termBlocks: Block[]) {
+  const placedIds = new Set(termSlots.flatMap((slot) => slot.placements.map((placement) => placement.blockId)));
+
+  return {
+    lessons: new Set(
+      termBlocks
+        .filter((block) => block.type === "lesson" && !block.metadata.extraCandidateType)
+        .map((block) => block.id)
+        .filter((id) => placedIds.has(id))
+    ),
+    writtenWorks: new Set(
+      termBlocks
+        .filter(
+          (block) =>
+            block.type === "written_work" &&
+            block.subcategory !== "quiz" &&
+            !block.metadata.extraCandidateType
+        )
+        .map((block) => block.id)
+        .filter((id) => placedIds.has(id))
+    ),
+    performanceTasks: new Set(
+      termBlocks
+        .filter((block) => block.type === "performance_task" && !block.metadata.extraCandidateType)
+        .map((block) => block.id)
+        .filter((id) => placedIds.has(id))
+    ),
+    quizzes: new Set(
+      termBlocks
+        .filter((block) => block.type === "written_work" && block.subcategory === "quiz")
+        .map((block) => block.id)
+        .filter((id) => placedIds.has(id))
+    ),
+  };
+}
+
+function diffPlacedCoreBlockIds(
+  before: ReturnType<typeof collectPlacedCoreBlockIds>,
+  after: ReturnType<typeof collectPlacedCoreBlockIds>
+) {
+  const missingLessons = Array.from(before.lessons).filter((id) => !after.lessons.has(id));
+  const missingWrittenWorks = Array.from(before.writtenWorks).filter((id) => !after.writtenWorks.has(id));
+  const missingPerformanceTasks = Array.from(before.performanceTasks).filter((id) => !after.performanceTasks.has(id));
+  const missingQuizzes = Array.from(before.quizzes).filter((id) => !after.quizzes.has(id));
+
+  return {
+    missingLessons,
+    missingWrittenWorks,
+    missingPerformanceTasks,
+    missingQuizzes,
+    hasMissing:
+      missingLessons.length > 0 ||
+      missingWrittenWorks.length > 0 ||
+      missingPerformanceTasks.length > 0 ||
+      missingQuizzes.length > 0,
+  };
+}
+
+function formatMissingCoreBlockIds(diff: ReturnType<typeof diffPlacedCoreBlockIds>) {
+  const parts: string[] = [];
+  if (diff.missingLessons.length > 0) {
+    parts.push(`L: ${diff.missingLessons.join(", ")}`);
+  }
+  if (diff.missingWrittenWorks.length > 0) {
+    parts.push(`WW: ${diff.missingWrittenWorks.join(", ")}`);
+  }
+  if (diff.missingPerformanceTasks.length > 0) {
+    parts.push(`PT: ${diff.missingPerformanceTasks.join(", ")}`);
+  }
+  if (diff.missingQuizzes.length > 0) {
+    parts.push(`Q: ${diff.missingQuizzes.join(", ")}`);
+  }
+  return parts.join(" | ");
+}
+
+function ensureTermBlockInventory(termBlocks: Block[]) {
+  const examBlock = termBlocks.find((block) => block.type === "exam") ?? null;
+  if (!examBlock) return;
+
+  const availableLessons = termBlocks.filter(
+    (block) => block.type === "lesson" && !block.metadata.extraCandidateType
+  ).length;
+  const availableWW = termBlocks.filter(
+    (block) =>
+      block.type === "written_work" &&
+      block.subcategory !== "quiz" &&
+      !block.metadata.extraCandidateType
+  ).length;
+  const availablePT = termBlocks.filter(
+    (block) => block.type === "performance_task" && !block.metadata.extraCandidateType
+  ).length;
+  const availableQuiz = termBlocks.filter(
+    (block) => block.type === "written_work" && block.subcategory === "quiz"
+  ).length;
+
+  const expectedLessons = Number(examBlock.metadata.termLessons ?? 0);
+  const expectedWW = Number(examBlock.metadata.termWW ?? 0);
+  const expectedPT = Number(examBlock.metadata.termPT ?? 0);
+  const expectedQuiz = Number(examBlock.metadata.termQuizAmount ?? 0);
+
+  const missingParts: string[] = [];
+  if (availableLessons < expectedLessons) {
+    missingParts.push(`lessons ${availableLessons}/${expectedLessons}`);
+  }
+  if (availableWW < expectedWW) {
+    missingParts.push(`written works ${availableWW}/${expectedWW}`);
+  }
+  if (availablePT < expectedPT) {
+    missingParts.push(`performance tasks ${availablePT}/${expectedPT}`);
+  }
+  if (availableQuiz < expectedQuiz) {
+    missingParts.push(`quizzes ${availableQuiz}/${expectedQuiz}`);
+  }
+
+  if (missingParts.length > 0) {
+    throw new Error(
+      `Repopulate cannot restore deleted required blocks. Missing inventory: ${missingParts.join(", ")}.`
+    );
+  }
+}
+
+function summarizeRequiredBlockCounts(blocks: Block[]) {
+  return {
+    lesson: blocks.filter((block) => block.type === "lesson" && block.required && !Boolean(block.metadata.lowPriority)).length,
+    writtenWork: blocks.filter(
+      (block) => block.type === "written_work" && block.subcategory !== "quiz" && block.required && !Boolean(block.metadata.lowPriority)
+    ).length,
+    performanceTask: blocks.filter(
+      (block) => block.type === "performance_task" && block.required && !Boolean(block.metadata.lowPriority)
+    ).length,
+    exam: blocks.filter((block) => block.type === "exam" && block.required).length,
+  };
+}
+
+function buildCalendarAlgorithmSlots(input: {
+  planStartDate: string;
+  planEndDate: string;
+  lessonPlanId: string;
+  slots: PlanSlotRow[];
+  blackoutDates: string[];
+  examBlockTemplates: ExamBlockTemplate[];
+}): SessionSlot[] {
+  const recurringSchedules = buildRecurringSchedulesFromSlotRows(input.slots);
+  const rebuiltSlots =
+    recurringSchedules.length > 0
+      ? buildSlots({
+          courseId: input.lessonPlanId,
+          startDate: input.planStartDate,
+          endDate: input.planEndDate,
+          rawMeetingSchedules: recurringSchedules,
+          holidays: input.blackoutDates,
+          termBoundaryDates: input.examBlockTemplates
+            .map((template) => template.preferredDate)
+            .filter((value): value is string => Boolean(value)),
+        })
+      : [];
+
+  const sourceSlotRowById = new Map(input.slots.map((slot) => [slot.slot_id, slot]));
+  const rebuiltSlotByKey = new Map(
+    rebuiltSlots.map((slot) => [
+      buildGeneratedSlotKey({
+        date: slot.date,
+        startTime: slot.startTime,
+        endTime: slot.endTime,
+        sessionType: slot.sessionType,
+        slotNumber: slot.slotNumber ?? null,
+        seriesKey: slot.seriesKey ?? null,
+      }),
+      slot,
+    ])
+  );
+
+  return mapSlotRowsToAlgorithmSlots(
+    input.slots.map((slot) => ({
+      ...slot,
+      is_locked: slot.is_locked || input.blackoutDates.includes(slot.slot_date),
+    }))
+  ).map((slot) => {
+    const source = sourceSlotRowById.get(slot.id);
+    const matched = source
+      ? rebuiltSlotByKey.get(
+          buildGeneratedSlotKey({
+            date: slot.date,
+            startTime: slot.startTime,
+            endTime: slot.endTime,
+            sessionType: slot.sessionType,
+            slotNumber: source.slot_number ?? null,
+            seriesKey: source.series_key ?? null,
+          })
+        )
+      : null;
+
+    return matched
+      ? {
+          ...slot,
+          weekday: matched.weekday,
+          termIndex: matched.termIndex,
+          termKey: matched.termKey,
+          termLabel: matched.termLabel,
+          termSlotIndex: matched.termSlotIndex,
+          isTermStart: matched.isTermStart,
+          isTermEnd: matched.isTermEnd,
+          reservedFor: matched.reservedFor,
+          slotNumber: matched.slotNumber,
+          seriesKey: matched.seriesKey,
+        }
+      : slot;
+  });
+}
+
 function schedulePlanEntries(input: {
+  planStartDate: string;
+  planEndDate: string;
   lessonPlanId: string;
   slots: PlanSlotRow[];
   blocks: PlanBlockRow[];
   blackoutDates: string[];
 }): CalendarScheduleResult {
+  const activeSlotRows = input.slots.filter((slot) => !input.blackoutDates.includes(slot.slot_date));
+  const activeSlotIdSet = new Set(activeSlotRows.map((slot) => slot.slot_id));
+  const scheduledSlots = buildScheduledCalendarSlots(
+    activeSlotRows,
+    input.blocks.filter((block) => Boolean(block.slot_id) && activeSlotIdSet.has(block.slot_id ?? ""))
+  );
+  const scheduledEntries = buildPlanEntriesFromScheduledSlots(scheduledSlots).sort(entrySort);
+
   if (input.slots.length === 0) {
-    const constraints: CalendarConstraint[] = [
-      {
-        code: "CALENDAR_NO_MEETING_SLOTS",
-        tier: "hard",
-        passed: false,
-        message: "No recurring class schedule is available for auto-placement.",
-      },
-    ];
     return {
-      entries: [],
-      slots: [],
-      diagnostics: toCalendarDiagnostics(constraints),
+      entries: scheduledEntries,
+      slots: scheduledSlots,
+      diagnostics: toCalendarDiagnostics([]),
     };
   }
 
-  const algorithmSlots = mapSlotRowsToAlgorithmSlots(
-    input.slots.map((slot) => ({
-      ...slot,
-      is_locked: slot.is_locked || input.blackoutDates.includes(slot.slot_date),
-    }))
+  const tocUnits = buildTocUnitsFromBlockRows(input.lessonPlanId, input.blocks);
+  const examBlockTemplates = buildExamTemplatesFromBlockRows(input.blocks);
+  const teacherRules = buildTeacherRulesFromBlockRows(input.blocks);
+  const expectedBlocks = buildBlocks({
+    courseId: input.lessonPlanId,
+    tocUnits,
+    teacherRules,
+    examBlockTemplates,
+    initialDelayDates: input.blackoutDates,
+  } satisfies BuildBlocksInput);
+  const algorithmSlots = buildCalendarAlgorithmSlots({
+    planStartDate: input.planStartDate,
+    planEndDate: input.planEndDate,
+    lessonPlanId: input.lessonPlanId,
+    slots: input.slots,
+    blackoutDates: input.blackoutDates,
+    examBlockTemplates,
+  });
+  const rebuiltSlots = algorithmSlots.filter((slot) => typeof slot.termIndex === "number");
+
+  const algorithmBlocks = mapBlockRowsToAlgorithmBlocks(input.blocks);
+  const placementSeed = buildPlacementSeed(
+    input.slots,
+    input.blocks.filter((block) => Boolean(block.slot_id))
   );
-  const placementSeed = buildPlacementSeed(input.slots, input.blocks.filter((block) => Boolean(block.slot_id)));
   const seededSlots = algorithmSlots.map((slot) => ({
     ...slot,
     placements: placementSeed[slot.id] ?? [],
   }));
-  const algorithmBlocks = mapBlockRowsToAlgorithmBlocks(input.blocks);
-  const pacingPlan = buildPacingPlan({ slots: seededSlots, blocks: algorithmBlocks });
-  const placementResult = placeBlocks({
-    slots: seededSlots,
-    blocks: algorithmBlocks,
-    pacingPlan,
-    teacherRules: {
-      allowLessonWrittenWorkOverlay: true,
-      preferLessonWrittenWorkOverlay: true,
-    },
+  const pacingPlan = buildPacingPlan({
+    slots: rebuiltSlots,
+    tocUnits,
+    teacherRules,
+    examBlockTemplates,
+    initialDelayDates: input.blackoutDates,
   });
+
+  const validationSlotIdSet = new Set(
+    seededSlots.filter((slot) => typeof slot.termIndex === "number").map((slot) => slot.id)
+  );
+  const validationSlots: SessionSlot[] = seededSlots.filter((slot) => validationSlotIdSet.has(slot.id));
+  const validationBlocks = algorithmBlocks.filter((block) => {
+    const sourceRow = input.blocks.find((row) => row.block_id === block.id);
+    return !sourceRow?.slot_id || validationSlotIdSet.has(sourceRow.slot_id);
+  });
+
   const validationResult = validatePlan({
-    slots: placementResult.slots,
-    blocks: algorithmBlocks,
-    tocUnits: [],
+    slots: validationSlots,
+    blocks: validationBlocks,
+    tocUnits,
+    expectedHolidayDates: input.blackoutDates,
+    expectedExamDates: examBlockTemplates
+      .map((template) => template.preferredDate)
+      .filter((value): value is string => Boolean(value)),
+    expectedTermCount: Math.max(1, examBlockTemplates.length || 1),
+    expectedDelayCount: pacingPlan.terms.reduce((sum, term) => sum + term.initialDelayCount, 0),
   });
-  const blockRowById = new Map(input.blocks.map((block) => [block.block_id, block]));
-  const autoScheduledBlocks: PlanBlockRow[] = [];
 
-  for (const slot of placementResult.slots) {
-    for (const placement of slot.placements) {
-      if (blockRowById.get(placement.blockId)?.slot_id) continue;
-      const source = blockRowById.get(placement.blockId);
-      if (!source) continue;
-      autoScheduledBlocks.push({
-        ...source,
-        slot_id: slot.id,
-        order_no: (source.order_no ?? 1) + ((placement.segmentIndex ?? 1) - 1),
-      });
-    }
-  }
-
-  const combinedScheduledSlots = buildScheduledCalendarSlots(input.slots, [
-    ...input.blocks.filter((block) => Boolean(block.slot_id)),
-    ...autoScheduledBlocks,
-  ]);
-
-  const constraints: CalendarConstraint[] = [
-    ...placementResult.validationIssues,
-    ...validationResult.validationIssues,
-  ].map((issue) => ({
+  const actualCounts = summarizeRequiredBlockCounts(validationBlocks);
+  const expectedCounts = summarizeRequiredBlockCounts(expectedBlocks);
+  const constraints: CalendarConstraint[] = validationResult.validationIssues.map((issue) => ({
     code: issue.code,
     tier: issue.severity === "error" ? "hard" : "soft",
     passed: false,
     message: issue.message,
   }));
 
+  if (
+    actualCounts.lesson !== expectedCounts.lesson ||
+    actualCounts.writtenWork !== expectedCounts.writtenWork ||
+    actualCounts.performanceTask !== expectedCounts.performanceTask ||
+    actualCounts.exam !== expectedCounts.exam
+  ) {
+    constraints.push({
+      code: "CALENDAR_ALGORITHM_DRIFT",
+      tier: "soft",
+      passed: false,
+      message:
+        `Stored blocks no longer match the rebuilt algorithm output ` +
+        `(L ${actualCounts.lesson}/${expectedCounts.lesson}, ` +
+        `WW ${actualCounts.writtenWork}/${expectedCounts.writtenWork}, ` +
+        `PT ${actualCounts.performanceTask}/${expectedCounts.performanceTask}, ` +
+        `EX ${actualCounts.exam}/${expectedCounts.exam}).`,
+    });
+  }
+
   return {
-    entries: buildPlanEntriesFromScheduledSlots(combinedScheduledSlots).sort(entrySort),
-    slots: combinedScheduledSlots,
+    entries: scheduledEntries,
+    slots: scheduledSlots,
     diagnostics: toCalendarDiagnostics(constraints),
   };
 }
@@ -696,6 +1631,8 @@ export default function CalendarScreen() {
           : mappedPlans
               .map((plan) => {
                 const scheduledEntries = schedulePlanEntries({
+                  planStartDate: plan.start_date,
+                  planEndDate: plan.end_date,
                   lessonPlanId: plan.lesson_plan_id,
                   slots: slotsMap[plan.lesson_plan_id] ?? [],
                   blocks: blocksMap[plan.lesson_plan_id] ?? [],
@@ -797,6 +1734,83 @@ export default function CalendarScreen() {
     () => new Set(selectedPlanId ? suspendedByPlan[selectedPlanId] ?? [] : []),
     [selectedPlanId, suspendedByPlan]
   );
+  const selectedDateAlgorithmSlots = useMemo(() => {
+    if (!selectedPlan) return [] as SessionSlot[];
+    const autoBlockRows = selectedPlanBlocks.filter((block) => !Boolean(block.metadata?.manual));
+    const examTemplates = buildExamTemplatesFromBlockRows(autoBlockRows);
+    return buildCalendarAlgorithmSlots({
+      planStartDate: selectedPlan.start_date,
+      planEndDate: selectedPlan.end_date,
+      lessonPlanId: selectedPlan.lesson_plan_id,
+      slots: selectedPlanSlots,
+      blackoutDates: [],
+      examBlockTemplates: examTemplates,
+    });
+  }, [selectedPlan, selectedPlanBlocks, selectedPlanSlots]);
+  const repopulatableDates = useMemo(() => {
+    if (!selectedPlan) return new Set<string>();
+
+    const algorithmSlotsByDate = new Map<string, SessionSlot[]>();
+    for (const slot of selectedDateAlgorithmSlots) {
+      const current = algorithmSlotsByDate.get(slot.date) ?? [];
+      current.push(slot);
+      algorithmSlotsByDate.set(slot.date, current);
+    }
+
+    const slotRowsByDate = new Map<string, PlanSlotRow[]>();
+    for (const slot of selectedPlanSlots) {
+      const current = slotRowsByDate.get(slot.slot_date) ?? [];
+      current.push(slot);
+      slotRowsByDate.set(slot.slot_date, current);
+    }
+
+    const dates = new Set<string>();
+    for (const [date, dateSlots] of Array.from(slotRowsByDate.entries())) {
+      const termIndex =
+        algorithmSlotsByDate.get(date)?.find((slot) => typeof slot.termIndex === "number")?.termIndex ?? null;
+      if (termIndex === null) continue;
+
+      if (selectedPlanSuspendedSet.has(date)) continue;
+
+      const hasOpenSelectedDateSlot = dateSlots.some((slot) => {
+        const slotBlocks = selectedPlanBlocks.filter(
+          (block) => block.slot_id === slot.slot_id && !Boolean(block.metadata?.manual)
+        );
+        return slotBlocks.length === 0 || slotBlocks.every((block) => block.overlay_mode === "minor");
+      });
+      const hasUnscheduledAutoBlockInTerm = selectedPlanBlocks.some(
+        (block) =>
+          !Boolean(block.metadata?.manual) &&
+          !block.slot_id &&
+          Number(block.metadata?.termIndex ?? -1) === termIndex
+      );
+
+      if (!hasOpenSelectedDateSlot && !hasUnscheduledAutoBlockInTerm) continue;
+
+      const examBlock = selectedPlanBlocks.find(
+        (block) =>
+          block.session_category === "exam" &&
+          Number(block.metadata?.termIndex ?? -1) === termIndex
+      );
+      const repopulatedDates = Array.isArray(examBlock?.metadata?.repopulatedDates)
+        ? examBlock?.metadata?.repopulatedDates.filter((value): value is string => typeof value === "string")
+        : [];
+      if (!repopulatedDates.includes(date)) {
+        dates.add(date);
+      }
+    }
+
+    return dates;
+  }, [selectedDateAlgorithmSlots, selectedPlan, selectedPlanBlocks, selectedPlanSlots, selectedPlanSuspendedSet]);
+  const monthlyRepopulationTargetDate = useMemo(() => {
+    const currentMonth = parseDateFromIso(currentMonthDate).getMonth();
+    const dates = Array.from(repopulatableDates).filter((date) => parseDateFromIso(date).getMonth() === currentMonth).sort();
+    return dates[0] ?? null;
+  }, [currentMonthDate, repopulatableDates]);
+  const repopulationTargetDate = zoomLevel === "monthly"
+    ? (repopulatableDates.has(selectedDate) ? selectedDate : monthlyRepopulationTargetDate)
+    : (repopulatableDates.has(selectedDate) ? selectedDate : null);
+  const canTriggerRepopulation = Boolean(repopulationTargetDate);
 
   const scheduleResult = useMemo(() => {
     if (!selectedPlan) {
@@ -813,6 +1827,8 @@ export default function CalendarScreen() {
     }
 
     return schedulePlanEntries({
+      planStartDate: selectedPlan.start_date,
+      planEndDate: selectedPlan.end_date,
       lessonPlanId: selectedPlan.lesson_plan_id,
       slots: selectedPlanSlots,
       blocks: selectedPlanBlocks,
@@ -1451,6 +2467,310 @@ export default function CalendarScreen() {
     }
   }, [cleanupEmptyManualSlots, entryEditor.targetEntryId, loadCalendarData, selectedPlan]);
 
+  const deleteCalendarEntry = useCallback(async (entry: PlanEntry) => {
+    if (!selectedPlan) return;
+    const rootId = getEditableEntryId(entry);
+    if (!rootId) return;
+
+    try {
+      const { error: cloneDeleteError } = await supabase
+        .from("blocks")
+        .delete()
+        .eq("lesson_plan_id", selectedPlan.lesson_plan_id)
+        .eq("root_block_id", rootId);
+      if (cloneDeleteError) throw cloneDeleteError;
+
+      const { error } = await supabase
+        .from("blocks")
+        .delete()
+        .eq("block_id", rootId)
+        .eq("lesson_plan_id", selectedPlan.lesson_plan_id);
+      if (error) throw error;
+      await cleanupEmptyManualSlots();
+      await loadCalendarData();
+    } catch (deleteError: any) {
+      Alert.alert("Delete failed", deleteError?.message ?? "Could not delete entry.");
+    }
+  }, [cleanupEmptyManualSlots, loadCalendarData, selectedPlan]);
+
+  const applySuspensionCompression = useCallback(async () => {
+    if (!selectedPlan) return;
+
+    const autoBlockRows = selectedPlanBlocks.filter((block) => !Boolean(block.metadata?.manual));
+    const manualBlocksOnDate = selectedPlanBlocks.filter(
+      (block) => Boolean(block.metadata?.manual) && block.slot_id && selectedPlanSlots.some((slot) => slot.slot_id === block.slot_id && slot.slot_date === selectedDate)
+    );
+    if (autoBlockRows.length === 0 && manualBlocksOnDate.length === 0) return;
+
+    const examTemplates = buildExamTemplatesFromBlockRows(autoBlockRows);
+    const algorithmSlots = buildCalendarAlgorithmSlots({
+      planStartDate: selectedPlan.start_date,
+      planEndDate: selectedPlan.end_date,
+      lessonPlanId: selectedPlan.lesson_plan_id,
+      slots: selectedPlanSlots,
+      blackoutDates: [],
+      examBlockTemplates: examTemplates,
+    }).filter((slot) => typeof slot.termIndex === "number");
+    const placementSeed = buildPlacementSeed(
+      selectedPlanSlots,
+      autoBlockRows.filter((block) => Boolean(block.slot_id))
+    );
+    const seededSlots = algorithmSlots.map((slot) => ({
+      ...slot,
+      locked: slot.locked || slot.date === selectedDate,
+      lockReason: slot.date === selectedDate ? "Suspended day" : slot.lockReason,
+      placements: placementSeed[slot.id] ? [...placementSeed[slot.id]!] : [],
+    }));
+    const affectedTermIndex =
+      seededSlots.find((slot) => slot.date === selectedDate && typeof slot.termIndex === "number")?.termIndex ?? null;
+    if (affectedTermIndex === null) return;
+
+    const algorithmBlocks = mapBlockRowsToAlgorithmBlocks(autoBlockRows).map((block) => {
+      if (block.type !== "exam" || Number(block.metadata.termIndex ?? -1) !== affectedTermIndex) {
+        return block;
+      }
+
+      const suspendedDates = Array.isArray(block.metadata.suspendedDates)
+        ? block.metadata.suspendedDates.filter((value): value is string => typeof value === "string")
+        : [];
+      const repopulatedDates = Array.isArray(block.metadata.repopulatedDates)
+        ? block.metadata.repopulatedDates.filter((value): value is string => typeof value === "string")
+        : [];
+      if (suspendedDates.includes(selectedDate)) return block;
+
+      return {
+        ...block,
+        metadata: {
+          ...block.metadata,
+          rawTermSlots: Math.max(0, Number(block.metadata.rawTermSlots ?? 0) - 1),
+          termSlots: Math.max(0, Number(block.metadata.termSlots ?? 0) - 1),
+          extraTermSlots: Number(block.metadata.extraTermSlots ?? 0) - 1,
+          suspendedDates: [...suspendedDates, selectedDate],
+          repopulatedDates: repopulatedDates.filter((value) => value !== selectedDate),
+        },
+      };
+    });
+    const termSlots = seededSlots.filter((slot) => slot.termIndex === affectedTermIndex);
+    const termBlocks = algorithmBlocks.filter((block) => Number(block.metadata.termIndex ?? -1) === affectedTermIndex);
+    compressTermPlan({
+      termSlots,
+      blocks: termBlocks,
+    });
+
+    for (const slot of termSlots) {
+      if (slot.date !== selectedDate) continue;
+      slot.placements = [];
+    }
+
+    normalizeTermPlacements(termSlots, termBlocks);
+    validateAdjustedTerm(termSlots, termBlocks);
+
+    const placementByBlockId = new Map(
+      seededSlots.flatMap((slot) =>
+        slot.placements.map((placement, index) => [
+          placement.blockId,
+          {
+            slotId: slot.id,
+            orderNo: index + 1,
+          },
+        ] as const)
+      )
+    );
+    const updatedMetadataByBlockId = new Map(algorithmBlocks.map((block) => [block.id, block.metadata]));
+
+    const suspendedSlotRows = selectedPlanSlots.filter((slot) => slot.slot_date === selectedDate);
+    if (suspendedSlotRows.length > 0) {
+      const suspendedSlotResults = await Promise.all(
+        suspendedSlotRows.map((slot) =>
+          supabase
+            .from("slots")
+            .update({
+              is_locked: true,
+            })
+            .eq("slot_id", slot.slot_id)
+            .eq("lesson_plan_id", selectedPlan.lesson_plan_id)
+        )
+      );
+      const suspendedSlotError = suspendedSlotResults.find((result) => result.error)?.error;
+      if (suspendedSlotError) throw suspendedSlotError;
+    }
+
+    const autoUpdateResults = await Promise.all(
+      autoBlockRows.map((row) => {
+        const placement = placementByBlockId.get(row.block_id) ?? null;
+        const nextMetadata = updatedMetadataByBlockId.get(row.block_id) ?? row.metadata ?? {};
+        const fallbackOrderNo = typeof row.order_no === "number" && Number.isFinite(row.order_no) ? row.order_no : 1;
+        return supabase
+          .from("blocks")
+          .update({
+            slot_id: placement?.slotId ?? null,
+            order_no: placement?.orderNo ?? fallbackOrderNo,
+            metadata: nextMetadata,
+          })
+          .eq("block_id", row.block_id)
+          .eq("lesson_plan_id", selectedPlan.lesson_plan_id);
+      })
+    );
+    const autoUpdateError = autoUpdateResults.find((result) => result.error)?.error;
+    if (autoUpdateError) throw autoUpdateError;
+
+    if (manualBlocksOnDate.length > 0) {
+      const manualUpdateResults = await Promise.all(
+        manualBlocksOnDate.map((row) =>
+          supabase
+            .from("blocks")
+            .update({
+              slot_id: null,
+              order_no: typeof row.order_no === "number" && Number.isFinite(row.order_no) ? row.order_no : 1,
+            })
+            .eq("block_id", row.block_id)
+            .eq("lesson_plan_id", selectedPlan.lesson_plan_id)
+        )
+      );
+      const manualUpdateError = manualUpdateResults.find((result) => result.error)?.error;
+      if (manualUpdateError) throw manualUpdateError;
+    }
+  }, [selectedDate, selectedPlan, selectedPlanBlocks, selectedPlanSlots]);
+
+  const applyRepopulation = useCallback(async () => {
+    if (!selectedPlan) return;
+    try {
+      const targetDate = repopulationTargetDate;
+      if (!targetDate) {
+        Alert.alert("Lessonplan is fully populated", "No active empty slots are available to repopulate.");
+        return;
+      }
+
+      const autoBlockRows = selectedPlanBlocks.filter((block) => !Boolean(block.metadata?.manual));
+      if (autoBlockRows.length === 0) return;
+
+      const examTemplates = buildExamTemplatesFromBlockRows(autoBlockRows);
+      const algorithmSlots = buildCalendarAlgorithmSlots({
+        planStartDate: selectedPlan.start_date,
+        planEndDate: selectedPlan.end_date,
+        lessonPlanId: selectedPlan.lesson_plan_id,
+        slots: selectedPlanSlots,
+        blackoutDates: [],
+        examBlockTemplates: examTemplates,
+      }).filter((slot) => typeof slot.termIndex === "number");
+      const placementSeed = buildPlacementSeed(
+        selectedPlanSlots,
+        autoBlockRows.filter((block) => Boolean(block.slot_id))
+      );
+      const seededSlots = algorithmSlots.map((slot) => ({
+        ...slot,
+        locked: slot.locked,
+        lockReason: slot.lockReason,
+        placements: placementSeed[slot.id] ? [...placementSeed[slot.id]!] : [],
+      }));
+      const affectedTermIndex =
+        seededSlots.find((slot) => slot.date === targetDate && typeof slot.termIndex === "number")?.termIndex ?? null;
+      if (affectedTermIndex === null) return;
+
+      const algorithmBlocks = mapBlockRowsToAlgorithmBlocks(autoBlockRows).map((block) => {
+        if (block.type !== "exam" || Number(block.metadata.termIndex ?? -1) !== affectedTermIndex) {
+          return block;
+        }
+
+        const suspendedDates = Array.isArray(block.metadata.suspendedDates)
+          ? block.metadata.suspendedDates.filter((value): value is string => typeof value === "string")
+          : [];
+        const repopulatedDates = Array.isArray(block.metadata.repopulatedDates)
+          ? block.metadata.repopulatedDates.filter((value): value is string => typeof value === "string")
+          : [];
+        const alreadyRepopulated = repopulatedDates.includes(targetDate);
+
+        return {
+          ...block,
+          metadata: {
+            ...block.metadata,
+            suspendedDates,
+            termSlots: Math.max(
+              0,
+              Number(block.metadata.termSlots ?? 0) + (alreadyRepopulated ? 0 : 1)
+            ),
+            extraTermSlots: Number(block.metadata.extraTermSlots ?? 0) + (alreadyRepopulated ? 0 : 1),
+            repopulatedDates: alreadyRepopulated ? repopulatedDates : [...repopulatedDates, targetDate],
+          },
+        };
+      });
+
+      const termSlots = seededSlots.filter((slot) => slot.termIndex === affectedTermIndex);
+      const termBlocks = algorithmBlocks.filter((block) => Number(block.metadata.termIndex ?? -1) === affectedTermIndex);
+      ensureTermBlockInventory(termBlocks);
+      const preflightPlaced = collectPlacedCoreBlockIds(termSlots, termBlocks);
+      const unscheduled = new Set(
+        autoBlockRows.filter((row) => !row.slot_id).map((row) => row.block_id)
+      );
+
+      extendTermPlan({
+        termSlots,
+        blocks: termBlocks,
+        unscheduled,
+      });
+      const postExtendPlaced = collectPlacedCoreBlockIds(termSlots, termBlocks);
+      const extendDiff = diffPlacedCoreBlockIds(preflightPlaced, postExtendPlaced);
+      if (extendDiff.hasMissing) {
+        throw new Error(
+          `Repopulate lost required blocks during extendTermPlan (${formatMissingCoreBlockIds(extendDiff)}).`
+        );
+      }
+
+      recoverMissingRequiredBlocks(termSlots, termBlocks);
+      const postRecoveryPlaced = collectPlacedCoreBlockIds(termSlots, termBlocks);
+      const recoveryDiff = diffPlacedCoreBlockIds(preflightPlaced, postRecoveryPlaced);
+      if (recoveryDiff.hasMissing) {
+        throw new Error(
+          `Repopulate could not recover required blocks (${formatMissingCoreBlockIds(recoveryDiff)}).`
+        );
+      }
+
+      normalizeTermPlacements(termSlots, termBlocks);
+      const postNormalizePlaced = collectPlacedCoreBlockIds(termSlots, termBlocks);
+      const normalizeDiff = diffPlacedCoreBlockIds(postRecoveryPlaced, postNormalizePlaced);
+      if (normalizeDiff.hasMissing) {
+        throw new Error(
+          `Repopulate lost required blocks during normalizeTermPlacements (${formatMissingCoreBlockIds(normalizeDiff)}).`
+        );
+      }
+      validateAdjustedTerm(termSlots, termBlocks);
+
+      const placementByBlockId = new Map(
+        seededSlots.flatMap((slot) =>
+          slot.placements.map((placement, index) => [
+            placement.blockId,
+            {
+              slotId: slot.id,
+              orderNo: index + 1,
+            },
+          ] as const)
+        )
+      );
+      const updatedMetadataByBlockId = new Map(algorithmBlocks.map((block) => [block.id, block.metadata]));
+
+      const autoUpdateResults = await Promise.all(
+        autoBlockRows.map((row) => {
+          const placement = placementByBlockId.get(row.block_id) ?? null;
+          const nextMetadata = updatedMetadataByBlockId.get(row.block_id) ?? row.metadata ?? {};
+          const fallbackOrderNo = typeof row.order_no === "number" && Number.isFinite(row.order_no) ? row.order_no : 1;
+          return supabase
+            .from("blocks")
+            .update({
+              slot_id: placement?.slotId ?? null,
+              order_no: placement?.orderNo ?? fallbackOrderNo,
+              metadata: nextMetadata,
+            })
+            .eq("block_id", row.block_id)
+            .eq("lesson_plan_id", selectedPlan.lesson_plan_id);
+        })
+      );
+      const autoUpdateError = autoUpdateResults.find((result) => result.error)?.error;
+      if (autoUpdateError) throw autoUpdateError;
+    } catch (error: any) {
+      Alert.alert("Repopulate failed", error?.message ?? "Could not repopulate this term.");
+    }
+  }, [repopulationTargetDate, selectedPlan, selectedPlanBlocks, selectedPlanSlots]);
+
   const toggleSuspendSelectedDay = useCallback(async () => {
     if (!selectedPlan || suspendMutating) return;
     const isSuspended = selectedPlanSuspendedSet.has(selectedDate);
@@ -1490,6 +2810,8 @@ export default function CalendarScreen() {
           created_by: user.id,
         });
         if (error) throw error;
+
+        await applySuspensionCompression();
       }
       await loadCalendarData();
     } catch (error: any) {
@@ -1497,7 +2819,7 @@ export default function CalendarScreen() {
     } finally {
       setSuspendMutating(false);
     }
-  }, [loadCalendarData, selectedDate, selectedPlan, selectedPlanSuspendedSet, suspendMutating]);
+  }, [applySuspensionCompression, loadCalendarData, selectedDate, selectedPlan, selectedPlanSuspendedSet, suspendMutating]);
 
   const handlePinchStateChange = useCallback(
     (event: any) => {
@@ -1533,14 +2855,6 @@ export default function CalendarScreen() {
     );
   }
 
-  if (!selectedPlan) {
-    return (
-      <View style={[styles.center, { backgroundColor: screenBg }]}> 
-        <Text style={[styles.emptyText, { color: c.mutedText }]}>No lesson plans yet.</Text>
-      </View>
-    );
-  }
-
   return (
       <View style={[styles.page, { backgroundColor: screenBg }]}> 
         <PinchGestureHandler onHandlerStateChange={handlePinchStateChange}>
@@ -1551,11 +2865,14 @@ export default function CalendarScreen() {
               showsVerticalScrollIndicator={false}
             >
           <View style={styles.topBar}>
-            <Pressable onPress={() => setZoomLevel((prev) => (prev === "daily" ? "monthly" : "daily"))}>
+            <Pressable
+              style={styles.topBarTitleWrap}
+              onPress={() => setZoomLevel((prev) => (prev === "daily" ? "monthly" : "daily"))}
+            >
               <Text style={[styles.modeLabel, { color: c.mutedText }]}> 
                 {zoomLevel === "daily" ? "Daily" : "Monthly"}
               </Text>
-              <Text style={[styles.dateTitle, { color: c.text }]}> 
+              <Text style={[styles.dateTitle, { color: c.text }]} numberOfLines={1}> 
                 {zoomLevel === "daily" ? longDateTitle(selectedDate) : monthTitle(currentMonthDate)}
               </Text>
             </Pressable>
@@ -1564,30 +2881,50 @@ export default function CalendarScreen() {
               <Pressable
                 style={[styles.planPill, { backgroundColor: cardBg, borderColor: c.border }]}
                 onPress={() => setPlanMenuOpen(true)}
+                disabled={plans.length === 0}
               >
                 <Ionicons name="chevron-down" size={16} color={c.text} />
                 <View style={styles.planPillTextWrap}>
                   <Text style={[styles.planCode, { color: c.text }]} numberOfLines={1}>
-                    {selectedPlan.title}
+                    {selectedPlan?.title ?? "No lesson plan"}
                   </Text>
                   <Text style={[styles.planSubtitle, { color: c.mutedText }]} numberOfLines={1}>
-                    {[selectedPlan.subject_code, selectedPlan.subject_title, selectedPlan.section_name].filter(Boolean).join(" - ") || "Lesson plan"}
+                    {selectedPlan
+                      ? ([selectedPlan.subject_code, selectedPlan.subject_title, selectedPlan.section_name].filter(Boolean).join(" - ") || "Lesson plan")
+                      : "Your calendar is empty for now"}
                   </Text>
                 </View>
               </Pressable>
             ) : null}
 
-            {zoomLevel === "daily" ? (
+            {selectedPlan && (zoomLevel === "daily" || zoomLevel === "monthly") ? (
               <View style={styles.topRightIconRow}>
+                {zoomLevel === "monthly" ? (
+                  <Pressable
+                    style={({ pressed }) => [
+                      styles.iconOnlyActionBtn,
+                      (!canTriggerRepopulation || suspendMutating) ? styles.iconOnlyActionBtnDisabled : undefined,
+                      pressed ? styles.iconOnlyActionBtnPressed : undefined,
+                    ]}
+                    onPress={applyRepopulation}
+                    disabled={suspendMutating}
+                    accessibilityLabel="Repopulate plan"
+                  >
+                    <Ionicons name="sparkles-outline" size={18} color={c.text} />
+                  </Pressable>
+                ) : null}
+                {zoomLevel === "daily" ? (
                 <Pressable
-                  style={[styles.iconOnlyActionBtn, { borderColor: c.border, backgroundColor: cardBg }]}
+                  style={styles.iconOnlyActionBtn}
                   onPress={openCreateEditor}
                   accessibilityLabel="Add block"
                 >
                   <Ionicons name="add" size={18} color={c.text} />
                 </Pressable>
+                ) : null}
+                {zoomLevel === "daily" ? (
                 <Pressable
-                  style={[styles.iconOnlyActionBtn, { borderColor: c.border, backgroundColor: cardBg }]}
+                  style={styles.iconOnlyActionBtn}
                   onPress={toggleSuspendSelectedDay}
                   disabled={suspendMutating}
                   accessibilityLabel={selectedPlanSuspendedSet.has(selectedDate) ? "Unsuspend day" : "Suspend day"}
@@ -1598,39 +2935,10 @@ export default function CalendarScreen() {
                     color={c.text}
                   />
                 </Pressable>
+                ) : null}
               </View>
             ) : null}
           </View>
-
-          {zoomLevel === "monthly" && (scheduleResult.diagnostics.hardViolations > 0 || scheduleResult.diagnostics.softViolations > 0) ? (
-            <View
-              style={[
-                styles.diagnosticCard,
-                {
-                  backgroundColor: scheduleResult.diagnostics.hardViolations > 0
-                    ? isDark
-                      ? "#3A1D1D"
-                      : "#FFEDEE"
-                    : isDark
-                      ? "#1F2C3A"
-                      : "#EEF7FF",
-                  borderColor: c.border,
-                },
-              ]}
-            >
-              <Text style={[styles.diagnosticTitle, { color: c.text }]}>
-                {scheduleResult.diagnostics.feasible ? "Schedule warnings" : "Schedule conflict detected"}
-              </Text>
-              {scheduleResult.diagnostics.constraints
-                .filter((d) => !d.passed)
-                .slice(0, 3)
-                .map((d) => (
-                  <Text key={d.code} style={[styles.diagnosticLine, { color: c.text }]}>
-                    [{d.tier.toUpperCase()}] {d.message}
-                  </Text>
-                ))}
-            </View>
-          ) : null}
 
           {zoomLevel === "daily" ? (
             <View>
@@ -1703,7 +3011,7 @@ export default function CalendarScreen() {
                           {
                             top,
                             minHeight: height,
-                            backgroundColor: cardBg,
+                            backgroundColor: getDailySlotCardStyle(slot, isDark, cardBg),
                             borderColor: c.border,
                           },
                         ]}
@@ -1712,76 +3020,79 @@ export default function CalendarScreen() {
                         <View style={[styles.timelineCardAccent, { backgroundColor: slot.blocks[0] ? getEntryColor(slot.blocks[0].category) : c.border }]} />
                         <View style={styles.timelineCardMain}>
                           <Text style={[styles.timelineTitle, { color: c.text }]} numberOfLines={1}>
-                            {slot.title || `Slot ${slot.slotNumber ?? ""}`.trim()}
+                            {getDailySlotDisplayTitle(slot)}
                           </Text>
                           <Text style={[styles.timelineSub, { color: c.text }]} numberOfLines={1}>
-                            {selectedPlan.section_name}
+                            {selectedPlan?.section_name ?? "No lesson plan"}
                           </Text>
                           <Text style={[styles.timelineTime, { color: c.mutedText }]}>
                             {(slot.startTime ?? "").slice(0, 5) || "--:--"} - {(slot.endTime ?? "").slice(0, 5) || "--:--"}
                           </Text>
                         </View>
                         <View style={styles.dailySlotBlocksWrap}>
-                          {slot.blocks.map((block) => (
-                            <Pressable
-                              key={`${block.blockId}-${block.scheduledDate}`}
-                              style={[
-                                styles.dailyBlockChip,
-                                {
-                                  borderColor: getEntryColor(block.category),
-                                  backgroundColor: subtleBg,
-                                },
-                              ]}
-                              onPress={() =>
-                                openEditEditor({
-                                  plan_entry_id: block.blockId,
-                                  lesson_plan_id: block.lessonPlanId,
-                                  title: block.title,
-                                  category: block.category,
-                                  description: block.description,
-                                  scheduled_date: block.scheduledDate,
-                                  start_time: block.startTime ? `${block.startTime}:00` : null,
-                                  end_time: block.endTime ? `${block.endTime}:00` : null,
-                                  meeting_type: block.meetingType,
-                                  session_category: block.category,
-                                  session_subcategory: block.subcategory,
-                                  entry_type: "planned_item",
-                                  day: slot.weekday,
-                                  room: slot.room,
-                                  slot_number: slot.slotNumber,
-                                  lesson_id: block.lessonId,
-                                  is_locked: block.isLocked,
-                                  ww_subtype: block.wwSubtype,
-                                  pt_subtype: block.ptSubtype,
-                                  root_block_id: block.rootBlockId,
-                                  block_key: block.blockKey,
-                                  algorithm_block_key: block.algorithmBlockKey,
-                                  slot_id: block.slotId,
-                                  order_no: block.orderNo,
-                                })
-                              }
-                            >
-                              <Text style={[styles.dailyBlockChipTitle, { color: c.text }]} numberOfLines={1}>
-                                {block.title}
-                              </Text>
-                              <Text style={[styles.dailyBlockChipMeta, { color: c.mutedText }]} numberOfLines={1}>
-                                {getChipLabel({
-                                  plan_entry_id: block.blockId,
-                                  lesson_plan_id: block.lessonPlanId,
-                                  title: block.title,
-                                  category: block.category,
-                                  description: block.description,
-                                  scheduled_date: block.scheduledDate,
-                                  start_time: block.startTime ? `${block.startTime}:00` : null,
-                                  end_time: block.endTime ? `${block.endTime}:00` : null,
-                                  meeting_type: block.meetingType,
-                                  session_category: block.category,
-                                  session_subcategory: block.subcategory,
-                                })}
-                                {block.subcategory ? ` • ${block.subcategory.replace(/_/g, " ")}` : ""}
-                              </Text>
-                            </Pressable>
-                          ))}
+                          {slot.blocks.map((block) => {
+                            const entry: PlanEntry = {
+                              plan_entry_id: block.blockId,
+                              lesson_plan_id: block.lessonPlanId,
+                              title: block.title,
+                              category: block.category,
+                              description: block.description,
+                              scheduled_date: block.scheduledDate,
+                              start_time: block.startTime ? `${block.startTime}:00` : null,
+                              end_time: block.endTime ? `${block.endTime}:00` : null,
+                              meeting_type: block.meetingType,
+                              session_category: block.category,
+                              session_subcategory: block.subcategory,
+                              entry_type: "planned_item",
+                              day: slot.weekday,
+                              room: slot.room,
+                              slot_number: slot.slotNumber,
+                              lesson_id: block.lessonId,
+                              is_locked: block.isLocked,
+                              ww_subtype: block.wwSubtype,
+                              pt_subtype: block.ptSubtype,
+                              root_block_id: block.rootBlockId,
+                              block_key: block.blockKey,
+                              algorithm_block_key: block.algorithmBlockKey,
+                              slot_id: block.slotId,
+                              order_no: block.orderNo,
+                            };
+
+                            return (
+                              <Swipeable
+                                key={`${block.blockId}-${block.scheduledDate}`}
+                                overshootRight={false}
+                                renderRightActions={() => (
+                                  <Pressable
+                                    style={styles.dailyBlockDeleteAction}
+                                    onPress={() => deleteCalendarEntry(entry)}
+                                  >
+                                    <Ionicons name="trash-outline" size={16} color="#FFFFFF" />
+                                    <Text style={styles.dailyBlockDeleteText}>Delete</Text>
+                                  </Pressable>
+                                )}
+                              >
+                                <Pressable
+                                  style={[
+                                    styles.dailyBlockChip,
+                                    {
+                                      borderColor: getEntryColor(block.category),
+                                      backgroundColor: subtleBg,
+                                    },
+                                  ]}
+                                  onPress={() => openEditEditor(entry)}
+                                >
+                                  <Text style={[styles.dailyBlockChipTitle, { color: c.text }]} numberOfLines={1}>
+                                    {block.title}
+                                  </Text>
+                                  <Text style={[styles.dailyBlockChipMeta, { color: c.mutedText }]} numberOfLines={1}>
+                                    {getChipLabel(entry)}
+                                    {block.subcategory ? ` • ${block.subcategory.replace(/_/g, " ")}` : ""}
+                                  </Text>
+                                </Pressable>
+                              </Swipeable>
+                            );
+                          })}
                         </View>
                       </Pressable>
                     ))}
@@ -1922,7 +3233,7 @@ export default function CalendarScreen() {
                                 {entry.title}
                               </Text>
                               <Text style={styles.detailItemSub} numberOfLines={1}>
-                                {entry.description || getChipLabel(entry)}
+                                {stripHtmlTags(entry.description) || getChipLabel(entry)}
                               </Text>
                             </Pressable>
                           );
@@ -2156,6 +3467,9 @@ export default function CalendarScreen() {
             <View style={[styles.planModal, { backgroundColor: cardBg, borderColor: c.border }]}> 
               <Text style={[styles.modalTitle, { color: c.text }]}>Select lesson plan</Text>
               <ScrollView style={styles.planList}>
+                {plans.length === 0 ? (
+                  <Text style={[styles.emptyText, { color: c.mutedText }]}>No lesson plans yet.</Text>
+                ) : null}
                 {plans.map((plan) => {
                   const isSelected = plan.lesson_plan_id === selectedPlanId;
                   return (
@@ -2212,14 +3526,19 @@ const styles = StyleSheet.create({
     gap: Spacing.md,
     marginBottom: Spacing.lg,
   },
+  topBarTitleWrap: {
+    flex: 1,
+    minWidth: 0,
+    paddingRight: Spacing.xs,
+  },
   modeLabel: {
     ...Typography.body,
     fontSize: 14,
   },
   dateTitle: {
     ...Typography.h1,
-    fontSize: 34,
-    lineHeight: 38,
+    fontSize: 24,
+    lineHeight: 28,
     marginTop: 2,
   },
   planPill: {
@@ -2253,14 +3572,20 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     gap: 8,
     alignItems: "center",
+    flexShrink: 0,
   },
   iconOnlyActionBtn: {
     width: 36,
     height: 36,
-    borderWidth: 1,
-    borderRadius: Radius.round,
     alignItems: "center",
     justifyContent: "center",
+    backgroundColor: "transparent",
+  },
+  iconOnlyActionBtnDisabled: {
+    opacity: 0.4,
+  },
+  iconOnlyActionBtnPressed: {
+    opacity: 0.65,
   },
   weekStrip: {
     flexDirection: "row",
@@ -2461,6 +3786,22 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     paddingHorizontal: 8,
     paddingVertical: 7,
+  },
+  dailyBlockDeleteAction: {
+    minWidth: 88,
+    borderRadius: 10,
+    marginLeft: 8,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#C94B4B",
+    paddingHorizontal: 12,
+  },
+  dailyBlockDeleteText: {
+    ...Typography.caption,
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#FFFFFF",
+    marginTop: 2,
   },
   dailyBlockChipTitle: {
     ...Typography.caption,
