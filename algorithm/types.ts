@@ -1,12 +1,6 @@
-export type InstitutionType =
-  | "public_secondary"
-  | "private_basiced"
-  | "higher_ed"
-  | "generic";
+export type SessionType = "lecture" | "laboratory" | "any";
 
-export type SessionType = "lecture" | "laboratory" | "mixed" | "any";
-
-export type Difficulty = "light" | "medium" | "heavy";
+export type Complexity = number; // 1 (easy) to 10 (hard)
 
 export type OverlayMode = "exclusive" | "major" | "minor";
 
@@ -51,7 +45,7 @@ export interface SessionSlot {
   placements: Placement[];
 }
 
-export interface TOCUnit {
+export interface Lesson {
   id: string;
   courseId: string;
   chapterId?: string | null;
@@ -59,7 +53,7 @@ export interface TOCUnit {
   title: string;
   order: number;
   estimatedMinutes: number;
-  difficulty?: Difficulty;
+  complexity?: Complexity;
   preferredSessionType?: SessionType;
   required: boolean;
 }
@@ -77,6 +71,7 @@ export interface Block {
   required: boolean;
   splittable: boolean;
   overlayMode: OverlayMode;
+  order: number;
   preferredSessionType: SessionType;
   dependencies: string[]; // block ids that must be scheduled before this block
   metadata?: Record<string, unknown>;
@@ -100,7 +95,6 @@ export interface Placement {
 export interface CourseInfo {
   id: string;
   title: string;
-  institutionType: InstitutionType;
   startDate: string; // YYYY-MM-DD
   endDate: string; // YYYY-MM-DD
 }
@@ -109,10 +103,10 @@ export interface TeacherRules {
   quizMode: "per_chapter" | "every_n_lessons" | "hybrid";
   quizEveryNLessons?: number;
   writtenWorkMode: "total" | "per_lesson";
-  writtenWorkTarget: number;
+  minWW: number;
   allowLessonWrittenWorkOverlay: boolean;
   preferLessonWrittenWorkOverlay: boolean;
-  performanceTaskMin: number;
+  minPT: number;
   includeReviewBeforeExam: boolean;
 }
 
@@ -126,7 +120,7 @@ export interface LockedDateInput {
 export interface LessonPlanInput {
   course: CourseInfo;
   sessionSlots: SessionSlot[];
-  tocUnits: TOCUnit[];
+  Lesson: Lesson[];
   teacherRules: TeacherRules;
   lockedDates?: LockedDateInput[];
 }

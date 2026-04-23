@@ -74,9 +74,7 @@ function getRemainingMinutes(slot: SessionSlot): number {
 }
 
 function slotSupportsBlockType(slot: SessionSlot, block: Block): boolean {
-  if (block.preferredSessionType === "any") return true;
   if (slot.sessionType === null) return true;
-  if (slot.sessionType === "mixed") return true;
   return slot.sessionType === block.preferredSessionType;
 }
 
@@ -389,19 +387,20 @@ function buildDependentReservationMap(
   return reservations;
 }
 
-function buildBufferBlock(courseId: string, index: number, minutes: number): Block {
+function buildBufferBlock(courseId: string, index: number, minutes: number , subcategory = "other"): Block {
   return {
     id: `block__buffer__${index}`,
     courseId,
     type: "buffer",
     subcategory: "other",
-    title: `Buffer / Catch-up ${index}`,
+    title: `${subcategory}`,
     estimatedMinutes: Math.max(30, Math.min(90, minutes)),
     minMinutes: 30,
     maxMinutes: Math.max(30, minutes),
     required: false,
     splittable: false,
     overlayMode: "major",
+    order: 0,
     preferredSessionType: "any",
     dependencies: [],
     metadata: {
