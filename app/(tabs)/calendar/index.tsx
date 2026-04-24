@@ -1,6 +1,6 @@
 import { Ionicons } from "@expo/vector-icons";
 import { Picker } from "@react-native-picker/picker";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -1421,6 +1421,8 @@ export default function CalendarScreen() {
     reviewDays: "1",
   });
   const [monthCellLayouts, setMonthCellLayouts] = useState<Record<string, { x: number; y: number; w: number; h: number }>>({});
+  const dailyBlockSwipeablesRef = useRef<Record<string, Swipeable | null>>({});
+  const openDailyBlockSwipeKeyRef = useRef<string | null>(null);
 
   const loadCalendarData = useCallback(async () => {
     setLoading(true);
@@ -2857,7 +2859,7 @@ export default function CalendarScreen() {
 
   return (
       <View style={[styles.page, { backgroundColor: screenBg }]}> 
-        <PinchGestureHandler onHandlerStateChange={handlePinchStateChange}>
+        <PinchGestureHandler enabled={zoomLevel === "monthly"} onHandlerStateChange={handlePinchStateChange}>
           <View style={styles.page}>
             <ScrollView
               refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={c.tint} />}
@@ -3004,7 +3006,7 @@ export default function CalendarScreen() {
                       </View>
                     ))}
                     {dailyTimeline.placed.map(({ slot, top, height }) => (
-                      <Pressable
+                      <View
                         key={`${slot.slotId}-${slot.slotDate}`}
                         style={[
                           styles.timelineCard,
@@ -3015,7 +3017,6 @@ export default function CalendarScreen() {
                             borderColor: c.border,
                           },
                         ]}
-                        onPress={() => null}
                       >
                         <View style={[styles.timelineCardAccent, { backgroundColor: slot.blocks[0] ? getEntryColor(slot.blocks[0].category) : c.border }]} />
                         <View style={styles.timelineCardMain}>
@@ -3031,6 +3032,7 @@ export default function CalendarScreen() {
                         </View>
                         <View style={styles.dailySlotBlocksWrap}>
                           {slot.blocks.map((block) => {
+                            const dailyBlockSwipeKey = `${block.blockId}-${block.scheduledDate}`;
                             const entry: PlanEntry = {
                               plan_entry_id: block.blockId,
                               lesson_plan_id: block.lessonPlanId,
@@ -3060,12 +3062,33 @@ export default function CalendarScreen() {
 
                             return (
                               <Swipeable
-                                key={`${block.blockId}-${block.scheduledDate}`}
+                                key={dailyBlockSwipeKey}
+                                ref={(instance) => {
+                                  dailyBlockSwipeablesRef.current[dailyBlockSwipeKey] = instance;
+                                }}
+                                friction={2}
+                                rightThreshold={32}
                                 overshootRight={false}
+                                containerStyle={styles.dailyBlockSwipe}
+                                onSwipeableWillOpen={() => {
+                                  const openKey = openDailyBlockSwipeKeyRef.current;
+                                  if (openKey && openKey !== dailyBlockSwipeKey) {
+                                    dailyBlockSwipeablesRef.current[openKey]?.close();
+                                  }
+                                  openDailyBlockSwipeKeyRef.current = dailyBlockSwipeKey;
+                                }}
+                                onSwipeableWillClose={() => {
+                                  if (openDailyBlockSwipeKeyRef.current === dailyBlockSwipeKey) {
+                                    openDailyBlockSwipeKeyRef.current = null;
+                                  }
+                                }}
                                 renderRightActions={() => (
                                   <Pressable
                                     style={styles.dailyBlockDeleteAction}
-                                    onPress={() => deleteCalendarEntry(entry)}
+                                    onPress={() => {
+                                      dailyBlockSwipeablesRef.current[dailyBlockSwipeKey]?.close();
+                                      deleteCalendarEntry(entry);
+                                    }}
                                   >
                                     <Ionicons name="trash-outline" size={16} color="#FFFFFF" />
                                     <Text style={styles.dailyBlockDeleteText}>Delete</Text>
@@ -3094,7 +3117,7 @@ export default function CalendarScreen() {
                             );
                           })}
                         </View>
-                      </Pressable>
+                      </View>
                     ))}
                   </View>
                 </View>
@@ -3781,6 +3804,10 @@ const styles = StyleSheet.create({
     paddingRight: 10,
     gap: 6,
   },
+  dailyBlockSwipe: {
+    borderRadius: 10,
+    overflow: "hidden",
+  },
   dailyBlockChip: {
     borderWidth: 1,
     borderRadius: 10,
@@ -3788,9 +3815,7 @@ const styles = StyleSheet.create({
     paddingVertical: 7,
   },
   dailyBlockDeleteAction: {
-    minWidth: 88,
-    borderRadius: 10,
-    marginLeft: 8,
+    width: 92,
     alignItems: "center",
     justifyContent: "center",
     backgroundColor: "#C94B4B",

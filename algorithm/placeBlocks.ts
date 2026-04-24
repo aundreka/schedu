@@ -331,9 +331,10 @@ function candidateFinalQuizSlots(
   afterIndex: number,
   reserveReviewSlot: boolean
 ) {
+  const examIndex = Math.max(0, slots.length - 1);
   const targetIndex = Math.max(
     Math.max(0, afterIndex + 1),
-    slots.length - 1 - (reserveReviewSlot ? 1 : 0)
+    examIndex - (reserveReviewSlot ? 2 : 1)
   );
   const exact = slots[targetIndex];
   if (exact && !exact.locked && !slotHasMajorBlock(exact)) {
@@ -497,8 +498,14 @@ function ensureFinalQuizBeforeExamWindow(termSlots: SessionSlot[], blocks: Block
   const finalQuiz = quizzes[quizzes.length - 1] ?? null;
   if (!finalQuiz) return;
 
+  const examIndex = termSlots.findIndex((_, index) => {
+    const block = getMajorBlockAt(termSlots, index, blocks);
+    return block?.type === "exam";
+  });
+  if (examIndex <= 0) return;
+
   const hasExamReview = blocks.some((block) => block.metadata.extraCandidateType === "review_before_exam");
-  const targetIndex = Math.max(0, termSlots.length - 1 - (hasExamReview ? 1 : 0));
+  const targetIndex = Math.max(0, examIndex - (hasExamReview ? 2 : 1));
   const finalQuizIndex = findPlacementIndex(termSlots, finalQuiz.id);
   if (finalQuizIndex < 0 || finalQuizIndex === targetIndex) return;
 
