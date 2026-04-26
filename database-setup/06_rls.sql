@@ -21,6 +21,51 @@ alter table public.plan_subject_content enable row level security;
 alter table public.school_calendar_events enable row level security;
 alter table public.delays enable row level security;
 
+create or replace function public.is_current_user_admin()
+returns boolean
+language sql
+stable
+as $$
+  select exists (
+    select 1
+    from public.users u
+    where u.userid = auth.uid()
+      and u.role in ('admin', 'superadmin')
+  );
+$$;
+
+create or replace function public.is_current_user_school_admin(p_school_id uuid)
+returns boolean
+language sql
+stable
+as $$
+  select exists (
+    select 1
+    from public.user_schools us
+    join public.users u on u.userid = us.user_id
+    where us.user_id = auth.uid()
+      and us.school_id = p_school_id
+      and u.role in ('admin', 'superadmin')
+  );
+$$;
+
+drop policy if exists "admins can read school member profiles" on public.users;
+create policy "admins can read school member profiles"
+on public.users for select
+using (
+  exists (
+    select 1
+    from public.user_schools current_membership
+    join public.user_schools target_membership
+      on target_membership.school_id = current_membership.school_id
+    join public.users current_user
+      on current_user.userid = current_membership.user_id
+    where current_membership.user_id = auth.uid()
+      and current_user.role in ('admin', 'superadmin')
+      and target_membership.user_id = users.userid
+  )
+);
+
 -- schools
 drop policy if exists "users can read member schools" on public.schools;
 create policy "users can read member schools"
@@ -49,7 +94,10 @@ with check (auth.uid() = created_by);
 drop policy if exists "users can read own school memberships" on public.user_schools;
 create policy "users can read own school memberships"
 on public.user_schools for select
-using (auth.uid() = user_id);
+using (
+  auth.uid() = user_id
+  or public.is_current_user_school_admin(school_id)
+);
 
 drop policy if exists "users can insert own school memberships" on public.user_schools;
 create policy "users can insert own school memberships"
@@ -270,7 +318,10 @@ with check (
 drop policy if exists "users can read own lesson plans" on public.lesson_plans;
 create policy "users can read own lesson plans"
 on public.lesson_plans for select
-using (auth.uid() = user_id);
+using (
+  auth.uid() = user_id
+  or public.is_current_user_school_admin(school_id)
+);
 
 drop policy if exists "users can manage own lesson plans" on public.lesson_plans;
 create policy "users can manage own lesson plans"
@@ -287,7 +338,10 @@ using (
     select 1
     from public.lesson_plans lp
     where lp.lesson_plan_id = slots.lesson_plan_id
-      and lp.user_id = auth.uid()
+      and (
+        lp.user_id = auth.uid()
+        or public.is_current_user_school_admin(lp.school_id)
+      )
   )
 );
 
@@ -320,7 +374,10 @@ using (
     select 1
     from public.lesson_plans lp
     where lp.lesson_plan_id = blocks.lesson_plan_id
-      and lp.user_id = auth.uid()
+      and (
+        lp.user_id = auth.uid()
+        or public.is_current_user_school_admin(lp.school_id)
+      )
   )
 );
 
@@ -353,7 +410,10 @@ using (
     select 1
     from public.lesson_plans lp
     where lp.lesson_plan_id = plan_subject_content.lesson_plan_id
-      and lp.user_id = auth.uid()
+      and (
+        lp.user_id = auth.uid()
+        or public.is_current_user_school_admin(lp.school_id)
+      )
   )
 );
 
@@ -414,7 +474,10 @@ with check (
 drop policy if exists "users can read own absences" on public.delays;
 create policy "users can read own absences"
 on public.delays for select
-using (auth.uid() = user_id);
+using (
+  auth.uid() = user_id
+  or public.is_current_user_school_admin(school_id)
+);
 
 drop policy if exists "users can manage own absences" on public.delays;
 create policy "users can manage own absences"

@@ -19,15 +19,15 @@ const CREATE_OPTIONS: CreateOption[] = [
     key: "lessonplan",
     label: "Lessonplan",
     icon: "reader-outline",
-    route: "/create/lessonplan",
+    route: "/(tabs)/create/lessonplan",
   },
-  { key: "subject", label: "Subject", icon: "albums-outline", route: "/create/subject" },
-  { key: "lesson", label: "Lesson", icon: "create-outline", route: "/create/lesson" },
+  { key: "subject", label: "Subject", icon: "albums-outline", route: "/(tabs)/create/subject" },
+  { key: "lesson", label: "Lesson", icon: "create-outline", route: "/(tabs)/create/lesson" },
   {
     key: "activities",
     label: "Activities",
     icon: "cube-outline",
-    route: "/create/activities",
+    route: "/(tabs)/create/activities",
   },
 ];
 

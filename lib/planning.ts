@@ -113,6 +113,35 @@ export function toMinutes(start: string | null | undefined, end: string | null |
   return Math.max(0, endHour * 60 + endMinute - (startHour * 60 + startMinute));
 }
 
+function defaultBlockOrderRank(category: string | null | undefined) {
+  if (category === "lesson") return 0;
+  if (category === "exam") return 1;
+  if (category === "written_work") return 2;
+  if (category === "performance_task") return 3;
+  if (category === "buffer") return 4;
+  return 9;
+}
+
+function compareBlockOrder(
+  a: { order_no?: number | null; title: string; session_category?: string | null; category?: string | null },
+  b: { order_no?: number | null; title: string; session_category?: string | null; category?: string | null }
+) {
+  const aHasOrder = typeof a.order_no === "number" && Number.isFinite(a.order_no);
+  const bHasOrder = typeof b.order_no === "number" && Number.isFinite(b.order_no);
+  if (aHasOrder && bHasOrder && a.order_no !== b.order_no) {
+    return Number(a.order_no) - Number(b.order_no);
+  }
+  if (aHasOrder !== bHasOrder) {
+    return aHasOrder ? -1 : 1;
+  }
+
+  const aRank = defaultBlockOrderRank(a.session_category ?? a.category);
+  const bRank = defaultBlockOrderRank(b.session_category ?? b.category);
+  if (aRank !== bRank) return aRank - bRank;
+
+  return a.title.localeCompare(b.title);
+}
+
 function toSessionType(value: string | null | undefined): SessionType | null {
   if (value === "lecture" || value === "laboratory" || value === "mixed" || value === "any") {
     return value;
@@ -240,7 +269,7 @@ export function buildPlacementSeed(
 
   for (const [slotId, rows] of Array.from(grouped.entries())) {
     const placements = [...rows]
-      .sort((a, b) => (a.order_no ?? 999) - (b.order_no ?? 999) || a.title.localeCompare(b.title))
+      .sort(compareBlockOrder)
       .map((row, index) => ({
         id: `placement__${row.block_id}__${slotId}__${index + 1}`,
         blockId: row.block_id,
@@ -286,7 +315,7 @@ export function buildScheduledCalendarSlots(
       startTime: null,
       endTime: null,
       scheduledDate: "",
-      orderNo: row.order_no ?? 1,
+      orderNo: typeof row.order_no === "number" && Number.isFinite(row.order_no) ? Number(row.order_no) : 0,
       isLocked: Boolean(row.is_locked),
       wwSubtype: row.ww_subtype,
       ptSubtype: row.pt_subtype,
@@ -303,13 +332,24 @@ export function buildScheduledCalendarSlots(
       const blocks = (blocksBySlotId.get(slot.slot_id) ?? [])
         .map((block) => ({
           ...block,
-          startTime: toHm(slot.start_time),
-          endTime: toHm(slot.end_time),
+          startTime:
+            typeof block.metadata?.resolvedStart === "string"
+              ? toHm(String(block.metadata.resolvedStart))
+              : toHm(slot.start_time),
+          endTime:
+            typeof block.metadata?.resolvedEnd === "string"
+              ? toHm(String(block.metadata.resolvedEnd))
+              : toHm(slot.end_time),
           scheduledDate: slot.slot_date,
           slotTitle: slot.title,
           slotNumber: slot.slot_number,
         }))
-        .sort((a, b) => a.orderNo - b.orderNo || a.title.localeCompare(b.title));
+        .sort((a, b) =>
+          compareBlockOrder(
+            { order_no: a.orderNo > 0 ? a.orderNo : null, title: a.title, category: a.category },
+            { order_no: b.orderNo > 0 ? b.orderNo : null, title: b.title, category: b.category }
+          )
+        );
 
       return {
         slotId: slot.slot_id,
@@ -327,6 +367,7 @@ export function buildScheduledCalendarSlots(
         blocks,
       } satisfies ScheduledCalendarSlot;
     })
+    .filter((slot) => slot.blocks.length > 0)
     .sort((a, b) => {
       const dateCompare = a.slotDate.localeCompare(b.slotDate);
       if (dateCompare !== 0) return dateCompare;
