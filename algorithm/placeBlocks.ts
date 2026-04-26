@@ -620,10 +620,10 @@ function buildExpansionCandidates(blocks: Block[]) {
   return [
     ...(examReview ? [examReview] : []),
     ...quizReviews,
-    ...ptExtensions,
-    ...lessonExtensions,
     ...(extraWW ? [extraWW] : []),
     ...(extraPT ? [extraPT] : []),
+    ...ptExtensions,
+    ...lessonExtensions,
   ];
 }
 

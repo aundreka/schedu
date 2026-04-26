@@ -54,6 +54,12 @@ type PlanItem = {
   plan_entry_id: string;
   category: PlanEntryCategory;
   title: string;
+  subtitle: string | null;
+  subcategory: string | null;
+  sort_order: number;
+  scheduled_date: string | null;
+  start_time: string | null;
+  order_no: number | null;
 };
 
 type PlanEntryRow = {
@@ -63,7 +69,11 @@ type PlanEntryRow = {
   algorithm_block_key: string | null;
   lesson_id: string | null;
   session_category: string | null;
+  session_subcategory: string | null;
   title: string | null;
+  order_no?: number | null;
+  slot?: { slot_date?: string | null; start_time?: string | null } | Array<{ slot_date?: string | null; start_time?: string | null }> | null;
+  metadata?: Record<string, unknown> | null;
 };
 
 type LessonPlanSummary = {
@@ -123,7 +133,209 @@ function buildPlanEntryKey(row: PlanEntryRow, category: PlanEntryCategory, norma
   );
 }
 
+function getNormalizedGlobalOrder(input: {
+  rawOrder: unknown;
+  rawGlobalOrder: unknown;
+  offset: number;
+  termExpectedCount: number;
+  termIndex: number;
+}) {
+  const explicitGlobal = Number(input.rawGlobalOrder ?? 0);
+  if (explicitGlobal > 0) return explicitGlobal;
+
+  const rawOrder = Number(input.rawOrder ?? 0);
+  if (!(rawOrder > 0)) return 0;
+  if (input.termIndex <= 0) return rawOrder;
+  if (rawOrder > input.termExpectedCount) return rawOrder;
+  return input.offset + rawOrder;
+}
+
+function getWrittenWorkSubtypeCode(subcategory?: string | null) {
+  if (subcategory === "quiz") return "Q";
+  if (subcategory === "seatwork") return "SW";
+  return "AS";
+}
+
+function getPerformanceTaskSubtypeCode(subcategory?: string | null) {
+  if (subcategory === "lab_report") return "LR";
+  if (subcategory === "reporting") return "REP";
+  if (subcategory === "project") return "PROJ";
+  return "ACT";
+}
+
+function getTermRequirementOffsets(rows: PlanEntryRow[]) {
+  const examsByTerm = new Map<number, PlanEntryRow>();
+  for (const row of rows) {
+    if (row.session_category !== "exam") continue;
+    const termIndex = Number(row.metadata?.termIndex ?? -1);
+    if (termIndex < 0) continue;
+    if (!examsByTerm.has(termIndex)) examsByTerm.set(termIndex, row);
+  }
+
+  let wwOffset = 0;
+  let ptOffset = 0;
+  let quizOffset = 0;
+  const offsets = new Map<number, { ww: number; pt: number; quiz: number }>();
+  const termIndexes = Array.from(examsByTerm.keys()).sort((a, b) => a - b);
+  for (const termIndex of termIndexes) {
+    offsets.set(termIndex, { ww: wwOffset, pt: ptOffset, quiz: quizOffset });
+    const exam = examsByTerm.get(termIndex);
+    wwOffset += Math.max(0, Number(exam?.metadata?.termWW ?? 0));
+    ptOffset += Math.max(0, Number(exam?.metadata?.termPT ?? 0));
+    quizOffset += Math.max(0, Number(exam?.metadata?.termQuizAmount ?? 0));
+  }
+
+  return { examsByTerm, offsets };
+}
+
+function formatPlanItem(row: PlanEntryRow, offsets: Map<number, { ww: number; pt: number; quiz: number }>, examsByTerm: Map<number, PlanEntryRow>) {
+  const fallbackTitle = normalizePlanEntryTitle(String(row.title ?? "Untitled")) || "Untitled";
+  const metadata = row.metadata ?? {};
+  const slotRaw = row.slot;
+  const slot = Array.isArray(slotRaw) ? slotRaw[0] : slotRaw;
+  const termIndex = Number(metadata.termIndex ?? -1);
+  const termOffsets = offsets.get(termIndex) ?? { ww: 0, pt: 0, quiz: 0 };
+  const exam = examsByTerm.get(termIndex);
+  const expectedWW = Math.max(0, Number(exam?.metadata?.termWW ?? 0));
+  const expectedPT = Math.max(0, Number(exam?.metadata?.termPT ?? 0));
+  const expectedQuiz = Math.max(0, Number(exam?.metadata?.termQuizAmount ?? 0));
+  const expectedNonQuizWW = Math.max(0, expectedWW - expectedQuiz);
+
+  if (row.session_category === "written_work" && row.session_subcategory === "quiz") {
+    const quizOrder = getNormalizedGlobalOrder({
+      rawOrder: metadata.quizOrder,
+      rawGlobalOrder: metadata.globalQuizOrder,
+      offset: termOffsets.quiz,
+      termExpectedCount: expectedQuiz,
+      termIndex,
+    });
+    const localQuizOrder =
+      Number(metadata.termQuizOrder ?? 0) > 0 ? Number(metadata.termQuizOrder ?? 0) : Math.max(0, quizOrder - termOffsets.quiz);
+    const wwOrder = termOffsets.ww + expectedNonQuizWW + localQuizOrder;
+    if (wwOrder > 0 && quizOrder > 0) {
+      return {
+        sort_order: wwOrder,
+        title: fallbackTitle,
+        subtitle: null,
+        subcategory: row.session_subcategory,
+        scheduled_date: slot?.slot_date ? String(slot.slot_date) : null,
+        start_time: slot?.start_time ? String(slot.start_time) : null,
+        order_no: typeof row.order_no === "number" ? Number(row.order_no) : null,
+      };
+    }
+    return {
+      sort_order: Number.MAX_SAFE_INTEGER,
+      title: fallbackTitle,
+      subtitle: null,
+      subcategory: row.session_subcategory,
+      scheduled_date: slot?.slot_date ? String(slot.slot_date) : null,
+      start_time: slot?.start_time ? String(slot.start_time) : null,
+      order_no: typeof row.order_no === "number" ? Number(row.order_no) : null,
+    };
+  }
+
+  if (row.session_category === "written_work") {
+    const wwOrder = getNormalizedGlobalOrder({
+      rawOrder: metadata.wwOrder,
+      rawGlobalOrder: metadata.globalWwOrder,
+      offset: termOffsets.ww,
+      termExpectedCount: expectedWW,
+      termIndex,
+    });
+    if (wwOrder > 0) {
+      return {
+        sort_order: wwOrder,
+        title: fallbackTitle,
+        subtitle: null,
+        subcategory: row.session_subcategory,
+        scheduled_date: slot?.slot_date ? String(slot.slot_date) : null,
+        start_time: slot?.start_time ? String(slot.start_time) : null,
+        order_no: typeof row.order_no === "number" ? Number(row.order_no) : null,
+      };
+    }
+    return {
+      sort_order: Number.MAX_SAFE_INTEGER,
+      title: fallbackTitle,
+      subtitle: null,
+      subcategory: row.session_subcategory,
+      scheduled_date: slot?.slot_date ? String(slot.slot_date) : null,
+      start_time: slot?.start_time ? String(slot.start_time) : null,
+      order_no: typeof row.order_no === "number" ? Number(row.order_no) : null,
+    };
+  }
+
+  if (row.session_category === "performance_task") {
+    const ptOrder = getNormalizedGlobalOrder({
+      rawOrder: metadata.ptOrder,
+      rawGlobalOrder: metadata.globalPtOrder,
+      offset: termOffsets.pt,
+      termExpectedCount: expectedPT,
+      termIndex,
+    });
+    if (ptOrder > 0) {
+      return {
+        sort_order: ptOrder,
+        title: fallbackTitle,
+        subtitle: null,
+        subcategory: row.session_subcategory,
+        scheduled_date: slot?.slot_date ? String(slot.slot_date) : null,
+        start_time: slot?.start_time ? String(slot.start_time) : null,
+        order_no: typeof row.order_no === "number" ? Number(row.order_no) : null,
+      };
+    }
+  }
+
+  return {
+    sort_order: Number.MAX_SAFE_INTEGER,
+    title: fallbackTitle,
+    subtitle: null,
+    subcategory: row.session_subcategory,
+    scheduled_date: slot?.slot_date ? String(slot.slot_date) : null,
+    start_time: slot?.start_time ? String(slot.start_time) : null,
+    order_no: typeof row.order_no === "number" ? Number(row.order_no) : null,
+  };
+}
+
+function relabelPlanItems(items: PlanItem[], category: PlanEntryCategory) {
+  const chronologicalItems = [...items].sort((a, b) => {
+    const aDate = a.scheduled_date || "9999-99-99";
+    const bDate = b.scheduled_date || "9999-99-99";
+    if (aDate !== bDate) return aDate.localeCompare(bDate);
+    const aTime = a.start_time || "99:99:99";
+    const bTime = b.start_time || "99:99:99";
+    if (aTime !== bTime) return aTime.localeCompare(bTime);
+    const aOrder = Number(a.order_no ?? 0);
+    const bOrder = Number(b.order_no ?? 0);
+    if (aOrder !== bOrder) return aOrder - bOrder;
+    return a.plan_entry_id.localeCompare(b.plan_entry_id);
+  });
+  const subtypeCounts = new Map<string, number>();
+  let categoryCount = 0;
+  const relabeled = new Map<string, PlanItem>();
+
+  for (const item of chronologicalItems) {
+    const subcategory = item.subcategory ?? "";
+    const code =
+      category === "written_work"
+        ? getWrittenWorkSubtypeCode(subcategory)
+        : getPerformanceTaskSubtypeCode(subcategory);
+    categoryCount += 1;
+    const nextSubtypeCount = (subtypeCounts.get(code) ?? 0) + 1;
+    subtypeCounts.set(code, nextSubtypeCount);
+
+    relabeled.set(item.plan_entry_id, {
+      ...item,
+      title: `${code}${nextSubtypeCount}`,
+      subtitle: `${category === "written_work" ? "WW" : "PT"}${categoryCount}`,
+      sort_order: categoryCount,
+    });
+  }
+
+  return items.map((item) => relabeled.get(item.plan_entry_id) ?? item);
+}
+
 function dedupePlanEntries(rows: PlanEntryRow[]) {
+  const { examsByTerm, offsets } = getTermRequirementOffsets(rows);
   const written = new Map<string, PlanItem>();
   const performance = new Map<string, PlanItem>();
 
@@ -136,10 +348,17 @@ function dedupePlanEntries(rows: PlanEntryRow[]) {
       (isUuid(row.root_block_id) ? row.root_block_id : null) ??
       (isUuid(row.block_id) ? row.block_id : null) ??
       String(row.block_id);
+    const display = formatPlanItem(row, offsets, examsByTerm);
     const item: PlanItem = {
       plan_entry_id: preferredId,
       category,
-      title: normalizedTitle,
+      title: display.title,
+      subtitle: display.subtitle,
+      subcategory: display.subcategory,
+      sort_order: display.sort_order,
+      scheduled_date: display.scheduled_date,
+      start_time: display.start_time,
+      order_no: display.order_no,
     };
 
     const key = buildPlanEntryKey(row, category, normalizedTitle);
@@ -157,8 +376,14 @@ function dedupePlanEntries(rows: PlanEntryRow[]) {
   }
 
   return {
-    written: Array.from(written.values()),
-    performance: Array.from(performance.values()),
+    written: relabelPlanItems(
+      Array.from(written.values()).sort((a, b) => a.sort_order - b.sort_order || a.title.localeCompare(b.title)),
+      "written_work"
+    ),
+    performance: relabelPlanItems(
+      Array.from(performance.values()).sort((a, b) => a.sort_order - b.sort_order || a.title.localeCompare(b.title)),
+      "performance_task"
+    ),
   };
 }
 
@@ -381,9 +606,9 @@ export default function SubjectDetailScreen() {
       if (selectedPlan?.lesson_plan_id) {
         const { data: entryRows, error: entriesError } = await supabase
           .from("blocks")
-          .select("block_id, root_block_id, block_key, algorithm_block_key, lesson_id, session_category, title")
+          .select("block_id, root_block_id, block_key, algorithm_block_key, lesson_id, session_category, session_subcategory, title, order_no, metadata, slot:slots(slot_date, start_time)")
           .eq("lesson_plan_id", selectedPlan.lesson_plan_id)
-          .in("session_category", ["written_work", "performance_task"])
+          .in("session_category", ["written_work", "performance_task", "exam"])
           .order("created_at", { ascending: true });
         if (entriesError) throw entriesError;
 
@@ -1304,9 +1529,12 @@ export default function SubjectDetailScreen() {
                   onPress={() => goToWrittenWorkDetail(item.plan_entry_id)}
                   style={[styles.planItem, { backgroundColor: c.background }]}
                 >
-                  <Text style={[styles.planItemText, { color: c.text }]} numberOfLines={1}>
-                    {item.title}
-                  </Text>
+                  <Text style={[styles.planItemText, { color: c.text }]} numberOfLines={1}>{item.title}</Text>
+                  {item.subtitle ? (
+                    <Text style={[styles.planItemSubtext, { color: c.mutedText }]} numberOfLines={1}>
+                      {item.subtitle}
+                    </Text>
+                  ) : null}
                 </Pressable>
               ))
             ) : (
@@ -1331,9 +1559,12 @@ export default function SubjectDetailScreen() {
                     { backgroundColor: scheme === "dark" ? "#4A2E33" : "#F0D7D8" },
                   ]}
                 >
-                  <Text style={[styles.planItemText, { color: c.text }]} numberOfLines={1}>
-                    {item.title}
-                  </Text>
+                  <Text style={[styles.planItemText, { color: c.text }]} numberOfLines={1}>{item.title}</Text>
+                  {item.subtitle ? (
+                    <Text style={[styles.planItemSubtext, { color: c.mutedText }]} numberOfLines={1}>
+                      {item.subtitle}
+                    </Text>
+                  ) : null}
                 </Pressable>
               ))
             ) : (
@@ -1585,19 +1816,23 @@ const styles = StyleSheet.create({
   planItem: {
     borderRadius: Radius.sm,
     paddingHorizontal: Spacing.sm,
-    minHeight: 34,
+    minHeight: 42,
     justifyContent: "center",
     marginBottom: Spacing.xs,
   },
   planItemPink: {
     borderRadius: Radius.sm,
     paddingHorizontal: Spacing.sm,
-    minHeight: 34,
+    minHeight: 42,
     justifyContent: "center",
     marginBottom: Spacing.xs,
   },
   planItemText: {
     ...Typography.body,
+    fontWeight: "600",
+  },
+  planItemSubtext: {
+    ...Typography.caption,
   },
   planEmpty: {
     ...Typography.body,

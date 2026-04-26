@@ -6,10 +6,10 @@ A teacher-facing curriculum workspace that bundles Supabase-powered auth, instit
 
 - **Supabase-first profile & institutions**: `(auth)` routes plus `profile/index.tsx`, `profile/settings.tsx`, and `profile/institution.tsx` keep teacher profiles, associated schools, sections, and preferences (default institution, filters, avatars, appearance) in sync with Supabase Postgres records.
 - **Lesson planning stack**: `(tabs)/plans`, `(tabs)/library`, and `(tabs)/library/subject_detail.tsx` expose lesson plans, subjects, subject structure editing (units → chapters → lessons), and plan detail views that stay in-flight with Supabase tables such as `lesson_plans`, `subjects`, `chapters`, `lessons`, and `plan_entries`.
-- **Calendar + scheduler**: `(tabs)/calendar/index.tsx` feeds plan entries into `algorithms/lessonPlanScheduler.ts`, surfaces monthly/daily timelines, and lets teachers tweak entries while respecting category color/legend rules defined in the calendar code base.
+- **Calendar + scheduler**: `(tabs)/calendar/index.tsx` uses the current planning pipeline in `algorithm/buildSlots.ts`, `algorithm/buildBlocks.ts`, `algorithm/buildPacingPlan.ts`, `algorithm/placeBlocks.ts`, and `algorithm/validatePlan.ts`, surfaces monthly/daily timelines, and lets teachers tweak entries while respecting category color/legend rules defined in the calendar code base.
 - **Create flow**: `(tabs)/create/*` guides teachers through building new subjects, lesson plans, notes, and activities, and routes back into the tab navigation once a creation path completes.
 - **Curriculum extraction**: `components/pdf-extractor.tsx` accepts PDFs or images (it warns that image OCR needs a Dev Client because `react-native-mlkit-ocr` does not run in Expo Go), uploads files to Supabase Storage, and calls the `extract-text` Edge function before populating an editable text area.
-- **Scheduler benchmarks**: `algorithms/lessonPlanScheduler.ts` defines a deterministic rules-engine algorithm and `scripts/*.ts|.sh` export benchmark data plus markdown/CSV/LaTeX summaries for coverage, order, assessment windows, and load balance statistics.
+- **Scheduler benchmarks**: `scripts/*.ts|.sh` benchmark and validate the current planning pipeline, exporting markdown/CSV summaries for slot generation, block placement, validation coverage, and utilization.
 
 ## Architecture
 
@@ -40,7 +40,7 @@ A teacher-facing curriculum workspace that bundles Supabase-powered auth, instit
 
 ## Notes & troubleshooting
 
-- The calendar view in `(tabs)/calendar/index.tsx` feeds plan data into `algorithms/lessonPlanScheduler.ts` and animates UI updates with `LayoutAnimation` + pinch-to-zoom gestures.
+- The calendar view in `(tabs)/calendar/index.tsx` runs on the current planner modules in `algorithm/*` and animates UI updates with `LayoutAnimation` + pinch-to-zoom gestures.
 - Image OCR requires a Dev Build because `react-native-mlkit-ocr` needs native binaries; PDFs are processed via the `extract-text` Edge Function so Expo Go is not strictly required for that flow.
 - `scripts/scheduler-benchmark.ts` plus the `.sh` wrappers can be used to benchmark the scheduler, producing markdown/CSV/LaTeX summaries in `generated/scheduler-benchmarks/`.
 - Adjust `constants/colors.ts`, `constants/fonts.ts`, or `context/theme.tsx` if you need to rebrand colors or typography.

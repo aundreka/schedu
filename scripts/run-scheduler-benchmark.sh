@@ -18,6 +18,11 @@ cd "$ROOT_DIR"
   --esModuleInterop \
   --outDir "$TMP_DIR" \
   scripts/scheduler-benchmark.ts \
-  algorithms/lessonPlanScheduler.ts
+  algorithm/buildBlocks.ts \
+  algorithm/buildPacingPlan.ts \
+  algorithm/buildSlots.ts \
+  algorithm/placeBlocks.ts \
+  algorithm/types.ts \
+  algorithm/validatePlan.ts
 
 node "$TMP_DIR/scripts/scheduler-benchmark.js"

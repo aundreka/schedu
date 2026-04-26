@@ -202,7 +202,9 @@ export function buildBlocks(input: BuildBlocksInput): Block[] {
     const termSlots = slotsByTerm.get(term.termIndex) ?? [];
     const chapterEndingOrders = buildChapterEndingLessonOrders(term.tocUnits);
     const ptSubtypeCounts: Record<string, number> = { __targetTotal: term.termPT };
-    const wwSubtypeCounts: Record<string, number> = { __targetTotal: term.termWW };
+    const nonQuizWrittenWorkCount = Math.max(0, term.termWW - term.termQuizAmount);
+    const wwSubtypeCounts: Record<string, number> = { __targetTotal: nonQuizWrittenWorkCount };
+    const termWwOffset = globalWwOrder;
 
     if (term.hasOrientation) {
       blocks.push({
@@ -294,8 +296,8 @@ export function buildBlocks(input: BuildBlocksInput): Block[] {
     }
     globalPtOrder += term.termPT;
 
-    for (let index = 0; index < term.termWW; index += 1) {
-      const wwOrder = globalWwOrder + index + 1;
+    for (let index = 0; index < nonQuizWrittenWorkCount; index += 1) {
+      const wwOrder = termWwOffset + index + 1;
       const subcategory = pickBalancedWrittenWorkSubtype({
         counts: wwSubtypeCounts,
         termLessons: term.tocUnits,
@@ -325,6 +327,7 @@ export function buildBlocks(input: BuildBlocksInput): Block[] {
 
     for (let index = 0; index < term.termQuizAmount; index += 1) {
       const quizOrder = globalQuizOrder + index + 1;
+      const wwOrder = termWwOffset + nonQuizWrittenWorkCount + index + 1;
       const coverage = buildQuizCoverage(
         term.tocUnits,
         term.lessonInterval,
@@ -347,6 +350,7 @@ export function buildBlocks(input: BuildBlocksInput): Block[] {
         metadata: {
           termIndex: term.termIndex,
           termKey: term.termKey,
+          globalWwOrder: wwOrder,
           quizOrder,
           termQuizOrder: index + 1,
           afterLessonOrder: coverage.endOrder,

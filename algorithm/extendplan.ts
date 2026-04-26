@@ -287,32 +287,6 @@ export function extendTermPlan(context: TermPlacementContext) {
     }
   }
 
-  for (const extension of ptExtensions) {
-    if (remaining <= 0) break;
-    const ptOrder = Number(extension.metadata.ptOrder ?? 0);
-    const baseBlock = blocks.find((block) => block.type === "performance_task" && !block.metadata.extraCandidateType && Number(block.metadata.ptOrder ?? 0) === ptOrder);
-    if (!baseBlock) continue;
-    const baseIndex = findPlacementIndex(termSlots, baseBlock.id);
-    if (baseIndex < 0 || baseIndex >= termSlots.length - 1) continue;
-    if (insertMajorAt(termSlots, baseIndex + 1, extension)) {
-      unscheduled.delete(extension.id);
-      remaining -= 1;
-    }
-  }
-
-  for (const extension of lessonExtensions) {
-    if (remaining <= 0) break;
-    const lessonOrder = Number(extension.metadata.lessonOrder ?? 0);
-    const baseBlock = blocks.find((block) => block.type === "lesson" && !block.metadata.extraCandidateType && Number(block.metadata.lessonOrder ?? 0) === lessonOrder);
-    if (!baseBlock) continue;
-    const baseIndex = findPlacementIndex(termSlots, baseBlock.id);
-    if (baseIndex < 0 || baseIndex >= termSlots.length - 1) continue;
-    if (insertMajorAt(termSlots, baseIndex + 1, extension)) {
-      unscheduled.delete(extension.id);
-      remaining -= 1;
-    }
-  }
-
   if (remaining > 0 && extraWW) {
     for (const slot of coreWindow) {
       if (slot.locked) continue;
@@ -335,6 +309,42 @@ export function extendTermPlan(context: TermPlacementContext) {
       unscheduled.delete(extraPT.id);
       remaining -= 1;
       break;
+    }
+  }
+
+  for (const extension of ptExtensions) {
+    if (remaining <= 0) break;
+    const ptOrder = Number(extension.metadata.ptOrder ?? 0);
+    const baseBlock = blocks.find(
+      (block) =>
+        block.type === "performance_task" &&
+        !block.metadata.extraCandidateType &&
+        Number(block.metadata.ptOrder ?? 0) === ptOrder
+    );
+    if (!baseBlock) continue;
+    const baseIndex = findPlacementIndex(termSlots, baseBlock.id);
+    if (baseIndex < 0 || baseIndex >= termSlots.length - 1) continue;
+    if (insertMajorAt(termSlots, baseIndex + 1, extension)) {
+      unscheduled.delete(extension.id);
+      remaining -= 1;
+    }
+  }
+
+  for (const extension of lessonExtensions) {
+    if (remaining <= 0) break;
+    const lessonOrder = Number(extension.metadata.lessonOrder ?? 0);
+    const baseBlock = blocks.find(
+      (block) =>
+        block.type === "lesson" &&
+        !block.metadata.extraCandidateType &&
+        Number(block.metadata.lessonOrder ?? 0) === lessonOrder
+    );
+    if (!baseBlock) continue;
+    const baseIndex = findPlacementIndex(termSlots, baseBlock.id);
+    if (baseIndex < 0 || baseIndex >= termSlots.length - 1) continue;
+    if (insertMajorAt(termSlots, baseIndex + 1, extension)) {
+      unscheduled.delete(extension.id);
+      remaining -= 1;
     }
   }
 }

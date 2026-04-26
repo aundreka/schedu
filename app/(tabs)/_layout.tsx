@@ -131,6 +131,14 @@ export default function TabsLayout() {
 
         <Tabs.Screen
           name="library"
+          listeners={{
+            tabPress: (e) => {
+              if (pathname.startsWith("/library") && pathname !== "/library") {
+                e.preventDefault();
+                router.replace("/library");
+              }
+            },
+          }}
           options={{
             title: "Library",
             tabBarIcon: ({ size, color }) => (

@@ -19,6 +19,7 @@ type WrittenWorkDetail = {
   plan_entry_id: string;
   title: string;
   description: string | null;
+  session_category: string | null;
   session_subcategory: string | null;
   scheduled_date: string | null;
   day: string | null;
@@ -64,12 +65,31 @@ function toTitleCase(value: string | null) {
     .join(" ");
 }
 
+function resolveKicker(entry: WrittenWorkDetail) {
+  if (entry.session_category === "exam") {
+    return entry.session_subcategory ? toTitleCase(entry.session_subcategory) : "Exam";
+  }
+  return toTitleCase(entry.session_subcategory);
+}
+
 export default function WrittenWorkDetailScreen() {
   const { colors: c, scheme } = useAppTheme();
-  const params = useLocalSearchParams<{ planEntryId?: string | string[] }>();
+  const params = useLocalSearchParams<{ planEntryId?: string | string[]; subjectId?: string | string[] }>();
   const planEntryId = useMemo(() => readParam(params.planEntryId), [params.planEntryId]);
+  const subjectId = useMemo(() => readParam(params.subjectId), [params.subjectId]);
   const [loading, setLoading] = useState(true);
   const [entry, setEntry] = useState<WrittenWorkDetail | null>(null);
+
+  const handleBack = useCallback(() => {
+    if (subjectId) {
+      router.replace({
+        pathname: "/library/subject_detail",
+        params: { subjectId },
+      });
+      return;
+    }
+    router.back();
+  }, [subjectId]);
 
   const loadEntry = useCallback(async () => {
     if (!planEntryId) {
@@ -82,9 +102,8 @@ export default function WrittenWorkDetailScreen() {
     try {
       const { data, error } = await supabase
         .from("blocks")
-        .select("block_id, title, description, session_subcategory, lesson_id, slot:slots(slot_date, weekday, start_time, end_time)")
+        .select("block_id, title, description, session_category, session_subcategory, lesson_id, slot:slots(slot_date, weekday, start_time, end_time)")
         .eq("block_id", planEntryId)
-        .eq("session_category", "written_work")
         .maybeSingle();
       if (error) throw error;
 
@@ -100,6 +119,7 @@ export default function WrittenWorkDetailScreen() {
         plan_entry_id: String(data.block_id),
         title: String(data.title ?? "Untitled Written Work"),
         description: data?.description ? String(data.description) : null,
+        session_category: data?.session_category ? String(data.session_category) : null,
         session_subcategory: data?.session_subcategory ? String(data.session_subcategory) : null,
         scheduled_date: slot?.slot_date ? String(slot.slot_date) : null,
         day: slot?.weekday ? String(slot.weekday) : null,
@@ -140,11 +160,10 @@ export default function WrittenWorkDetailScreen() {
   if (!entry) {
     return (
       <View style={[styles.center, { backgroundColor: pageBg }]}>
-        <Pressable style={styles.backBtn} onPress={() => router.back()}>
+        <Pressable style={styles.backBtn} onPress={handleBack}>
           <Ionicons name="arrow-back" size={18} color={c.text} />
-          <Text style={[styles.backText, { color: c.text }]}>Back</Text>
         </Pressable>
-        <Text style={[styles.emptyText, { color: c.text }]}>Written work not found.</Text>
+        <Text style={[styles.emptyText, { color: c.text }]}>Item not found.</Text>
       </View>
     );
   }
@@ -155,13 +174,12 @@ export default function WrittenWorkDetailScreen() {
         contentContainerStyle={styles.content}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={c.text} />}
       >
-        <Pressable style={styles.backBtn} onPress={() => router.back()}>
+        <Pressable style={styles.backBtn} onPress={handleBack}>
           <Ionicons name="arrow-back" size={18} color={c.text} />
-          <Text style={[styles.backText, { color: c.text }]}>Back to Subject</Text>
         </Pressable>
 
         <View style={[styles.heroCard, { backgroundColor: cardBg, borderColor: c.border }]}>
-          <Text style={[styles.kicker, { color: c.mutedText }]}>{toTitleCase(entry.session_subcategory)}</Text>
+          <Text style={[styles.kicker, { color: c.mutedText }]}>{resolveKicker(entry)}</Text>
           <Text style={[styles.title, { color: c.text }]}>{entry.title}</Text>
           {entry.lesson_title ? (
             <Text style={[styles.meta, { color: c.mutedText }]}>Lesson: {entry.lesson_title}</Text>
@@ -201,12 +219,7 @@ const styles = StyleSheet.create({
   backBtn: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 8,
     alignSelf: "flex-start",
-  },
-  backText: {
-    ...Typography.body,
-    fontWeight: "600",
   },
   heroCard: {
     borderWidth: 1,

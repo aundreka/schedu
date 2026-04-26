@@ -3,176 +3,209 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-const strict_1 = __importDefault(require("assert/strict"));
-const lessonPlanScheduler_1 = require("../algorithms/lessonPlanScheduler");
-function entry(overrides) {
-    return {
-        description: null,
-        scheduled_date: null,
-        start_time: null,
-        end_time: null,
-        ...overrides,
-    };
-}
-function recurringRow(id, lessonPlanId, day, start, end, meetingType) {
-    return entry({
-        plan_entry_id: id,
-        lesson_plan_id: lessonPlanId,
-        title: `${day} class ${start}`,
-        category: "lesson",
-        entry_type: "recurring_class",
-        day,
-        start_time: start,
-        end_time: end,
-        meeting_type: meetingType,
+const strict_1 = __importDefault(require("node:assert/strict"));
+const buildBlocks_1 = require("../algorithm/buildBlocks");
+const buildPacingPlan_1 = require("../algorithm/buildPacingPlan");
+const buildSlots_1 = require("../algorithm/buildSlots");
+const placeBlocks_1 = require("../algorithm/placeBlocks");
+const validatePlan_1 = require("../algorithm/validatePlan");
+function buildScenario(input) {
+    const slots = (0, buildSlots_1.buildSlots)({
+        courseId: input.courseId,
+        startDate: input.startDate,
+        endDate: input.endDate,
+        rawMeetingSchedules: input.schedules,
+        holidays: input.holidays ?? [],
+        termBoundaryDates: input.examBlockTemplates
+            .map((template) => template.preferredDate)
+            .filter((value) => Boolean(value)),
     });
+    const pacingPlan = (0, buildPacingPlan_1.buildPacingPlan)({
+        slots,
+        tocUnits: input.tocUnits,
+        teacherRules: input.teacherRules,
+        examBlockTemplates: input.examBlockTemplates,
+        initialDelayDates: input.holidays ?? [],
+    });
+    const blocks = (0, buildBlocks_1.buildBlocks)({
+        courseId: input.courseId,
+        tocUnits: input.tocUnits,
+        teacherRules: input.teacherRules,
+        examBlockTemplates: input.examBlockTemplates,
+        slots,
+        initialDelayDates: input.holidays ?? [],
+    });
+    const placement = (0, placeBlocks_1.placeBlocks)({ slots, blocks });
+    const validation = (0, validatePlan_1.validatePlan)({
+        slots: placement.slots,
+        blocks,
+        tocUnits: input.tocUnits,
+        expectedHolidayDates: input.holidays ?? [],
+        expectedExamDates: input.examBlockTemplates
+            .map((template) => template.preferredDate)
+            .filter((value) => Boolean(value)),
+        expectedTermCount: Math.max(1, input.examBlockTemplates.length || 1),
+        expectedDelayCount: pacingPlan.terms.reduce((sum, term) => sum + term.initialDelayCount, 0),
+    });
+    return { slots, pacingPlan, blocks, placement, validation };
 }
-function testLockedMultiSlotPlacement() {
-    const input = {
-        lessonPlanId: "plan_lock_slot",
+function makeTocUnits(courseId, count) {
+    return Array.from({ length: count }, (_, index) => ({
+        id: `lesson_${index + 1}`,
+        courseId,
+        chapterId: index < Math.ceil(count / 2) ? "chapter_a" : "chapter_b",
+        chapterTitle: index < Math.ceil(count / 2) ? "Chapter A" : "Chapter B",
+        title: `Lesson ${index + 1}`,
+        order: index + 1,
+        estimatedMinutes: 60,
+        difficulty: index % 3 === 0 ? "high" : index % 2 === 0 ? "medium" : "easy",
+        preferredSessionType: "lecture",
+        required: true,
+    }));
+}
+function majorTitlesBySlotDate(slots, blocks) {
+    const blockById = new Map(blocks.map((block) => [block.id, block]));
+    return slots
+        .map((slot) => {
+        const major = slot.placements.find((placement) => placement.lane === "major");
+        const block = major ? blockById.get(major.blockId) ?? null : null;
+        return {
+            date: slot.date,
+            title: block?.title ?? null,
+            type: block?.type ?? null,
+            subcategory: block?.subcategory ?? null,
+        };
+    })
+        .filter((row) => Boolean(row.title));
+}
+function testPreferredExamDateAnchoring() {
+    const courseId = "course_exam_anchor";
+    const result = buildScenario({
+        courseId,
         startDate: "2026-06-01",
-        endDate: "2026-06-01",
-        entries: [
-            recurringRow("rec_1", "plan_lock_slot", "monday", "08:00:00", "09:00:00", "lecture"),
-            recurringRow("rec_2", "plan_lock_slot", "monday", "10:00:00", "11:00:00", "laboratory"),
-            entry({
-                plan_entry_id: "lesson_locked",
-                lesson_plan_id: "plan_lock_slot",
-                title: "Lesson 1",
-                category: "lesson",
-                scheduled_date: "2026-06-01",
-                start_time: "10:00:00",
-                end_time: "11:00:00",
-                is_locked: true,
-            }),
+        endDate: "2026-06-26",
+        schedules: [
+            { id: "mwf_am", dayOfWeek: 1, startTime: "08:00", endTime: "09:00", sessionType: "lecture" },
+            { id: "mwf_am", dayOfWeek: 3, startTime: "08:00", endTime: "09:00", sessionType: "lecture" },
+            { id: "mwf_am", dayOfWeek: 5, startTime: "08:00", endTime: "09:00", sessionType: "lecture" },
         ],
-    };
-    const result = (0, lessonPlanScheduler_1.generateSchedulePlan)(input);
-    const locked = result.entries.find((e) => e.is_locked &&
-        e.title === "Lesson 1" &&
-        e.scheduled_date === "2026-06-01" &&
-        e.start_time === "10:00:00" &&
-        e.end_time === "11:00:00");
-    strict_1.default.ok(locked, "Expected locked lesson entry to be preserved.");
-    strict_1.default.equal(locked?.scheduled_date, "2026-06-01");
-    strict_1.default.equal(locked?.start_time, "10:00:00");
-    strict_1.default.equal(locked?.end_time, "11:00:00");
-}
-function testFinalExamDoesNotOverwriteLastOccupiedMeeting() {
-    const input = {
-        lessonPlanId: "plan_final_exam_shift",
-        startDate: "2026-06-01",
-        endDate: "2026-06-05",
-        entries: [
-            recurringRow("rec_mon", "plan_final_exam_shift", "monday", "08:00:00", "09:00:00", "lecture"),
-            recurringRow("rec_wed", "plan_final_exam_shift", "wednesday", "08:00:00", "09:00:00", "lecture"),
-            recurringRow("rec_fri", "plan_final_exam_shift", "friday", "08:00:00", "09:00:00", "lecture"),
-            entry({
-                plan_entry_id: "exam_final",
-                lesson_plan_id: "plan_final_exam_shift",
+        tocUnits: makeTocUnits(courseId, 6),
+        teacherRules: {
+            quizMode: "hybrid",
+            quizEveryNLessons: 3,
+            writtenWorkMode: "total",
+            minWW: 2,
+            allowLessonWrittenWorkOverlay: true,
+            preferLessonWrittenWorkOverlay: true,
+            minPT: 1,
+            includeReviewBeforeExam: true,
+        },
+        examBlockTemplates: [
+            {
+                id: "final_exam",
                 title: "Final Exam",
-                category: "exam",
-            }),
-            entry({
-                plan_entry_id: "locked_last_slot",
-                lesson_plan_id: "plan_final_exam_shift",
-                title: "Locked Last Slot",
-                category: "written_work",
-                scheduled_date: "2026-06-05",
-                start_time: "08:00:00",
-                end_time: "09:00:00",
-                is_locked: true,
-            }),
+                estimatedMinutes: 90,
+                subcategory: "final",
+                preferredDate: "2026-06-24",
+                required: true,
+            },
         ],
-    };
-    const result = (0, lessonPlanScheduler_1.generateSchedulePlan)(input);
-    const lockedLast = result.entries.find((e) => e.is_locked &&
-        e.title === "Locked Last Slot" &&
-        e.scheduled_date === "2026-06-05" &&
-        e.start_time === "08:00:00");
-    strict_1.default.ok(lockedLast, "Expected locked non-lesson entry on last slot.");
-    strict_1.default.equal(lockedLast?.scheduled_date, "2026-06-05");
-    strict_1.default.equal(lockedLast?.start_time, "08:00:00");
-    const finalExam = result.entries.find((e) => e.category === "exam" && e.title.toLowerCase().includes("final"));
-    strict_1.default.ok(finalExam, "Expected final exam to be present.");
-    strict_1.default.notEqual(finalExam?.scheduled_date, "2026-06-05", "Final exam should not overwrite last occupied meeting.");
-    const shiftedDiagnostic = result.diagnostics.constraints.find((d) => d.code === "FINAL_EXAM_SHIFTED");
-    strict_1.default.ok(shiftedDiagnostic, "Expected FINAL_EXAM_SHIFTED diagnostic when last meeting is occupied.");
+    });
+    const examSlot = majorTitlesBySlotDate(result.placement.slots, result.blocks).find((row) => row.type === "exam");
+    strict_1.default.ok(examSlot, "Expected the exam block to be scheduled.");
+    strict_1.default.equal(examSlot?.date, "2026-06-24", "Expected the final exam to anchor to its preferred date.");
+    strict_1.default.equal(result.validation.metrics.scheduledRequiredLessonBlocks, result.validation.metrics.totalRequiredLessons, "Expected required lessons to remain fully scheduled in the anchored exam scenario.");
+    strict_1.default.equal(result.validation.validationIssues.filter((issue) => issue.code === "VALIDATE_TERM_MISSING_EXAM").length, 0, "Expected the anchored exam scenario to keep its exam block.");
 }
-function testBlackoutDatesAreRespected() {
-    const input = {
-        lessonPlanId: "plan_blackout",
+function testHolidaySkippingAndLessonCoverage() {
+    const courseId = "course_holiday_skip";
+    const holidays = ["2026-06-10", "2026-06-12"];
+    const result = buildScenario({
+        courseId,
         startDate: "2026-06-01",
-        endDate: "2026-06-05",
-        blackoutDates: ["2026-06-03"],
-        entries: [
-            recurringRow("rec_mon", "plan_blackout", "monday", "08:00:00", "09:00:00", "lecture"),
-            recurringRow("rec_wed", "plan_blackout", "wednesday", "08:00:00", "09:00:00", "lecture"),
-            recurringRow("rec_fri", "plan_blackout", "friday", "08:00:00", "09:00:00", "lecture"),
-            entry({
-                plan_entry_id: "lesson_1",
-                lesson_plan_id: "plan_blackout",
-                title: "Lesson 1",
-                category: "lesson",
-            }),
-            entry({
-                plan_entry_id: "exam_1",
-                lesson_plan_id: "plan_blackout",
-                title: "Final Exam",
-                category: "exam",
-            }),
+        endDate: "2026-06-30",
+        schedules: [
+            { id: "mwf_am", dayOfWeek: 1, startTime: "08:00", endTime: "09:00", sessionType: "lecture" },
+            { id: "mwf_am", dayOfWeek: 3, startTime: "08:00", endTime: "09:00", sessionType: "lecture" },
+            { id: "mwf_am", dayOfWeek: 5, startTime: "08:00", endTime: "09:00", sessionType: "lecture" },
         ],
-    };
-    const result = (0, lessonPlanScheduler_1.generateSchedulePlan)(input);
-    const scheduledOnBlackout = result.entries.filter((e) => e.scheduled_date === "2026-06-03");
-    strict_1.default.equal(scheduledOnBlackout.length, 0, "Expected no entries scheduled on blackout date.");
+        tocUnits: makeTocUnits(courseId, 7),
+        teacherRules: {
+            quizMode: "hybrid",
+            quizEveryNLessons: 3,
+            writtenWorkMode: "total",
+            minWW: 2,
+            allowLessonWrittenWorkOverlay: true,
+            preferLessonWrittenWorkOverlay: true,
+            minPT: 2,
+            includeReviewBeforeExam: true,
+        },
+        examBlockTemplates: [
+            {
+                id: "final_exam",
+                title: "Final Exam",
+                estimatedMinutes: 90,
+                subcategory: "final",
+                preferredDate: "2026-06-29",
+                required: true,
+            },
+        ],
+        holidays,
+    });
+    strict_1.default.ok(result.placement.slots.every((slot) => !holidays.includes(slot.date)), "Expected holidays to be omitted from generated slots.");
+    strict_1.default.equal(result.validation.metrics.unscheduledRequiredLessonIds.length, 0, "Expected all required lessons to remain scheduled despite holidays.");
+    strict_1.default.equal(result.validation.metrics.holidayViolations, 0, "Expected no holiday violations for the holiday scenario.");
 }
-function testGeneratedEntryIdsAreUnique() {
-    const input = {
-        lessonPlanId: "plan_unique_ids",
+function testMultiTermOrdering() {
+    const courseId = "course_multiterm";
+    const result = buildScenario({
+        courseId,
         startDate: "2026-06-01",
-        endDate: "2026-06-19",
-        entries: [
-            recurringRow("rec_mon", "plan_unique_ids", "monday", "08:00:00", "10:00:00", "lecture"),
-            recurringRow("rec_wed", "plan_unique_ids", "wednesday", "08:00:00", "10:00:00", "lecture"),
-            recurringRow("rec_fri", "plan_unique_ids", "friday", "08:00:00", "10:00:00", "laboratory"),
-            ...Array.from({ length: 8 }, (_, i) => entry({
-                plan_entry_id: `lesson_${i + 1}`,
-                lesson_plan_id: "plan_unique_ids",
-                title: `Lesson ${i + 1}`,
-                category: "lesson",
-                lesson_estimated_minutes: i % 2 === 0 ? 120 : 60,
-            })),
-            entry({
-                plan_entry_id: "written_work_1",
-                lesson_plan_id: "plan_unique_ids",
-                title: "Written Work",
-                category: "written_work",
-            }),
-            entry({
-                plan_entry_id: "performance_task_1",
-                lesson_plan_id: "plan_unique_ids",
-                title: "Performance Task",
-                category: "performance_task",
-            }),
-            entry({
-                plan_entry_id: "exam_final",
-                lesson_plan_id: "plan_unique_ids",
-                title: "Final Exam",
-                category: "exam",
-            }),
+        endDate: "2026-08-07",
+        schedules: [
+            { id: "mon_am", dayOfWeek: 1, startTime: "08:00", endTime: "09:00", sessionType: "lecture" },
+            { id: "wed_am", dayOfWeek: 3, startTime: "08:00", endTime: "09:00", sessionType: "lecture" },
+            { id: "fri_lab", dayOfWeek: 5, startTime: "13:00", endTime: "14:30", sessionType: "laboratory" },
         ],
-    };
-    const result = (0, lessonPlanScheduler_1.generateSchedulePlan)(input);
-    const ids = result.entries.map((e) => e.plan_entry_id);
-    const unique = new Set(ids);
-    strict_1.default.equal(unique.size, ids.length, "Expected generated plan_entry_id values to be unique.");
+        tocUnits: makeTocUnits(courseId, 12),
+        teacherRules: {
+            quizMode: "hybrid",
+            quizEveryNLessons: 3,
+            writtenWorkMode: "total",
+            minWW: 4,
+            allowLessonWrittenWorkOverlay: true,
+            preferLessonWrittenWorkOverlay: true,
+            minPT: 3,
+            includeReviewBeforeExam: true,
+        },
+        examBlockTemplates: [
+            {
+                id: "midterm_exam",
+                title: "Midterm Exam",
+                estimatedMinutes: 90,
+                subcategory: "midterm",
+                preferredDate: "2026-07-03",
+                required: true,
+            },
+            {
+                id: "final_exam",
+                title: "Final Exam",
+                estimatedMinutes: 90,
+                subcategory: "final",
+                preferredDate: "2026-08-07",
+                required: true,
+            },
+        ],
+    });
+    strict_1.default.equal(result.pacingPlan.terms.length, 2, "Expected two pacing-plan terms.");
+    strict_1.default.equal(result.validation.metrics.termCount, 2, "Expected validation to detect two terms.");
+    strict_1.default.equal(result.validation.metrics.scheduledRequiredLessonBlocks, result.validation.metrics.totalRequiredLessons, "Expected all required lessons to remain scheduled across both terms.");
+    strict_1.default.equal(result.validation.validationIssues.filter((issue) => issue.code === "VALIDATE_TERM_MISSING_EXAM").length, 0, "Expected each term to retain an exam block.");
 }
 function run() {
-    testLockedMultiSlotPlacement();
-    testFinalExamDoesNotOverwriteLastOccupiedMeeting();
-    testBlackoutDatesAreRespected();
-    testGeneratedEntryIdsAreUnique();
-    console.log("scheduler invariants: all checks passed");
+    testPreferredExamDateAnchoring();
+    testHolidaySkippingAndLessonCoverage();
+    testMultiTermOrdering();
+    console.log("scheduler invariants: current algorithm checks passed");
 }
 run();

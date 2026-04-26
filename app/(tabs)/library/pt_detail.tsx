@@ -66,10 +66,22 @@ function toTitleCase(value: string | null) {
 
 export default function PerformanceTaskDetailScreen() {
   const { colors: c, scheme } = useAppTheme();
-  const params = useLocalSearchParams<{ planEntryId?: string | string[] }>();
+  const params = useLocalSearchParams<{ planEntryId?: string | string[]; subjectId?: string | string[] }>();
   const planEntryId = useMemo(() => readParam(params.planEntryId), [params.planEntryId]);
+  const subjectId = useMemo(() => readParam(params.subjectId), [params.subjectId]);
   const [loading, setLoading] = useState(true);
   const [entry, setEntry] = useState<PerformanceTaskDetail | null>(null);
+
+  const handleBack = useCallback(() => {
+    if (subjectId) {
+      router.replace({
+        pathname: "/library/subject_detail",
+        params: { subjectId },
+      });
+      return;
+    }
+    router.back();
+  }, [subjectId]);
 
   const loadEntry = useCallback(async () => {
     if (!planEntryId) {
@@ -140,9 +152,8 @@ export default function PerformanceTaskDetailScreen() {
   if (!entry) {
     return (
       <View style={[styles.center, { backgroundColor: pageBg }]}>
-        <Pressable style={styles.backBtn} onPress={() => router.back()}>
+        <Pressable style={styles.backBtn} onPress={handleBack}>
           <Ionicons name="arrow-back" size={18} color={c.text} />
-          <Text style={[styles.backText, { color: c.text }]}>Back</Text>
         </Pressable>
         <Text style={[styles.emptyText, { color: c.text }]}>Performance task not found.</Text>
       </View>
@@ -155,9 +166,8 @@ export default function PerformanceTaskDetailScreen() {
         contentContainerStyle={styles.content}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={c.text} />}
       >
-        <Pressable style={styles.backBtn} onPress={() => router.back()}>
+        <Pressable style={styles.backBtn} onPress={handleBack}>
           <Ionicons name="arrow-back" size={18} color={c.text} />
-          <Text style={[styles.backText, { color: c.text }]}>Back to Subject</Text>
         </Pressable>
 
         <View style={[styles.heroCard, { backgroundColor: cardBg, borderColor: c.border }]}>
@@ -201,12 +211,7 @@ const styles = StyleSheet.create({
   backBtn: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 8,
     alignSelf: "flex-start",
-  },
-  backText: {
-    ...Typography.body,
-    fontWeight: "600",
   },
   heroCard: {
     borderWidth: 1,

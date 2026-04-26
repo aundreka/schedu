@@ -1,12 +1,1 @@
-in [index.tsx](app/(tabs\)/calendar/index.tsx), fix the following errors in repopulate logic:
-1. as seen in the screenshot, the first slot contains orientation but also contains ww1, and pt1. there should NEVER BE a pt/ww BEFORE the first lesson of each term.
-2. also as seen in the screenshot, the last quiz of the prelim term  was not swapped with the lessons after it.
-
-
-
-fix the following errors in daily view UI:
-1. make sure that the chips only contain the acronym. (ex. L1, WW1, Q2), and that no content is cut off from the card and that everything is centered vertically even if the time low. right now the blocks arent visible, refer to screenshot
-2. some lesson chips lead to edit lesson. remove edit lesson entirely this is unecessary since we can delete and move the block trhough other means. 
-3. when adding a block, block type should be chips that become highoighted when selected. start and end time should automatically be the time of the slot, or if the slot is full then right after the slot, or if there is no slot for that day then no seeded time. remove the subheader when adding a block. 
-please fix these
-
+the lesson blocks in daily view are not redirecting to lesson_detail.tsx/library/lesson_detail.tsx) when clicked. also modify the ordering of blocks in daily view so that buffer blocks are always in front of the slot

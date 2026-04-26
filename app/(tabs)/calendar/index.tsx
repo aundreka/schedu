@@ -17,6 +17,7 @@ import {
   Text,
   TextInput,
   UIManager,
+  LayoutAnimation,
   type ViewStyle,
   View
 } from "react-native";
@@ -68,6 +69,7 @@ type PlanEntry = {
   plan_entry_id: string;
   lesson_plan_id: string;
   title: string;
+  subtitle?: string | null;
   category: string;
   description: string | null;
   scheduled_date: string | null;
@@ -90,6 +92,22 @@ type PlanEntry = {
   slot_id?: string | null;
   order_no?: number | null;
 };
+
+function compareEntriesChronologically(a: PlanEntry, b: PlanEntry) {
+  const aDate = a.scheduled_date || "9999-99-99";
+  const bDate = b.scheduled_date || "9999-99-99";
+  if (aDate !== bDate) return aDate.localeCompare(bDate);
+  const aTime = a.start_time || "99:99:99";
+  const bTime = b.start_time || "99:99:99";
+  if (aTime !== bTime) return aTime.localeCompare(bTime);
+  const aSlot = Number(a.slot_number ?? 0);
+  const bSlot = Number(b.slot_number ?? 0);
+  if (aSlot !== bSlot) return aSlot - bSlot;
+  const aOrder = Number(a.order_no ?? 0);
+  const bOrder = Number(b.order_no ?? 0);
+  if (aOrder !== bOrder) return aOrder - bOrder;
+  return a.plan_entry_id.localeCompare(b.plan_entry_id);
+}
 
 type CalendarConstraint = {
   code: string;
@@ -131,6 +149,7 @@ type EntryEditorState = {
   description: string;
   category: string;
   subtype: string;
+  customSubtype: string;
   startDate: string;
   endDate: string;
   startTime: string;
@@ -151,6 +170,8 @@ type DailyTimeEditState = {
   startMinutes: number;
   endMinutes: number;
 };
+
+type CreateDropdownField = "category" | "subtype" | "startTime" | "endTime" | null;
 
 const DAYS_SHORT = ["S", "M", "T", "W", "T", "F", "S"] as const;
 const MONTHS_LONG = [
@@ -388,7 +409,12 @@ function DailyTimeAdjustableCard({
   return (
     <View style={styles.dailyTimeAdjustWrap}>
       {active ? <View style={styles.dailyTimeDragSurface} {...dragResponder.panHandlers} /> : null}
-      <Pressable onLongPress={onActivate} delayLongPress={220} onPress={onPress}>
+      <Pressable
+        style={styles.dailyTimePressable}
+        onLongPress={onActivate}
+        delayLongPress={220}
+        onPress={onPress}
+      >
         {children}
       </Pressable>
       {active ? <View style={styles.dailyTimeResizeHandleTop} {...topResponder.panHandlers} /> : null}
@@ -467,24 +493,45 @@ function longDateTitle(iso: string) {
 }
 
 function entrySort(a: PlanEntry, b: PlanEntry) {
-  const priority: Record<string, number> = {
-    lesson: 0,
-    written_work: 1,
-    performance_task: 2,
-    buffer: 3,
-    exam: 4,
-  };
-  const pa = priority[a.category] ?? 99;
-  const pb = priority[b.category] ?? 99;
-  if (pa !== pb) return pa - pb;
   const aTime = a.start_time || "99:99:99";
   const bTime = b.start_time || "99:99:99";
   if (aTime !== bTime) return aTime.localeCompare(bTime);
+  const rankDiff =
+    getDailyBlockOrderRank({
+      category: a.category,
+      subcategory: a.session_subcategory,
+      orderNo: a.order_no,
+      title: a.title,
+    }) -
+    getDailyBlockOrderRank({
+      category: b.category,
+      subcategory: b.session_subcategory,
+      orderNo: b.order_no,
+      title: b.title,
+    });
+  if (rankDiff !== 0) return rankDiff;
+  const orderDiff = Number(a.order_no ?? 0) - Number(b.order_no ?? 0);
+  if (orderDiff !== 0) return orderDiff;
   return a.title.localeCompare(b.title);
 }
 
 function getEntryColor(category: string) {
   return CATEGORY_STYLE[category]?.color ?? "#B6C0CC";
+}
+
+function getDailyBlockOrderRank(block: {
+  category?: string | null;
+  subcategory?: string | null;
+  orderNo?: number | null;
+  title?: string | null;
+}) {
+  if (block.category === "lesson") return 0;
+  if (block.category === "exam") return 1;
+  if (block.category === "written_work" && block.subcategory === "quiz") return 2;
+  if (block.category === "written_work") return 3;
+  if (block.category === "performance_task") return 4;
+  if (block.category === "buffer") return 5;
+  return 9;
 }
 
 function getChipLabel(entry: PlanEntry) {
@@ -493,6 +540,20 @@ function getChipLabel(entry: PlanEntry) {
     return matched ? matched[0].replace(/\s+/g, " ") : "L";
   }
   return CATEGORY_STYLE[entry.category]?.chipLabel ?? "PL";
+}
+
+function getDailyMetaLabel(entry: PlanEntry) {
+  if (entry.category === "lesson") return "";
+  return formatEditorChoiceLabel(entry.category || "");
+}
+
+function getDailyPrimaryLabel(entry: PlanEntry) {
+  if (entry.category === "lesson") return entry.title;
+  const orderMatch = entry.title.match(/(\d+)\s*$/);
+  const order = orderMatch?.[1] ?? "";
+  const subtypeSource = entry.session_subcategory ?? entry.ww_subtype ?? entry.pt_subtype ?? "";
+  const subtype = formatEditorChoiceLabel(subtypeSource);
+  return order && subtype ? `${subtype} ${order}` : subtype || entry.title;
 }
 
 function getDailySlotCardStyle(slot: ScheduledCalendarSlot, isDark: boolean, defaultCardBg: string) {
@@ -513,18 +574,26 @@ function buildAutoBlockIdentity(input: {
 }) {
   const metadata = input.metadata ?? {};
   const title = (input.title ?? "").trim();
+  const extraCandidateType =
+    typeof metadata.extraCandidateType === "string" ? metadata.extraCandidateType : null;
   const lessonTitleOrder = title.match(/(?:^L|lesson\s*)(\d+)$/i)?.[1] ?? null;
-  const quizTitleOrder = title.match(/(?:^Q|quiz\s*)(\d+)$/i)?.[1] ?? null;
-  const wwTitleOrder = title.match(/(?:^WW|written\s*work\s*)(\d+)$/i)?.[1] ?? null;
-  const ptTitleOrder = title.match(/(?:^PT|performance\s*task\s*)(\d+)$/i)?.[1] ?? null;
+  const quizTitleOrder = title.match(/(?:^|:\s*)(?:Q|quiz\s*)(\d+)/i)?.[1] ?? null;
+  const wwTitleOrder = title.match(/(?:^WW|written\s*work\s*)(\d+)/i)?.[1] ?? null;
+  const ptTitleOrder = title.match(/(?:^PT|performance\s*task\s*)(\d+)/i)?.[1] ?? null;
   if (input.category === "lesson") {
+    const globalOrder = Number(metadata.globalLessonOrder ?? metadata.lessonOrder ?? lessonTitleOrder ?? 0);
+    if (extraCandidateType) {
+      return globalOrder > 0
+        ? `lesson|extra|${extraCandidateType}|${globalOrder}`
+        : `lesson|extra|${extraCandidateType}|${input.sourceTocId ?? input.lessonId ?? title.toLowerCase()}`;
+    }
+    if (globalOrder > 0) return `lesson|order|${globalOrder}`;
     const source =
       input.sourceTocId ??
       input.lessonId ??
       (typeof metadata.sourceTocId === "string" ? metadata.sourceTocId : null) ??
-      lessonTitleOrder ??
-      String(metadata.globalLessonOrder ?? metadata.lessonOrder ?? "");
-    return source ? `lesson|${source}` : null;
+      null;
+    return source ? `lesson|source|${source}` : null;
   }
   if (input.category === "written_work" && input.subcategory === "quiz") {
     const order = Number(metadata.globalQuizOrder ?? metadata.quizOrder ?? quizTitleOrder ?? 0);
@@ -532,10 +601,16 @@ function buildAutoBlockIdentity(input: {
   }
   if (input.category === "written_work") {
     const order = Number(metadata.globalWwOrder ?? metadata.wwOrder ?? wwTitleOrder ?? 0);
+    if (extraCandidateType) {
+      return order > 0 ? `ww|extra|${extraCandidateType}|${order}` : `ww|extra|${extraCandidateType}`;
+    }
     return order > 0 ? `ww|${order}` : null;
   }
   if (input.category === "performance_task") {
     const order = Number(metadata.globalPtOrder ?? metadata.ptOrder ?? ptTitleOrder ?? 0);
+    if (extraCandidateType) {
+      return order > 0 ? `pt|extra|${extraCandidateType}|${order}` : `pt|extra|${extraCandidateType}`;
+    }
     return order > 0 ? `pt|${order}` : null;
   }
   if (input.category === "exam") {
@@ -548,6 +623,103 @@ function buildAutoBlockIdentity(input: {
   return null;
 }
 
+function getWrittenWorkSubtypeCode(subcategory?: string | null) {
+  if (subcategory === "quiz") return "Q";
+  if (subcategory === "seatwork") return "SW";
+  return "AS";
+}
+
+function getPerformanceTaskSubtypeCode(subcategory?: string | null) {
+  if (subcategory === "lab_report") return "LR";
+  if (subcategory === "reporting") return "REP";
+  if (subcategory === "project") return "PROJ";
+  return "ACT";
+}
+
+function getDisplayLabelsForBlockLike(input: {
+  title: string;
+  category?: string | null;
+  subcategory?: string | null;
+  metadata?: Record<string, unknown> | null;
+}) {
+  const metadata = input.metadata ?? {};
+  if (input.category === "lesson") {
+    const lessonOrder = Number(metadata.globalLessonOrder ?? metadata.lessonOrder ?? 0);
+    const lessonTitle =
+      typeof metadata.lessonTitle === "string" && metadata.lessonTitle.trim()
+        ? metadata.lessonTitle.trim()
+        : input.title.trim();
+    return { title: lessonTitle, subtitle: lessonOrder > 0 ? `L${lessonOrder}` : null as string | null };
+  }
+  if (input.category === "written_work" && input.subcategory === "quiz") {
+    const quizOrder = Number(metadata.globalQuizOrder ?? metadata.quizOrder ?? 0);
+    const wwOrder = Number(metadata.globalWwOrder ?? 0);
+    if (quizOrder > 0 && wwOrder > 0) return { title: `Q${quizOrder}`, subtitle: `WW${wwOrder}` };
+  }
+  if (input.category === "written_work") {
+    const wwOrder = Number(metadata.globalWwOrder ?? metadata.wwOrder ?? 0);
+    if (wwOrder > 0) {
+      return { title: `${getWrittenWorkSubtypeCode(input.subcategory)}${wwOrder}`, subtitle: `WW${wwOrder}` };
+    }
+  }
+  if (input.category === "performance_task") {
+    const ptOrder = Number(metadata.globalPtOrder ?? metadata.ptOrder ?? 0);
+    if (ptOrder > 0) {
+      return { title: `${getPerformanceTaskSubtypeCode(input.subcategory)}${ptOrder}`, subtitle: `PT${ptOrder}` };
+    }
+  }
+  const canonical = getCanonicalAutoBlockTitle({
+    category: input.category,
+    subcategory: input.subcategory,
+    metadata: input.metadata,
+    fallbackTitle: input.title,
+  }).trim();
+  return { title: canonical || input.title.trim(), subtitle: null as string | null };
+}
+
+function applyEntryDisplayOrders(entries: PlanEntry[]) {
+  const chronologicalEntries = [...entries].sort(compareEntriesChronologically);
+  const writtenSubtypeCounts = new Map<string, number>();
+  const performanceSubtypeCounts = new Map<string, number>();
+  let writtenCount = 0;
+  let performanceCount = 0;
+  const relabeledByKey = new Map<string, PlanEntry>();
+
+  for (const entry of chronologicalEntries) {
+    if (entry.category === "written_work") {
+      const code = getWrittenWorkSubtypeCode(entry.session_subcategory ?? entry.ww_subtype ?? "assignment");
+      const subtypeCount = (writtenSubtypeCounts.get(code) ?? 0) + 1;
+      writtenSubtypeCounts.set(code, subtypeCount);
+      writtenCount += 1;
+      relabeledByKey.set(`${entry.plan_entry_id}|${entry.scheduled_date ?? ""}`, {
+        ...entry,
+        title: `${code}${subtypeCount}`,
+        subtitle: `WW${writtenCount}`,
+      });
+      continue;
+    }
+
+    if (entry.category === "performance_task") {
+      const code = getPerformanceTaskSubtypeCode(
+        entry.session_subcategory ?? entry.pt_subtype ?? inferPerformanceTaskSubtype(entry.title, entry.description ?? null)
+      );
+      const subtypeCount = (performanceSubtypeCounts.get(code) ?? 0) + 1;
+      performanceSubtypeCounts.set(code, subtypeCount);
+      performanceCount += 1;
+      relabeledByKey.set(`${entry.plan_entry_id}|${entry.scheduled_date ?? ""}`, {
+        ...entry,
+        title: `${code}${subtypeCount}`,
+        subtitle: `PT${performanceCount}`,
+      });
+      continue;
+    }
+
+    relabeledByKey.set(`${entry.plan_entry_id}|${entry.scheduled_date ?? ""}`, entry);
+  }
+
+  return entries.map((entry) => relabeledByKey.get(`${entry.plan_entry_id}|${entry.scheduled_date ?? ""}`) ?? entry);
+}
+
 function getCanonicalAutoBlockTitle(input: {
   category?: string | null;
   subcategory?: string | null;
@@ -555,21 +727,40 @@ function getCanonicalAutoBlockTitle(input: {
   fallbackTitle: string;
 }) {
   const metadata = input.metadata ?? {};
+  const extraCandidateType =
+    typeof metadata.extraCandidateType === "string" ? metadata.extraCandidateType : null;
   if (input.category === "lesson") {
     const globalOrder = Number(metadata.globalLessonOrder ?? metadata.lessonOrder ?? 0);
+    if (extraCandidateType === "lesson_extension") {
+      return globalOrder > 0 ? `L${globalOrder} Extension` : input.fallbackTitle;
+    }
     return globalOrder > 0 ? `L${globalOrder}` : input.fallbackTitle;
   }
   if (input.category === "written_work" && input.subcategory === "quiz") {
     const quizOrder = Number(metadata.globalQuizOrder ?? metadata.quizOrder ?? 0);
-    return quizOrder > 0 ? `Q${quizOrder}` : input.fallbackTitle;
+    const wwOrder = Number(metadata.globalWwOrder ?? 0);
+    return quizOrder > 0 && wwOrder > 0 ? `WW${wwOrder}: Q${quizOrder}` : input.fallbackTitle;
   }
   if (input.category === "written_work") {
     const wwOrder = Number(metadata.globalWwOrder ?? metadata.wwOrder ?? 0);
-    return wwOrder > 0 ? `WW${wwOrder}` : input.fallbackTitle;
+    if (extraCandidateType === "extra_written_work") {
+      return "Additional Written Work";
+    }
+    return wwOrder > 0
+      ? `WW${wwOrder}: ${getWrittenWorkSubtypeCode(input.subcategory)}${wwOrder}`
+      : input.fallbackTitle;
   }
   if (input.category === "performance_task") {
     const ptOrder = Number(metadata.globalPtOrder ?? metadata.ptOrder ?? 0);
-    return ptOrder > 0 ? `PT${ptOrder}` : input.fallbackTitle;
+    if (extraCandidateType === "pt_extension") {
+      return ptOrder > 0 ? `PT${ptOrder} Extension` : input.fallbackTitle;
+    }
+    if (extraCandidateType === "extra_performance_task") {
+      return "Additional Performance Task";
+    }
+    return ptOrder > 0
+      ? `PT${ptOrder}: ${getPerformanceTaskSubtypeCode(input.subcategory)}${ptOrder}`
+      : input.fallbackTitle;
   }
   if (input.category === "buffer") {
     if (metadata.extraCandidateType === "review_before_quiz") {
@@ -586,20 +777,10 @@ function getCanonicalAutoBlockTitle(input: {
 }
 
 function getMonthlyPreviewTitle(entry: PlanEntry) {
-  const raw = entry.title.trim();
-  const compactMatch = raw.match(/^(L|WW|PT|Q)\s*(\d+)$/i);
-  if (compactMatch) {
-    return `${compactMatch[1].toUpperCase()}${compactMatch[2]}`;
+  if (entry.category === "lesson") {
+    return entry.subtitle?.trim() || "Lesson";
   }
-  const lessonMatch = raw.match(/lesson\s*(\d+)/i);
-  if (lessonMatch) return `L${lessonMatch[1]}`;
-  const wwMatch = raw.match(/written\s*work\s*(\d+)/i);
-  if (wwMatch) return `WW${wwMatch[1]}`;
-  const quizMatch = raw.match(/quiz\s*(\d+)/i);
-  if (quizMatch) return `Q${quizMatch[1]}`;
-  const ptMatch = raw.match(/performance\s*task\s*(\d+)/i);
-  if (ptMatch) return `PT${ptMatch[1]}`;
-  return raw;
+  return entry.title.trim();
 }
 
 function getTermRequirementOffsets(blockRows: PlanBlockRow[]) {
@@ -719,6 +900,10 @@ function canonicalizeLoadedPlanBlocks(blockRows: PlanBlockRow[]) {
       if (normalizedOrder > 0) {
         metadata.quizOrder = normalizedOrder;
         metadata.globalQuizOrder = normalizedOrder;
+        const localQuizOrder =
+          Number(metadata.termQuizOrder ?? 0) > 0 ? Number(metadata.termQuizOrder ?? 0) : normalizedOrder - termOffsets.quiz;
+        metadata.globalWwOrder =
+          termOffsets.ww + Math.max(0, expectedWW - expectedQuiz) + Math.max(1, localQuizOrder);
       }
     }
 
@@ -765,6 +950,7 @@ function buildSyntheticRequiredTermBlocks(input: {
   const expectedWW = Math.max(0, Number(examMetadata.termWW ?? 0));
   const expectedPT = Math.max(0, Number(examMetadata.termPT ?? 0));
   const expectedQuiz = Math.max(0, Number(examMetadata.termQuizAmount ?? 0));
+  const expectedNonQuizWW = Math.max(0, expectedWW - expectedQuiz);
 
   const lessonTemplate =
     input.currentTermBlocks.find((block) => block.type === "lesson" && !block.metadata.extraCandidateType) ?? null;
@@ -899,7 +1085,7 @@ function buildSyntheticRequiredTermBlocks(input: {
     });
   }
 
-  for (let localOrder = 1; localOrder <= expectedWW; localOrder += 1) {
+  for (let localOrder = 1; localOrder <= expectedNonQuizWW; localOrder += 1) {
     const globalOrder = termOffsets.ww + localOrder;
     if (existingWW.has(globalOrder)) continue;
     synthesized.push({
@@ -927,6 +1113,7 @@ function buildSyntheticRequiredTermBlocks(input: {
 
   for (let localOrder = 1; localOrder <= expectedQuiz; localOrder += 1) {
     const globalOrder = termOffsets.quiz + localOrder;
+    const wwDisplayOrder = termOffsets.ww + expectedNonQuizWW + localOrder;
     if (existingQuiz.has(globalOrder)) continue;
     synthesized.push({
       id: `quiz__repopulate__${input.lessonPlanId}__${termKey}_${input.termIndex + 1}__${localOrder}`,
@@ -945,6 +1132,7 @@ function buildSyntheticRequiredTermBlocks(input: {
         termKey,
         quizOrder: globalOrder,
         globalQuizOrder: globalOrder,
+        globalWwOrder: wwDisplayOrder,
         termQuizOrder: localOrder,
         lowPriority: false,
       },
@@ -960,21 +1148,34 @@ function getDisplayTitleForBlockLike(input: {
   subcategory?: string | null;
   metadata?: Record<string, unknown> | null;
 }) {
-  return getCanonicalAutoBlockTitle({
-    category: input.category,
-    subcategory: input.subcategory,
-    metadata: input.metadata,
-    fallbackTitle: input.title,
-  });
+  return getDisplayLabelsForBlockLike(input).title;
 }
 
-function getLibraryRouteForEntry(entry: PlanEntry, subjectId: string | null | undefined) {
+function getDisplaySubtitleForBlockLike(input: {
+  title: string;
+  category?: string | null;
+  subcategory?: string | null;
+  metadata?: Record<string, unknown> | null;
+}) {
+  return getDisplayLabelsForBlockLike(input).subtitle;
+}
+
+function getDailyDisplayTitleForBlockLike(input: {
+  title: string;
+  category?: string | null;
+  subcategory?: string | null;
+  metadata?: Record<string, unknown> | null;
+}) {
+  return getDisplayTitleForBlockLike(input).trim() || input.title.trim();
+}
+
+function getLibraryRouteForEntry(entry: PlanEntry, subjectId?: string | null) {
   if (entry.category === "lesson" && entry.lesson_id) {
     return {
       pathname: "/library/lesson_detail" as const,
       params: {
         lessonId: entry.lesson_id,
-        subjectId: subjectId ?? undefined,
+        ...(subjectId ? { subjectId } : {}),
       },
     };
   }
@@ -983,6 +1184,16 @@ function getLibraryRouteForEntry(entry: PlanEntry, subjectId: string | null | un
       pathname: "/library/ww_detail" as const,
       params: {
         planEntryId: entry.plan_entry_id,
+        ...(subjectId ? { subjectId } : {}),
+      },
+    };
+  }
+  if (entry.category === "exam") {
+    return {
+      pathname: "/library/ww_detail" as const,
+      params: {
+        planEntryId: entry.plan_entry_id,
+        ...(subjectId ? { subjectId } : {}),
       },
     };
   }
@@ -991,6 +1202,7 @@ function getLibraryRouteForEntry(entry: PlanEntry, subjectId: string | null | un
       pathname: "/library/pt_detail" as const,
       params: {
         planEntryId: entry.plan_entry_id,
+        ...(subjectId ? { subjectId } : {}),
       },
     };
   }
@@ -1076,21 +1288,45 @@ function subtypesForCategory(category: string) {
   if (category === "written_work") return ["assignment", "seatwork", "quiz"];
   if (category === "performance_task") return ["activity", "lab_report", "reporting", "project"];
   if (category === "exam") return ["prelim", "midterm", "final"];
-  if (category === "buffer") return ["review", "preparation", "other"];
+  if (category === "buffer") return ["review", "preparation", "orientation", "other"];
   return [];
+}
+
+function createModeSubtypesForCategory(category: string) {
+  const base = subtypesForCategory(category);
+  if (base.length === 0) return [];
+  if (base.includes("other")) return base;
+  return [...base, "other"];
+}
+
+function formatEditorChoiceLabel(value: string) {
+  if (!value) return "";
+  return value
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function getStoredSubtypeForCreate(category: string, subtype: string) {
+  if (subtype !== "other") return subtype;
+  if (category === "lesson") return "lecture";
+  if (category === "written_work") return "assignment";
+  if (category === "performance_task") return "activity";
+  if (category === "exam") return "final";
+  if (category === "buffer") return "other";
+  return "";
 }
 
 function buildPlanEntriesFromScheduledSlots(slots: ScheduledCalendarSlot[]): PlanEntry[] {
   return slots.flatMap((slot) =>
     slot.blocks.map((block) => ({
-      plan_entry_id: block.blockId,
-      lesson_plan_id: block.lessonPlanId,
-      title: getDisplayTitleForBlockLike({
+      ...getDisplayLabelsForBlockLike({
         title: block.title,
         category: block.category,
         subcategory: block.subcategory,
         metadata: block.metadata,
       }),
+      plan_entry_id: block.blockId,
+      lesson_plan_id: block.lessonPlanId,
       category: block.category,
       description: block.description,
       scheduled_date: block.scheduledDate,
@@ -1180,7 +1416,14 @@ function buildTocUnitsFromBlockRows(lessonPlanId: string, blockRows: PlanBlockRo
   const deduped = new Map<string, TOCUnit>();
 
   requiredLessons.forEach((block, index) => {
+    const lessonOrder =
+      typeof block.metadata?.globalLessonOrder === "number"
+        ? Number(block.metadata.globalLessonOrder)
+        : typeof block.metadata?.lessonOrder === "number"
+          ? Number(block.metadata.lessonOrder)
+          : inferLessonOrder(block.title, index + 1);
     const sourceId =
+      (lessonOrder > 0 ? `lesson_order_${lessonOrder}` : null) ||
       (typeof block.metadata?.sourceTocId === "string" && block.metadata.sourceTocId) ||
       block.lesson_id ||
       block.block_key ||
@@ -1200,10 +1443,7 @@ function buildTocUnitsFromBlockRows(lessonPlanId: string, blockRows: PlanBlockRo
       chapterId: typeof block.metadata?.chapterId === "string" ? block.metadata.chapterId : null,
       chapterTitle: typeof block.metadata?.chapterTitle === "string" ? block.metadata.chapterTitle : null,
       title: block.title,
-      order:
-        typeof block.metadata?.lessonOrder === "number"
-          ? Number(block.metadata.lessonOrder)
-          : inferLessonOrder(block.title, index + 1),
+      order: lessonOrder,
       estimatedMinutes: Math.max(30, Number(block.estimated_minutes ?? 60)),
       difficulty,
       preferredSessionType: inferSessionType(block.preferred_session_type ?? block.meeting_type),
@@ -1212,6 +1452,50 @@ function buildTocUnitsFromBlockRows(lessonPlanId: string, blockRows: PlanBlockRo
   });
 
   return Array.from(deduped.values()).sort((a, b) => a.order - b.order);
+}
+
+function dedupeCurrentTermBlocks(blocks: Block[]) {
+  const blockRank = (block: Block) => {
+    let score = 0;
+    if (block.sourceTocId) score += 4;
+    if (typeof block.metadata.globalLessonOrder === "number" || typeof block.metadata.lessonOrder === "number") score += 2;
+    if (block.type === "exam") score += 1;
+    return score;
+  };
+
+  const kept: Block[] = [];
+  const seen = new Map<string, Block>();
+
+  for (const block of blocks) {
+    if (Boolean(block.metadata.extraCandidateType)) {
+      kept.push(block);
+      continue;
+    }
+    const identity = buildAutoBlockIdentity({
+      category: block.type,
+      subcategory: block.subcategory,
+      sourceTocId: block.sourceTocId ?? null,
+      metadata: block.metadata,
+      title: block.title,
+    });
+    if (!identity) {
+      kept.push(block);
+      continue;
+    }
+    const existing = seen.get(identity) ?? null;
+    if (!existing) {
+      seen.set(identity, block);
+      kept.push(block);
+      continue;
+    }
+    if (blockRank(block) > blockRank(existing)) {
+      const existingIndex = kept.findIndex((candidate) => candidate.id === existing.id);
+      if (existingIndex >= 0) kept[existingIndex] = block;
+      seen.set(identity, block);
+    }
+  }
+
+  return kept;
 }
 
 function buildExamTemplatesFromBlockRows(blockRows: PlanBlockRow[]): ExamBlockTemplate[] {
@@ -1639,17 +1923,18 @@ function normalizeTermPlacements(termSlots: SessionSlot[], termBlocks: Block[]) 
     return (a.startTime ?? "").localeCompare(b.startTime ?? "");
   });
   const blockMap = buildBlockMap(termBlocks);
-  const moveMajorBlockToIndex = (blockId: string, targetIndex: number) => {
-    const currentIndex = sortedTermSlots.findIndex(
+  const moveMajorBlockStepwiseToIndex = (blockId: string, targetIndex: number) => {
+    let currentIndex = sortedTermSlots.findIndex(
       (slot) => getMajorPlacement(slot)?.blockId === blockId
     );
-    if (
-      currentIndex >= 0 &&
-      targetIndex >= 0 &&
-      targetIndex < sortedTermSlots.length &&
-      currentIndex !== targetIndex
-    ) {
-      swapMajorPlacements(sortedTermSlots, currentIndex, targetIndex);
+    if (currentIndex < 0 || targetIndex < 0 || targetIndex >= sortedTermSlots.length) return;
+    while (currentIndex < targetIndex) {
+      if (!swapMajorPlacements(sortedTermSlots, currentIndex, currentIndex + 1)) break;
+      currentIndex += 1;
+    }
+    while (currentIndex > targetIndex) {
+      if (!swapMajorPlacements(sortedTermSlots, currentIndex, currentIndex - 1)) break;
+      currentIndex -= 1;
     }
   };
 
@@ -1676,7 +1961,7 @@ function normalizeTermPlacements(termSlots: SessionSlot[], termBlocks: Block[]) 
         (slot) => getMajorPlacement(slot)?.blockId === targetBlock.id
       );
       if (currentIndex >= 0 && currentIndex !== slotIndex) {
-        swapMajorPlacements(sortedTermSlots, currentIndex, slotIndex);
+        moveMajorBlockStepwiseToIndex(targetBlock.id, slotIndex);
       }
     });
   };
@@ -1724,7 +2009,20 @@ function normalizeTermPlacements(termSlots: SessionSlot[], termBlocks: Block[]) 
     }
   };
 
-  reorderMajorsByKey((block) => block.type === "lesson", "lessonOrder");
+  const findNextNonExamMajorCarrierIndex = (startIndex: number) => {
+    for (let index = Math.max(0, startIndex); index < sortedTermSlots.length; index += 1) {
+      const major = getMajorPlacement(sortedTermSlots[index]!);
+      const block = major ? blockMap.get(major.blockId) ?? null : null;
+      if (block?.type === "exam") continue;
+      return index;
+    }
+    return -1;
+  };
+
+  reorderMajorsByKey(
+    (block) => block.type === "lesson" && !block.metadata.extraCandidateType,
+    "lessonOrder"
+  );
   reorderMajorsByKey((block) => block.type === "performance_task" && !block.metadata.extraCandidateType, "ptOrder");
   reorderMajorsByKey((block) => block.type === "written_work" && block.subcategory === "quiz", "quizOrder");
   reorderMinorByKey((block) => block.type === "written_work" && block.subcategory !== "quiz", "wwOrder");
@@ -1758,6 +2056,43 @@ function normalizeTermPlacements(termSlots: SessionSlot[], termBlocks: Block[]) 
     swapMajorPlacements(sortedTermSlots, currentFirstLessonIndex, desiredFirstLessonIndex);
   }
 
+  let normalizedFirstLessonIndex =
+    firstLesson ? sortedTermSlots.findIndex((slot) => getMajorPlacement(slot)?.blockId === firstLesson.id) : -1;
+  if (normalizedFirstLessonIndex > 0) {
+    for (let index = normalizedFirstLessonIndex - 1; index >= 0; index -= 1) {
+      const major = getMajorPlacement(sortedTermSlots[index]!);
+      const block = major ? blockMap.get(major.blockId) ?? null : null;
+      if (
+        block?.type === "performance_task" ||
+        (block?.type === "written_work" && block.subcategory === "quiz")
+      ) {
+        swapMajorPlacements(sortedTermSlots, index, index + 1);
+        normalizedFirstLessonIndex -= 1;
+      }
+    }
+  }
+  if (normalizedFirstLessonIndex >= 0) {
+    const wwBlocksToMove: Block[] = [];
+    for (let index = 0; index < normalizedFirstLessonIndex; index += 1) {
+      const slot = sortedTermSlots[index]!;
+      const movedPlacements = slot.placements.filter((placement) => {
+        const block = blockMap.get(placement.blockId) ?? null;
+        return block?.type === "written_work" && block.subcategory !== "quiz" && !block.metadata.extraCandidateType;
+      });
+      if (movedPlacements.length === 0) continue;
+      slot.placements = slot.placements.filter((placement) => !movedPlacements.includes(placement));
+      movedPlacements.forEach((placement) => {
+        const block = blockMap.get(placement.blockId) ?? null;
+        if (block) wwBlocksToMove.push(block);
+      });
+    }
+    for (const block of wwBlocksToMove) {
+      const targetIndex = findNextNonExamMajorCarrierIndex(normalizedFirstLessonIndex);
+      if (targetIndex < 0) break;
+      addRecoveredPlacement(sortedTermSlots[targetIndex]!, block, "minor");
+    }
+  }
+
   const examIndex = sortedTermSlots.findIndex((slot) => {
     const major = getMajorPlacement(slot);
     const block = major ? blockMap.get(major.blockId) ?? null : null;
@@ -1773,33 +2108,35 @@ function normalizeTermPlacements(termSlots: SessionSlot[], termBlocks: Block[]) 
     .sort((a, b) => Number(a.metadata.quizOrder ?? 0) - Number(b.metadata.quizOrder ?? 0));
   const finalQuiz = quizBlocks[quizBlocks.length - 1] ?? null;
   if (examIndex > 0 && finalQuiz) {
-    const latestQuizIndex = examReviewIndex === examIndex - 1 ? examIndex - 2 : examIndex - 1;
-    if (latestQuizIndex >= 0) {
-      moveMajorBlockToIndex(finalQuiz.id, latestQuizIndex);
+    const targetFinalQuizIndex = examReviewIndex === examIndex - 1 ? examIndex - 2 : examIndex - 1;
+    if (targetFinalQuizIndex >= 0) {
+      moveMajorBlockStepwiseToIndex(finalQuiz.id, targetFinalQuizIndex);
     }
 
-    let currentQuizIndex = sortedTermSlots.findIndex(
-      (slot) => getMajorPlacement(slot)?.blockId === finalQuiz.id
-    );
-    if (currentQuizIndex >= 0) {
-      for (let index = currentQuizIndex + 1; index < examIndex; index += 1) {
-        const major = getMajorPlacement(sortedTermSlots[index]!);
-        const block = major ? blockMap.get(major.blockId) ?? null : null;
-        if (block?.type !== "lesson") continue;
+    const currentQuizIndex = sortedTermSlots.findIndex((slot) => getMajorPlacement(slot)?.blockId === finalQuiz.id);
+    const latestLessonBeforeExamIndex = sortedTermSlots.reduce((latest, slot, index) => {
+      if (index >= examIndex) return latest;
+      const major = getMajorPlacement(slot);
+      const block = major ? blockMap.get(major.blockId) ?? null : null;
+      return block?.type === "lesson" ? index : latest;
+    }, -1);
+    if (currentQuizIndex >= 0 && latestLessonBeforeExamIndex > currentQuizIndex) {
+      moveMajorBlockStepwiseToIndex(finalQuiz.id, latestLessonBeforeExamIndex);
+    }
+  }
 
-        const targetIndex = sortedTermSlots.findIndex((slot, slotIndex) => {
-          if (slotIndex >= currentQuizIndex) return false;
-          const slotMajor = getMajorPlacement(slot);
-          const slotBlock = slotMajor ? blockMap.get(slotMajor.blockId) ?? null : null;
-          return slotBlock?.type !== "lesson" && !(slotBlock?.type === "buffer" && slotBlock.subcategory === "orientation");
-        });
-        if (targetIndex >= 0) {
-          swapMajorPlacements(sortedTermSlots, index, targetIndex);
-          currentQuizIndex = sortedTermSlots.findIndex(
-            (slot) => getMajorPlacement(slot)?.blockId === finalQuiz.id
-          );
-        }
-      }
+  reorderMajorsByKey(
+    (block) => block.type === "lesson" && !block.metadata.extraCandidateType,
+    "lessonOrder"
+  );
+  reorderMajorsByKey((block) => block.type === "performance_task" && !block.metadata.extraCandidateType, "ptOrder");
+  reorderMajorsByKey((block) => block.type === "written_work" && block.subcategory === "quiz", "quizOrder");
+  reorderMinorByKey((block) => block.type === "written_work" && block.subcategory !== "quiz", "wwOrder");
+
+  if (examIndex > 0 && finalQuiz) {
+    const targetFinalQuizIndex = examReviewIndex === examIndex - 1 ? examIndex - 2 : examIndex - 1;
+    if (targetFinalQuizIndex >= 0) {
+      moveMajorBlockStepwiseToIndex(finalQuiz.id, targetFinalQuizIndex);
     }
   }
 
@@ -1903,6 +2240,26 @@ function validateAdjustedTerm(termSlots: SessionSlot[], termBlocks: Block[]) {
     const block = major ? blockMap.get(major.blockId) ?? null : null;
     return block?.type === "lesson" ? index : latest;
   }, -1);
+  const firstLessonIndex = sortedTermSlots.findIndex((slot) => {
+    const major = getMajorPlacement(slot);
+    const block = major ? blockMap.get(major.blockId) ?? null : null;
+    return block?.type === "lesson" && !block.metadata.extraCandidateType;
+  });
+  const hasPtOrQuizBeforeFirstLesson =
+    firstLessonIndex > 0 &&
+    sortedTermSlots.slice(0, firstLessonIndex).some((slot) => {
+      const major = getMajorPlacement(slot);
+      const block = major ? blockMap.get(major.blockId) ?? null : null;
+      return block?.type === "performance_task" || (block?.type === "written_work" && block.subcategory === "quiz");
+    });
+  const hasWwBeforeFirstLesson =
+    firstLessonIndex > 0 &&
+    sortedTermSlots.slice(0, firstLessonIndex).some((slot) =>
+      slot.placements.some((placement) => {
+        const block = blockMap.get(placement.blockId) ?? null;
+        return block?.type === "written_work" && block.subcategory !== "quiz" && !block.metadata.extraCandidateType;
+      })
+    );
   const hasLessonAfterFinalQuiz =
     finalQuizIndex >= 0 &&
     sortedTermSlots
@@ -1911,6 +2268,23 @@ function validateAdjustedTerm(termSlots: SessionSlot[], termBlocks: Block[]) {
         const major = getMajorPlacement(slot);
         const block = major ? blockMap.get(major.blockId) ?? null : null;
         return block?.type === "lesson";
+      });
+  const examReviewIndex = sortedTermSlots.findIndex((slot) => {
+    const major = getMajorPlacement(slot);
+    const block = major ? blockMap.get(major.blockId) ?? null : null;
+    return block?.metadata.extraCandidateType === "review_before_exam";
+  });
+  const targetFinalQuizIndex =
+    examIndex > 0 ? (examReviewIndex === examIndex - 1 ? examIndex - 2 : examIndex - 1) : -1;
+  const hasNonTerminalMajorBetweenFinalQuizAndExam =
+    finalQuizIndex >= 0 &&
+    examIndex >= 0 &&
+    sortedTermSlots
+      .slice(finalQuizIndex + 1, examIndex)
+      .some((slot) => {
+        const major = getMajorPlacement(slot);
+        const block = major ? blockMap.get(major.blockId) ?? null : null;
+        return Boolean(block) && block?.metadata.extraCandidateType !== "review_before_exam";
       });
 
   if (!lessonsInOrder || !ptInOrder || !ptPlacedInOrder || !quizInOrder || !wwInOrder) {
@@ -1921,6 +2295,15 @@ function validateAdjustedTerm(termSlots: SessionSlot[], termBlocks: Block[]) {
   }
   if (hasLessonAfterFinalQuiz) {
     throw new Error("Lessons cannot appear after the final quiz in a term.");
+  }
+  if (targetFinalQuizIndex >= 0 && finalQuizIndex !== targetFinalQuizIndex) {
+    throw new Error("Final quiz must occupy the slot immediately before the exam or exam review.");
+  }
+  if (hasNonTerminalMajorBetweenFinalQuizAndExam) {
+    throw new Error("No major blocks may appear between the final quiz and the exam boundary.");
+  }
+  if (hasPtOrQuizBeforeFirstLesson || hasWwBeforeFirstLesson) {
+    throw new Error("Written work and performance tasks cannot appear before the first lesson in a term.");
   }
 }
 
@@ -2054,7 +2437,7 @@ function schedulePlanEntries(input: {
     activeSlotRows,
     input.blocks.filter((block) => Boolean(block.slot_id) && activeSlotIdSet.has(block.slot_id ?? ""))
   );
-  const scheduledEntries = buildPlanEntriesFromScheduledSlots(scheduledSlots).sort(entrySort);
+  const scheduledEntries = applyEntryDisplayOrders(buildPlanEntriesFromScheduledSlots(scheduledSlots).sort(entrySort));
 
   if (input.slots.length === 0) {
     return {
@@ -2199,18 +2582,54 @@ export default function CalendarScreen() {
     lessonId: null,
     title: "",
     description: "",
-    category: "lesson",
-    subtype: "lecture",
+    category: "",
+    subtype: "",
+    customSubtype: "",
     startDate: toLocalDateString(),
     endDate: toLocalDateString(),
     startTime: "",
     endTime: "",
     reviewDays: "1",
   });
+  const createSubtypeReveal = useRef(new Animated.Value(0)).current;
+  const createTimeReveal = useRef(new Animated.Value(0)).current;
   const [monthCellLayouts, setMonthCellLayouts] = useState<Record<string, { x: number; y: number; w: number; h: number }>>({});
   const [dailyTimeEdit, setDailyTimeEdit] = useState<DailyTimeEditState | null>(null);
+  const [createDropdownOpen, setCreateDropdownOpen] = useState<CreateDropdownField>(null);
   const dailyBlockSwipeClosersRef = useRef<Record<string, (() => void) | null>>({});
   const openDailyBlockSwipeKeyRef = useRef<string | null>(null);
+  const showCreateSubtypeSection = entryEditor.visible && entryEditor.mode === "create" && Boolean(entryEditor.category);
+  const showCreateTimeSection = showCreateSubtypeSection && Boolean(entryEditor.subtype);
+
+  useEffect(() => {
+    Animated.timing(createSubtypeReveal, {
+      toValue: showCreateSubtypeSection ? 1 : 0,
+      duration: 180,
+      useNativeDriver: true,
+    }).start();
+  }, [createSubtypeReveal, showCreateSubtypeSection]);
+
+  useEffect(() => {
+    Animated.timing(createTimeReveal, {
+      toValue: showCreateTimeSection ? 1 : 0,
+      duration: 180,
+      useNativeDriver: true,
+    }).start();
+  }, [createTimeReveal, showCreateTimeSection]);
+
+  useEffect(() => {
+    if (!entryEditor.visible || entryEditor.mode !== "create") {
+      setCreateDropdownOpen(null);
+      return;
+    }
+    if (!showCreateSubtypeSection && createDropdownOpen === "subtype") {
+      setCreateDropdownOpen(null);
+      return;
+    }
+    if (!showCreateTimeSection && (createDropdownOpen === "startTime" || createDropdownOpen === "endTime")) {
+      setCreateDropdownOpen(null);
+    }
+  }, [createDropdownOpen, entryEditor.mode, entryEditor.visible, showCreateSubtypeSection, showCreateTimeSection]);
 
   const loadCalendarData = useCallback(async () => {
     setLoading(true);
@@ -2268,7 +2687,7 @@ export default function CalendarScreen() {
             .order("start_time", { ascending: true }),
           supabase
             .from("blocks")
-            .select("block_id, lesson_plan_id, slot_id, root_block_id, lesson_id, algorithm_block_key, block_key, title, description, session_category, session_subcategory, meeting_type, estimated_minutes, min_minutes, max_minutes, required, splittable, overlay_mode, preferred_session_type, dependency_keys, order_no, is_locked, ww_subtype, pt_subtype, metadata")
+            .select("block_id, lesson_plan_id, slot_id, root_block_id, lesson_id, algorithm_block_key, block_key, title, description, session_category, session_subcategory, meeting_type, estimated_minutes, min_minutes, max_minutes, required, splittable, overlay_mode, preferred_session_type, dependency_keys, order_no, is_locked, ww_subtype, pt_subtype, metadata, lesson:lessons(title)")
             .in("lesson_plan_id", lessonPlanIds)
             .order("created_at", { ascending: true }),
         ]);
@@ -2303,6 +2722,8 @@ export default function CalendarScreen() {
           for (const row of blockRows ?? []) {
             const planId = String(row.lesson_plan_id);
             const current = blocksMap[planId] ?? [];
+            const lessonRaw = row?.lesson;
+            const lesson = Array.isArray(lessonRaw) ? lessonRaw[0] : lessonRaw;
             current.push({
               block_id: String(row.block_id),
               lesson_plan_id: planId,
@@ -2328,7 +2749,12 @@ export default function CalendarScreen() {
               is_locked: typeof row?.is_locked === "boolean" ? Boolean(row.is_locked) : null,
               ww_subtype: row?.ww_subtype ? String(row.ww_subtype) : null,
               pt_subtype: row?.pt_subtype ? String(row.pt_subtype) : null,
-              metadata: row?.metadata && typeof row.metadata === "object" ? (row.metadata as Record<string, unknown>) : {},
+              metadata: {
+                ...(row?.metadata && typeof row.metadata === "object" ? (row.metadata as Record<string, unknown>) : {}),
+                ...(lesson?.title
+                  ? { lessonTitle: String(lesson.title) }
+                  : {}),
+              },
             });
             blocksMap[planId] = current;
           }
@@ -2620,6 +3046,14 @@ export default function CalendarScreen() {
     });
   }, [blackoutsByPlan, selectedPlan, selectedPlanBlocks, selectedPlanSlots]);
   const displayEntries = useMemo(() => scheduleResult.entries, [scheduleResult.entries]);
+  const displayEntryByKey = useMemo(() => {
+    const map = new Map<string, PlanEntry>();
+    for (const entry of displayEntries) {
+      if (!entry.scheduled_date) continue;
+      map.set(`${entry.plan_entry_id}|${entry.scheduled_date}`, entry);
+    }
+    return map;
+  }, [displayEntries]);
 
   const entriesByDate = useMemo(() => {
     const map: Record<string, PlanEntry[]> = {};
@@ -2670,22 +3104,64 @@ export default function CalendarScreen() {
     const timelineStartMin = startHour * 60;
     const totalHours = Math.max(1, endHour - startHour + 1);
     const hourMarks = Array.from({ length: totalHours + 1 }, (_, i) => startHour + i);
-    const placed: DailyPlacedBlock[] = dailySlots.flatMap((slot, slotIndex) =>
-      slot.blocks.map((block, blockIndex) => {
-        const fallbackStart = timelineStartMin + (slotIndex * 45) + (blockIndex * 15);
-        const startMin = toMinutesFromSqlTime(block.startTime) ?? fallbackStart;
-        const endMinRaw = toMinutesFromSqlTime(block.endTime);
-        const endMin = endMinRaw && endMinRaw > startMin ? endMinRaw : startMin + 50;
-        const top = ((startMin - timelineStartMin) / 60) * hourHeight;
-        const height = Math.max(56, ((endMin - startMin) / 60) * hourHeight);
-        return { slot, block, top, height, stackIndex: blockIndex };
-      })
-    );
+    const rowGap = 8;
+    const minRowHeight = 56;
+    const placed: DailyPlacedBlock[] = [];
+    let maxBottom = totalHours * hourHeight;
+
+    dailySlots.forEach((slot, slotIndex) => {
+      const orderedBlocks = [...slot.blocks].sort((a, b) => {
+        const rankDiff =
+          getDailyBlockOrderRank({
+            category: a.category,
+            subcategory: a.subcategory,
+            orderNo: a.orderNo,
+            title: a.title,
+          }) -
+          getDailyBlockOrderRank({
+            category: b.category,
+            subcategory: b.subcategory,
+            orderNo: b.orderNo,
+            title: b.title,
+          });
+        if (rankDiff !== 0) return rankDiff;
+        const orderDiff = Number(a.orderNo ?? 0) - Number(b.orderNo ?? 0);
+        if (orderDiff !== 0) return orderDiff;
+        return a.title.localeCompare(b.title);
+      });
+
+      const fallbackStart = timelineStartMin + slotIndex * 45;
+      const slotStartMin =
+        toMinutesFromSqlTime(slot.startTime) ??
+        toMinutesFromSqlTime(orderedBlocks[0]?.startTime) ??
+        fallbackStart;
+      const slotEndRaw =
+        toMinutesFromSqlTime(slot.endTime) ??
+        orderedBlocks
+          .map((block) => toMinutesFromSqlTime(block.endTime))
+          .filter((value): value is number => typeof value === "number")
+          .reduce((latest, value) => Math.max(latest, value), 0);
+      const slotEndMin = slotEndRaw && slotEndRaw > slotStartMin ? slotEndRaw : slotStartMin + 50;
+      const slotTop = ((slotStartMin - timelineStartMin) / 60) * hourHeight;
+      const slotHeight = Math.max(minRowHeight, ((slotEndMin - slotStartMin) / 60) * hourHeight);
+      const distributedRowHeight = Math.max(
+        minRowHeight,
+        Math.floor((slotHeight - rowGap * Math.max(0, orderedBlocks.length - 1)) / Math.max(1, orderedBlocks.length))
+      );
+
+      orderedBlocks.forEach((block, blockIndex) => {
+        const top = slotTop + blockIndex * (distributedRowHeight + rowGap);
+        const height = distributedRowHeight;
+        placed.push({ slot, block, top, height, stackIndex: blockIndex });
+        maxBottom = Math.max(maxBottom, top + height);
+      });
+    });
+
     return {
       startHour,
       hourHeight,
       hourMarks,
-      totalHeight: totalHours * hourHeight,
+      totalHeight: Math.max(totalHours * hourHeight, maxBottom + rowGap),
       placed,
     };
   }, [dailySlots]);
@@ -2814,6 +3290,25 @@ export default function CalendarScreen() {
     return { laneByStartKey, maxLaneByRow };
   }, [entriesByDate, monthCells]);
 
+  const createEntrySeedTimes = useMemo(() => {
+    const selectedDaySlots = [...selectedPlanSlots]
+      .filter((slot) => slot.slot_date === selectedDate)
+      .sort(comparePlanSlotRows);
+    if (selectedDaySlots.length === 0) {
+      return { startTime: "", endTime: "" };
+    }
+
+    const openSlot =
+      selectedDaySlots.find((slot) => {
+        const slotBlocks = selectedPlanBlocks.filter((block) => block.slot_id === slot.slot_id);
+        return slotBlocks.length === 0 || slotBlocks.every((block) => block.overlay_mode === "minor");
+      }) ?? null;
+    const slotStart = toHm(openSlot?.start_time);
+    const slotEnd = toHm(openSlot?.end_time);
+    if (!openSlot || !slotStart || !slotEnd) return { startTime: "", endTime: "" };
+    return { startTime: slotStart, endTime: slotEnd };
+  }, [selectedDate, selectedPlanBlocks, selectedPlanSlots]);
+
   const openCreateEditor = useCallback(() => {
     setEntryEditor({
       visible: true,
@@ -2822,15 +3317,16 @@ export default function CalendarScreen() {
       lessonId: null,
       title: "",
       description: "",
-      category: "lesson",
-      subtype: "lecture",
+      category: "",
+      subtype: "",
+      customSubtype: "",
       startDate: selectedDate,
       endDate: selectedDate,
-      startTime: "",
-      endTime: "",
+      startTime: createEntrySeedTimes.startTime,
+      endTime: createEntrySeedTimes.endTime,
       reviewDays: "1",
     });
-  }, [selectedDate]);
+  }, [createEntrySeedTimes.endTime, createEntrySeedTimes.startTime, selectedDate]);
 
   const openEditEditor = useCallback((entry: PlanEntry) => {
     const subtype =
@@ -2855,6 +3351,7 @@ export default function CalendarScreen() {
       description: entry.description ?? "",
       category: entry.category,
       subtype,
+      customSubtype: "",
       startDate: entry.scheduled_date ?? selectedDate,
       endDate: entry.scheduled_date ?? selectedDate,
       startTime: (entry.start_time ?? "").slice(0, 5),
@@ -2973,9 +3470,24 @@ export default function CalendarScreen() {
     if (!selectedPlan) return;
 
     if (entryEditor.mode === "create") {
-      const createCategory = ["lesson", "written_work", "performance_task", "exam"].includes(entryEditor.category)
+      const createCategory = ["lesson", "written_work", "performance_task", "exam", "buffer"].includes(entryEditor.category)
         ? entryEditor.category
         : "lesson";
+      const selectedSubtype = entryEditor.subtype.trim();
+      if (!selectedSubtype) {
+        Alert.alert("Subcategory required", "Select a subcategory for the block.");
+        return;
+      }
+      const storedSubtype = getStoredSubtypeForCreate(createCategory, selectedSubtype);
+      if (!storedSubtype) {
+        Alert.alert("Subtype required", "Select a valid subcategory.");
+        return;
+      }
+      const customLabel = entryEditor.customSubtype.trim();
+      if (selectedSubtype === "other" && !customLabel) {
+        Alert.alert("Custom label required", "Enter a label for the Other subcategory.");
+        return;
+      }
 
       try {
         const parsedStart = entryEditor.startTime.trim() ? parseSqlTime(entryEditor.startTime.trim()) : null;
@@ -3102,6 +3614,12 @@ export default function CalendarScreen() {
           if (shiftError) throw shiftError;
         }
 
+        const defaultGeneratedTitle =
+          createCategory === "buffer"
+            ? formatEditorChoiceLabel(storedSubtype)
+            : getAutomaticCreateCategoryTitle({ category: createCategory, sequence, termKey });
+        const createdTitle = selectedSubtype === "other" ? customLabel : defaultGeneratedTitle;
+
         const createdMetadata =
           createCategory === "exam"
             ? {
@@ -3111,6 +3629,7 @@ export default function CalendarScreen() {
                 termKey,
                 resolvedStart: parsedStart,
                 resolvedEnd: parsedEnd,
+                manualLabel: selectedSubtype === "other" ? customLabel : null,
               }
             : {
                 ...buildRenumberedSeriesMetadata({
@@ -3123,6 +3642,7 @@ export default function CalendarScreen() {
                 manual: true,
                 resolvedStart: parsedStart,
                 resolvedEnd: parsedEnd,
+                manualLabel: selectedSubtype === "other" ? customLabel : null,
               };
 
         const { error: createError } = await supabase
@@ -3134,18 +3654,14 @@ export default function CalendarScreen() {
             lesson_id: null,
             algorithm_block_key: `manual__${createCategory}__${makeId()}`,
             block_key: makeId(),
-            title: getAutomaticCreateCategoryTitle({ category: createCategory, sequence, termKey }),
-            description: entryEditor.description.trim() || null,
+            title: createdTitle,
+            description: null,
             session_category: createCategory,
             session_subcategory:
-              createCategory === "lesson"
-                ? "lecture"
-                : createCategory === "written_work"
-                  ? "assignment"
-                  : createCategory === "performance_task"
-                    ? "activity"
-                    : termKey,
-            meeting_type: createCategory === "lesson" ? "lecture" : null,
+              createCategory === "exam"
+                ? storedSubtype
+                : storedSubtype,
+            meeting_type: createCategory === "lesson" ? storedSubtype : null,
             estimated_minutes: Math.max(
               15,
               ((toMinutesFromSqlTime(parsedEnd) ?? 0) - (toMinutesFromSqlTime(parsedStart) ?? 0)) || 60
@@ -3154,13 +3670,13 @@ export default function CalendarScreen() {
             max_minutes: null,
             required: true,
             splittable: false,
-            overlay_mode: createCategory === "written_work" ? "minor" : "major",
-            preferred_session_type: createCategory === "lesson" ? "lecture" : "any",
+            overlay_mode: createCategory === "written_work" && storedSubtype !== "quiz" ? "minor" : "major",
+            preferred_session_type: createCategory === "lesson" ? storedSubtype : "any",
             dependency_keys: [],
             order_no: targetOrderNo,
             is_locked: true,
-            ww_subtype: createCategory === "written_work" ? "assignment" : null,
-            pt_subtype: createCategory === "performance_task" ? "activity" : null,
+            ww_subtype: createCategory === "written_work" ? storedSubtype : null,
+            pt_subtype: createCategory === "performance_task" ? storedSubtype : null,
             metadata: createdMetadata,
           });
         if (createError) throw createError;
@@ -3822,7 +4338,9 @@ export default function CalendarScreen() {
         const termSlots = seededSlots.filter((slot) => slot.termIndex === termIndex);
         if (termSlots.length === 0) continue;
 
-        const currentTermBlocks = algorithmBlocks.filter((block) => Number(block.metadata.termIndex ?? -1) === termIndex);
+        const currentTermBlocks = dedupeCurrentTermBlocks(
+          algorithmBlocks.filter((block) => Number(block.metadata.termIndex ?? -1) === termIndex)
+        );
         const expectedTermBlocks = expectedBlocks.filter((block) => Number(block.metadata.termIndex ?? -1) === termIndex);
         const currentIdentitySet = new Set(
           currentTermBlocks
@@ -3900,11 +4418,7 @@ export default function CalendarScreen() {
         });
         recoverMissingRequiredBlocks(termSlots, termBlocks);
         normalizeTermPlacements(termSlots, termBlocks);
-        try {
-          validateAdjustedTerm(termSlots, termBlocks);
-        } catch (validationError: any) {
-          console.warn("[calendar] Repopulate proceeding with partial recovery", validationError?.message ?? validationError);
-        }
+        validateAdjustedTerm(termSlots, termBlocks);
 
         termBlocks.forEach((block) => {
           updatedMetadataByBlockId.set(block.id, block.metadata);
@@ -4239,15 +4753,17 @@ export default function CalendarScreen() {
                       </View>
                     ))}
                     {dailyTimeline.placed.map(({ slot, block, top, height, stackIndex }) => {
-                      const entry: PlanEntry = {
+                      const displayEntry = displayEntryByKey.get(`${block.blockId}|${slot.slotDate}`) ?? null;
+                      const fallbackEntry: PlanEntry = {
                         plan_entry_id: block.blockId,
                         lesson_plan_id: block.lessonPlanId,
-                        title: getDisplayTitleForBlockLike({
+                        title: getDailyDisplayTitleForBlockLike({
                           title: block.title,
                           category: block.category,
                           subcategory: block.subcategory,
                           metadata: block.metadata,
                         }),
+                        subtitle: null,
                         category: block.category,
                         description: block.description,
                         scheduled_date: block.scheduledDate,
@@ -4270,15 +4786,37 @@ export default function CalendarScreen() {
                         slot_id: block.slotId,
                         order_no: block.orderNo,
                       };
+                      const labelSource = displayEntry ?? fallbackEntry;
+                      const dailyLabel = getDailyPrimaryLabel(labelSource);
+                      const entry: PlanEntry = {
+                        ...fallbackEntry,
+                        title: labelSource.title,
+                        subtitle: displayEntry?.subtitle ?? null,
+                      };
+                      const dailySubtitle = getDailyMetaLabel(labelSource);
                       const libraryRoute = getLibraryRouteForEntry(entry, selectedPlan?.subject_id);
                       const swipeKey = `${block.blockId}-${block.scheduledDate}`;
-                      const baseStartMinutes = toMinutesFromSqlTime(block.startTime) ?? 0;
-                      const baseEndMinutes = toMinutesFromSqlTime(block.endTime) ?? (baseStartMinutes + 60);
+                      const fallbackStartMinutes =
+                        toMinutesFromSqlTime(slot.startTime) ??
+                        toMinutesFromSqlTime(block.startTime) ??
+                        Math.round((top / dailyTimeline.hourHeight) * 60 + (dailyTimeline.startHour * 60));
+                      const fallbackEndMinutes = Math.max(
+                        (toMinutesFromSqlTime(slot.endTime) ?? 0) > fallbackStartMinutes
+                          ? (toMinutesFromSqlTime(slot.endTime) as number)
+                          : fallbackStartMinutes + 30,
+                        toMinutesFromSqlTime(block.endTime) ?? fallbackStartMinutes + 30
+                      );
+                      const baseStartMinutes = toMinutesFromSqlTime(block.startTime) ?? fallbackStartMinutes;
+                      const baseEndMinutes = toMinutesFromSqlTime(block.endTime) ?? fallbackEndMinutes;
                       const isEditingTime = dailyTimeEdit?.blockId === block.blockId;
                       const activeStartMinutes = isEditingTime ? (dailyTimeEdit?.startMinutes ?? baseStartMinutes) : baseStartMinutes;
                       const activeEndMinutes = isEditingTime ? (dailyTimeEdit?.endMinutes ?? baseEndMinutes) : baseEndMinutes;
-                      const adjustedTop = ((activeStartMinutes - (dailyTimeline.startHour * 60)) / 60) * dailyTimeline.hourHeight;
-                      const adjustedHeight = Math.max(56, ((activeEndMinutes - activeStartMinutes) / 60) * dailyTimeline.hourHeight);
+                      const adjustedTop = isEditingTime
+                        ? ((activeStartMinutes - (dailyTimeline.startHour * 60)) / 60) * dailyTimeline.hourHeight
+                        : top;
+                      const adjustedHeight = isEditingTime
+                        ? Math.max(56, ((activeEndMinutes - activeStartMinutes) / 60) * dailyTimeline.hourHeight)
+                        : height;
 
                       return (
                       <View
@@ -4288,6 +4826,7 @@ export default function CalendarScreen() {
                           {
                             top: adjustedTop,
                             height: adjustedHeight,
+                            zIndex: Math.max(1, 20 - stackIndex),
                           },
                         ]}
                       >
@@ -4347,7 +4886,9 @@ export default function CalendarScreen() {
                                 setDailyTimeEdit(null);
                                 return;
                               }
-                              openEditEditor(entry);
+                              if (libraryRoute) {
+                                router.push(libraryRoute);
+                              }
                             }}
                           >
                             <View
@@ -4356,7 +4897,6 @@ export default function CalendarScreen() {
                                 {
                                   backgroundColor: getDailySlotCardStyle(slot, isDark, cardBg),
                                   borderColor: isEditingTime ? c.tint : c.border,
-                                  marginTop: stackIndex * 6,
                                 },
                               ]}
                             >
@@ -4367,45 +4907,28 @@ export default function CalendarScreen() {
                                   ]}
                                 />
                                 <View style={styles.timelineCardMain}>
-                                  <Text style={[styles.timelineTitle, { color: c.text }]} numberOfLines={2}>
-                                    {getDisplayTitleForBlockLike({
-                                      title: block.title,
-                                      category: block.category,
-                                      subcategory: block.subcategory,
-                                      metadata: block.metadata,
-                                    })}
-                                  </Text>
-                                  <Text style={[styles.timelineSub, { color: c.text }]} numberOfLines={1}>
-                                    {slot.title?.trim() || `Slot ${slot.slotNumber ?? ""}`.trim()}
-                                  </Text>
-                                  <Text style={[styles.timelineTime, { color: c.mutedText }]}>
-                                    {formatDisplayTimeRange(minutesToHm(activeStartMinutes), minutesToHm(activeEndMinutes))}
-                                  </Text>
-                                </View>
-                                <View style={styles.dailyBlockChipRail}>
-                                  <Pressable
-                                    style={[
-                                      styles.dailyBlockChip,
-                                      styles.dailyBlockLibraryChip,
-                                      {
-                                        borderColor: getEntryColor(block.category),
-                                        backgroundColor: subtleBg,
-                                      },
-                                    ]}
-                                    disabled={!libraryRoute}
-                                    onPress={() => {
-                                      if (libraryRoute) {
-                                        router.push(libraryRoute);
-                                      }
-                                    }}
-                                  >
-                                    <Text style={[styles.dailyBlockChipTitle, { color: c.text }]} numberOfLines={1}>
-                                      {getChipLabel(entry)}
+                                  <View style={styles.timelineCardCenter}>
+                                    <Text style={[styles.timelineDailyTitle, { color: c.text }]} numberOfLines={2}>
+                                      {dailyLabel}
                                     </Text>
-                                    <Text style={[styles.dailyBlockChipMeta, { color: c.mutedText }]} numberOfLines={1}>
-                                      {block.subcategory ? block.subcategory.replace(/_/g, " ") : "Library"}
-                                    </Text>
-                                  </Pressable>
+                                    {dailySubtitle ? (
+                                      <Text style={[styles.timelineDailySubtitle, { color: c.mutedText }]} numberOfLines={1}>
+                                        {dailySubtitle}
+                                      </Text>
+                                    ) : null}
+                                    {libraryRoute && adjustedHeight >= 110 ? (
+                                      <Pressable
+                                        style={styles.timelineCardLibraryLink}
+                                        onPress={() => {
+                                          router.push(libraryRoute);
+                                        }}
+                                      >
+                                        <Text style={[styles.timelineCardLibraryText, { color: c.mutedText }]} numberOfLines={1}>
+                                          Open details
+                                        </Text>
+                                      </Pressable>
+                                    ) : null}
+                                  </View>
                                 </View>
                             </View>
                           </DailyTimeAdjustableCard>
@@ -4495,19 +5018,7 @@ export default function CalendarScreen() {
                           return !(entriesByDate[prevDay] ?? []).some((item) => entryChainKey(item) === key);
                         });
 
-                        const cap = 4;
-                        const picked: PlanEntry[] = [];
-                        const requiredBuckets = ["lesson", "written_work", "performance_task"] as const;
-                        for (const bucket of requiredBuckets) {
-                          const found = chainStarts.find((entry) => entry.category === bucket);
-                          if (found) picked.push(found);
-                        }
-                        for (const entry of chainStarts) {
-                          if (picked.length >= cap) break;
-                          if (picked.some((row) => row.plan_entry_id === entry.plan_entry_id)) continue;
-                          picked.push(entry);
-                        }
-                        return picked;
+                        return chainStarts.slice(0, 4);
                       })().map((entry) => {
                           const key = entryChainKey(entry);
 
@@ -4549,9 +5060,6 @@ export default function CalendarScreen() {
                               <Text style={styles.detailItemTitle} numberOfLines={1}>
                                 {getMonthlyPreviewTitle(entry)}
                               </Text>
-                              <Text style={styles.detailItemSub} numberOfLines={1}>
-                                {stripHtmlTags(entry.description) || getChipLabel(entry)}
-                              </Text>
                             </Pressable>
                           );
                         })}
@@ -4569,18 +5077,27 @@ export default function CalendarScreen() {
           transparent
           visible={entryEditor.visible}
           animationType="fade"
-          onRequestClose={() => setEntryEditor((prev) => ({ ...prev, visible: false }))}
+          onRequestClose={() => {
+            setCreateDropdownOpen(null);
+            setEntryEditor((prev) => ({ ...prev, visible: false }));
+          }}
         >
-          <Pressable style={styles.modalBackdrop} onPress={() => setEntryEditor((prev) => ({ ...prev, visible: false }))}>
+          <Pressable
+            style={styles.modalBackdrop}
+            onPress={() => {
+              setCreateDropdownOpen(null);
+              setEntryEditor((prev) => ({ ...prev, visible: false }));
+            }}
+          >
             <Pressable style={[styles.planModal, { backgroundColor: cardBg, borderColor: c.border }]} onPress={() => null}>
               <Text style={[styles.modalTitle, { color: c.text }]}>
                 {entryEditor.mode === "create" ? "Add block" : "Edit block"}
               </Text>
-              <Text style={[styles.modalSubtitle, { color: c.mutedText }]}>
-                {entryEditor.mode === "create"
-                  ? "Choose a block type, add an optional description, and set start/end time."
-                  : "Configure details, subtype, schedule range, and time."}
-              </Text>
+              {entryEditor.mode === "edit" ? (
+                <Text style={[styles.modalSubtitle, { color: c.mutedText }]}>
+                  Configure details, subtype, schedule range, and time.
+                </Text>
+              ) : null}
               {entryEditor.lessonId ? (
                 <Text style={[styles.entryPreviewSummary, { color: c.mutedText }]}>
                   This lesson total now comes from its scheduled calendar blocks.
@@ -4602,34 +5119,137 @@ export default function CalendarScreen() {
 
               {entryEditor.mode === "create" ? (
                 <View style={styles.editorSection}>
-                  <Text style={[styles.entryFieldLabel, { color: c.mutedText }]}>Block type</Text>
-                  <View style={[styles.entryPickerWrap, { borderColor: c.border, backgroundColor: subtleBg }]}>
-                    <Picker
-                      selectedValue={entryEditor.category}
-                      onValueChange={(value) => setEntryEditor((prev) => ({ ...prev, category: String(value) }))}
-                      style={[styles.entryPicker, { color: c.text }]}
-                      itemStyle={[styles.entryPickerItem, { color: c.text }]}
-                      dropdownIconColor={c.text}
+                  <Text style={[styles.entryFieldLabel, { color: c.mutedText }]}>Category</Text>
+                  <View style={styles.createDropdownWrap}>
+                    <Pressable
+                      style={[styles.createDropdownField, { backgroundColor: "#7ED957" }]}
+                      onPress={() =>
+                        setCreateDropdownOpen((prev) => (prev === "category" ? null : "category"))
+                      }
                     >
-                      <Picker.Item label="Lesson" value="lesson" />
-                      <Picker.Item label="Written Work" value="written_work" />
-                      <Picker.Item label="Performance Task" value="performance_task" />
-                      <Picker.Item label="Exam" value="exam" />
-                    </Picker>
+                      <Text style={styles.createDropdownFieldText}>
+                        {entryEditor.category ? formatEditorChoiceLabel(entryEditor.category) : "Select Category"}
+                      </Text>
+                      <Ionicons
+                        name={createDropdownOpen === "category" ? "chevron-up" : "chevron-down"}
+                        size={18}
+                        color="#FFFFFF"
+                        style={styles.createDropdownIcon}
+                      />
+                    </Pressable>
+                    {createDropdownOpen === "category" ? (
+                      <View style={[styles.createDropdownMenu, { backgroundColor: cardBg, borderColor: c.border }]}>
+                        {["lesson", "written_work", "performance_task", "exam", "buffer"].map((category) => (
+                          <Pressable
+                            key={category}
+                            style={styles.createDropdownItem}
+                            onPress={() => {
+                              LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+                              setEntryEditor((prev) => ({
+                                ...prev,
+                                category,
+                                subtype: "",
+                                customSubtype: "",
+                                startTime: createEntrySeedTimes.startTime,
+                                endTime: createEntrySeedTimes.endTime,
+                              }));
+                              setCreateDropdownOpen(null);
+                            }}
+                          >
+                            <Text style={[styles.createDropdownItemText, { color: c.text }]}>
+                              {formatEditorChoiceLabel(category)}
+                            </Text>
+                          </Pressable>
+                        ))}
+                      </View>
+                    ) : null}
                   </View>
                 </View>
               ) : null}
 
-              <View style={styles.editorSection}>
-                <Text style={[styles.entryFieldLabel, { color: c.mutedText }]}>Description</Text>
-                <TextInput
-                  value={entryEditor.description}
-                  onChangeText={(value) => setEntryEditor((prev) => ({ ...prev, description: value }))}
-                  placeholder="Optional description"
-                  placeholderTextColor={c.mutedText}
-                  style={[styles.entryInput, { color: c.text, borderColor: c.border, backgroundColor: subtleBg }]}
-                />
-              </View>
+              {entryEditor.mode === "edit" ? (
+                <View style={styles.editorSection}>
+                  <Text style={[styles.entryFieldLabel, { color: c.mutedText }]}>Description</Text>
+                  <TextInput
+                    value={entryEditor.description}
+                    onChangeText={(value) => setEntryEditor((prev) => ({ ...prev, description: value }))}
+                    placeholder="Optional description"
+                    placeholderTextColor={c.mutedText}
+                    style={[styles.entryInput, { color: c.text, borderColor: c.border, backgroundColor: subtleBg }]}
+                  />
+                </View>
+              ) : null}
+
+              {entryEditor.mode === "create" && showCreateSubtypeSection ? (
+                <Animated.View
+                  style={[
+                    styles.editorSection,
+                    {
+                      opacity: createSubtypeReveal,
+                      transform: [
+                        {
+                          translateY: createSubtypeReveal.interpolate({
+                            inputRange: [0, 1],
+                            outputRange: [12, 0],
+                          }),
+                        },
+                      ],
+                    },
+                  ]}
+                >
+                  <Text style={[styles.entryFieldLabel, { color: c.mutedText }]}>Subcategory</Text>
+                  <View style={styles.createDropdownWrap}>
+                    <Pressable
+                      style={[styles.createDropdownField, { backgroundColor: "#FF914D" }]}
+                      onPress={() =>
+                        setCreateDropdownOpen((prev) => (prev === "subtype" ? null : "subtype"))
+                      }
+                    >
+                      <Text style={styles.createDropdownFieldText}>
+                        {entryEditor.subtype ? formatEditorChoiceLabel(entryEditor.subtype) : "Select Subcategory"}
+                      </Text>
+                      <Ionicons
+                        name={createDropdownOpen === "subtype" ? "chevron-up" : "chevron-down"}
+                        size={18}
+                        color="#FFFFFF"
+                        style={styles.createDropdownIcon}
+                      />
+                    </Pressable>
+                    {createDropdownOpen === "subtype" ? (
+                      <View style={[styles.createDropdownMenu, { backgroundColor: cardBg, borderColor: c.border }]}>
+                        {createModeSubtypesForCategory(entryEditor.category).map((subtype) => (
+                          <Pressable
+                            key={subtype}
+                            style={styles.createDropdownItem}
+                            onPress={() => {
+                              LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+                              setEntryEditor((prev) => ({
+                                ...prev,
+                                subtype,
+                                customSubtype: subtype === "other" ? prev.customSubtype : "",
+                              }));
+                              setCreateDropdownOpen(null);
+                            }}
+                          >
+                            <Text style={[styles.createDropdownItemText, { color: c.text }]}>
+                              {formatEditorChoiceLabel(subtype)}
+                            </Text>
+                          </Pressable>
+                        ))}
+                      </View>
+                    ) : null}
+                  </View>
+                  {entryEditor.subtype === "other" ? (
+                    <TextInput
+                      value={entryEditor.customSubtype}
+                      onChangeText={(value) => setEntryEditor((prev) => ({ ...prev, customSubtype: value }))}
+                      placeholder="Specify label"
+                      placeholderTextColor={c.mutedText}
+                      style={[styles.createOtherInput, { color: c.text, borderColor: c.border, backgroundColor: subtleBg }]}
+                    />
+                  ) : null}
+                </Animated.View>
+              ) : null}
 
               {entryEditor.mode === "edit" ? (
               <View style={styles.editorSection}>
@@ -4652,6 +5272,7 @@ export default function CalendarScreen() {
                           ...prev,
                           category,
                           subtype: defaultSubtypeForCategory(category),
+                          customSubtype: "",
                         }))
                       }
                     >
@@ -4729,44 +5350,160 @@ export default function CalendarScreen() {
               </View>
               ) : null}
 
-              <View style={styles.editorSection}>
-                <View style={styles.entryTimeRow}>
-                  <View style={styles.entryTimeCell}>
-                    <Text style={[styles.entryFieldLabel, { color: c.mutedText }]}>Start (HH:MM)</Text>
-                    <View style={[styles.entryPickerWrap, { borderColor: c.border, backgroundColor: subtleBg }]}>
-                      <Picker
-                        selectedValue={entryEditor.startTime}
-                        onValueChange={(value) => setEntryEditor((prev) => ({ ...prev, startTime: String(value) }))}
-                        style={[styles.entryPicker, { color: c.text }]}
-                        itemStyle={[styles.entryPickerItem, { color: c.text }]}
-                        dropdownIconColor={c.text}
-                      >
-                        <Picker.Item label="No time" value="" />
-                        {timePickerOptions.map((time) => (
-                          <Picker.Item key={`start-time-${time}`} label={time} value={time} />
-                        ))}
-                      </Picker>
+              {entryEditor.mode === "create" ? (
+                showCreateTimeSection ? (
+                  <Animated.View
+                    style={[
+                      styles.editorSection,
+                      {
+                        opacity: createTimeReveal,
+                        transform: [
+                          {
+                            translateY: createTimeReveal.interpolate({
+                              inputRange: [0, 1],
+                              outputRange: [12, 0],
+                            }),
+                          },
+                        ],
+                      },
+                    ]}
+                  >
+                    <View style={styles.entryTimeRow}>
+                      <View style={styles.entryTimeCell}>
+                        <Text style={[styles.entryFieldLabel, { color: c.mutedText }]}>Start Time</Text>
+                        <View style={styles.createDropdownWrap}>
+                          <Pressable
+                            style={[styles.createDropdownField, styles.createTimeField, { backgroundColor: "#B3B3B6" }]}
+                            onPress={() =>
+                              setCreateDropdownOpen((prev) => (prev === "startTime" ? null : "startTime"))
+                            }
+                          >
+                            <Text style={styles.createDropdownFieldText}>
+                              {entryEditor.startTime || "--:--"}
+                            </Text>
+                            <Ionicons
+                              name={createDropdownOpen === "startTime" ? "chevron-up" : "chevron-down"}
+                              size={18}
+                              color="#FFFFFF"
+                              style={styles.createDropdownIcon}
+                            />
+                          </Pressable>
+                          {createDropdownOpen === "startTime" ? (
+                            <ScrollView style={[styles.createDropdownMenu, styles.createTimeDropdownMenu, { backgroundColor: cardBg, borderColor: c.border }]}>
+                              <Pressable
+                                style={styles.createDropdownItem}
+                                onPress={() => {
+                                  setEntryEditor((prev) => ({ ...prev, startTime: "" }));
+                                  setCreateDropdownOpen(null);
+                                }}
+                              >
+                                <Text style={[styles.createDropdownItemText, { color: c.text }]}>--:--</Text>
+                              </Pressable>
+                              {timePickerOptions.map((time) => (
+                                <Pressable
+                                  key={`start-time-${time}`}
+                                  style={styles.createDropdownItem}
+                                  onPress={() => {
+                                    setEntryEditor((prev) => ({ ...prev, startTime: time }));
+                                    setCreateDropdownOpen(null);
+                                  }}
+                                >
+                                  <Text style={[styles.createDropdownItemText, { color: c.text }]}>{time}</Text>
+                                </Pressable>
+                              ))}
+                            </ScrollView>
+                          ) : null}
+                        </View>
+                      </View>
+                      <View style={styles.entryTimeCell}>
+                        <Text style={[styles.entryFieldLabel, { color: c.mutedText }]}>End Time</Text>
+                        <View style={styles.createDropdownWrap}>
+                          <Pressable
+                            style={[styles.createDropdownField, styles.createTimeField, { backgroundColor: "#B3B3B6" }]}
+                            onPress={() =>
+                              setCreateDropdownOpen((prev) => (prev === "endTime" ? null : "endTime"))
+                            }
+                          >
+                            <Text style={styles.createDropdownFieldText}>
+                              {entryEditor.endTime || "--:--"}
+                            </Text>
+                            <Ionicons
+                              name={createDropdownOpen === "endTime" ? "chevron-up" : "chevron-down"}
+                              size={18}
+                              color="#FFFFFF"
+                              style={styles.createDropdownIcon}
+                            />
+                          </Pressable>
+                          {createDropdownOpen === "endTime" ? (
+                            <ScrollView style={[styles.createDropdownMenu, styles.createTimeDropdownMenu, { backgroundColor: cardBg, borderColor: c.border }]}>
+                              <Pressable
+                                style={styles.createDropdownItem}
+                                onPress={() => {
+                                  setEntryEditor((prev) => ({ ...prev, endTime: "" }));
+                                  setCreateDropdownOpen(null);
+                                }}
+                              >
+                                <Text style={[styles.createDropdownItemText, { color: c.text }]}>--:--</Text>
+                              </Pressable>
+                              {timePickerOptions.map((time) => (
+                                <Pressable
+                                  key={`end-time-${time}`}
+                                  style={styles.createDropdownItem}
+                                  onPress={() => {
+                                    setEntryEditor((prev) => ({ ...prev, endTime: time }));
+                                    setCreateDropdownOpen(null);
+                                  }}
+                                >
+                                  <Text style={[styles.createDropdownItemText, { color: c.text }]}>{time}</Text>
+                                </Pressable>
+                              ))}
+                            </ScrollView>
+                          ) : null}
+                        </View>
+                      </View>
                     </View>
-                  </View>
-                  <View style={styles.entryTimeCell}>
-                    <Text style={[styles.entryFieldLabel, { color: c.mutedText }]}>End (HH:MM)</Text>
-                    <View style={[styles.entryPickerWrap, { borderColor: c.border, backgroundColor: subtleBg }]}>
-                      <Picker
-                        selectedValue={entryEditor.endTime}
-                        onValueChange={(value) => setEntryEditor((prev) => ({ ...prev, endTime: String(value) }))}
-                        style={[styles.entryPicker, { color: c.text }]}
-                        itemStyle={[styles.entryPickerItem, { color: c.text }]}
-                        dropdownIconColor={c.text}
-                      >
-                        <Picker.Item label="No time" value="" />
-                        {timePickerOptions.map((time) => (
-                          <Picker.Item key={`end-time-${time}`} label={time} value={time} />
-                        ))}
-                      </Picker>
+                  </Animated.View>
+                ) : null
+              ) : (
+                <View style={styles.editorSection}>
+                  <View style={styles.entryTimeRow}>
+                    <View style={styles.entryTimeCell}>
+                      <Text style={[styles.entryFieldLabel, { color: c.mutedText }]}>Start (HH:MM)</Text>
+                      <View style={[styles.entryPickerWrap, { borderColor: c.border, backgroundColor: subtleBg }]}>
+                        <Picker
+                          selectedValue={entryEditor.startTime}
+                          onValueChange={(value) => setEntryEditor((prev) => ({ ...prev, startTime: String(value) }))}
+                          style={[styles.entryPicker, { color: c.text }]}
+                          itemStyle={[styles.entryPickerItem, { color: c.text }]}
+                          dropdownIconColor={c.text}
+                        >
+                          <Picker.Item label="No time" value="" />
+                          {timePickerOptions.map((time) => (
+                            <Picker.Item key={`start-time-${time}`} label={time} value={time} />
+                          ))}
+                        </Picker>
+                      </View>
+                    </View>
+                    <View style={styles.entryTimeCell}>
+                      <Text style={[styles.entryFieldLabel, { color: c.mutedText }]}>End (HH:MM)</Text>
+                      <View style={[styles.entryPickerWrap, { borderColor: c.border, backgroundColor: subtleBg }]}>
+                        <Picker
+                          selectedValue={entryEditor.endTime}
+                          onValueChange={(value) => setEntryEditor((prev) => ({ ...prev, endTime: String(value) }))}
+                          style={[styles.entryPicker, { color: c.text }]}
+                          itemStyle={[styles.entryPickerItem, { color: c.text }]}
+                          dropdownIconColor={c.text}
+                        >
+                          <Picker.Item label="No time" value="" />
+                          {timePickerOptions.map((time) => (
+                            <Picker.Item key={`end-time-${time}`} label={time} value={time} />
+                          ))}
+                        </Picker>
+                      </View>
                     </View>
                   </View>
                 </View>
-              </View>
+              )}
 
               {entryEditor.mode === "edit" && (entryEditor.category === "performance_task" || entryEditor.category === "exam") ? (
                 <>
@@ -5107,6 +5844,27 @@ const styles = StyleSheet.create({
     flex: 1,
     paddingHorizontal: 10,
     paddingVertical: 9,
+    justifyContent: "center",
+  },
+  timelineCardCenter: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    paddingHorizontal: 6,
+  },
+  timelineDailyTitle: {
+    ...Typography.body,
+    fontSize: 16,
+    lineHeight: 20,
+    fontWeight: "700",
+    textAlign: "center",
+  },
+  timelineDailySubtitle: {
+    ...Typography.caption,
+    fontSize: 11,
+    lineHeight: 14,
+    textAlign: "center",
   },
   timelineTitle: {
     ...Typography.h2,
@@ -5125,6 +5883,19 @@ const styles = StyleSheet.create({
     fontSize: 11,
     marginTop: 4,
   },
+  timelineTimeCentered: {
+    marginTop: 0,
+    textAlign: "center",
+  },
+  timelineCardLibraryLink: {
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+  },
+  timelineCardLibraryText: {
+    ...Typography.caption,
+    fontSize: 10,
+    fontWeight: "600",
+  },
   dailyBlockSwipe: {
     width: "100%",
     flex: 1,
@@ -5142,6 +5913,10 @@ const styles = StyleSheet.create({
     height: "100%",
   },
   dailyTimeAdjustWrap: {
+    flex: 1,
+    height: "100%",
+  },
+  dailyTimePressable: {
     flex: 1,
     height: "100%",
   },
@@ -5174,8 +5949,10 @@ const styles = StyleSheet.create({
   dailyBlockChip: {
     borderWidth: 1,
     borderRadius: DAILY_BLOCK_RADIUS,
-    paddingHorizontal: 8,
+    paddingHorizontal: 10,
     paddingVertical: 7,
+    alignItems: "center",
+    justifyContent: "center",
   },
   dailyBlockChipRail: {
     width: 112,
@@ -5185,7 +5962,8 @@ const styles = StyleSheet.create({
     justifyContent: "flex-start",
   },
   dailyBlockLibraryChip: {
-    minHeight: 52,
+    minHeight: 34,
+    minWidth: 62,
     justifyContent: "center",
   },
   dailyBlockDeleteAction: {
@@ -5418,12 +6196,13 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderRadius: 12,
     overflow: "hidden",
-    minHeight: 44,
+    height: Platform.OS === "ios" ? 68 : 44,
     justifyContent: "center",
   },
   entryPicker: {
     width: "100%",
-    height: 44,
+    height: Platform.OS === "ios" ? 140 : 44,
+    marginVertical: Platform.OS === "ios" ? -36 : 0,
     opacity: 1,
   },
   entryPickerItem: {
@@ -5448,6 +6227,99 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: "600",
     textTransform: "capitalize",
+  },
+  createStageLabel: {
+    ...Typography.body,
+    fontSize: 22,
+    fontWeight: "800",
+    marginBottom: 12,
+  },
+  createStageStack: {
+    gap: 12,
+  },
+  createStageChoice: {
+    minHeight: 94,
+    borderRadius: 32,
+    borderWidth: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 20,
+  },
+  createStageChoiceText: {
+    ...Typography.h2,
+    fontSize: 34,
+    lineHeight: 40,
+    fontWeight: "800",
+    textAlign: "center",
+  },
+  createOtherInput: {
+    marginTop: 12,
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    ...Typography.body,
+    fontSize: 14,
+    fontWeight: "500",
+  },
+  createDropdownWrap: {
+    position: "relative",
+    zIndex: 20,
+  },
+  createDropdownField: {
+    minHeight: 94,
+    borderRadius: 32,
+    paddingHorizontal: 24,
+    alignItems: "center",
+    justifyContent: "center",
+    position: "relative",
+  },
+  createTimeField: {
+    minHeight: 92,
+    borderRadius: 28,
+  },
+  createDropdownFieldText: {
+    ...Typography.h2,
+    fontSize: 34,
+    lineHeight: 40,
+    fontWeight: "800",
+    color: "#FFFFFF",
+    textAlign: "center",
+  },
+  createDropdownIcon: {
+    position: "absolute",
+    right: 18,
+    top: "50%",
+    marginTop: -9,
+  },
+  createDropdownMenu: {
+    marginTop: 8,
+    borderWidth: 1,
+    borderRadius: 20,
+    overflow: "hidden",
+  },
+  createTimeDropdownMenu: {
+    maxHeight: 220,
+  },
+  createDropdownItem: {
+    paddingHorizontal: 18,
+    paddingVertical: 14,
+    borderBottomWidth: 1,
+    borderBottomColor: "rgba(148,163,184,0.16)",
+  },
+  createDropdownItemText: {
+    ...Typography.body,
+    fontSize: 18,
+    fontWeight: "700",
+    textAlign: "center",
+  },
+  createCompactPickerWrap: {
+    minHeight: 44,
+    height: 44,
+  },
+  createCompactPicker: {
+    height: 44,
+    marginVertical: 0,
   },
   entryTimeRow: {
     flexDirection: "row",
