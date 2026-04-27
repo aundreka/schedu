@@ -3,6 +3,7 @@ import type {
   Block,
   ExamBlockTemplate,
   PacingPlan,
+  QuizCoverage,
   SessionSlot,
   SessionSubcategory,
   TeacherRules,
@@ -142,14 +143,8 @@ function pickBalancedWrittenWorkSubtype(input: {
   return best;
 }
 
-function buildQuizCoverage(termLessons: TOCUnit[], lessonInterval: number, quizOrder: number, quizCount: number) {
-  const endOrder =
-    quizOrder === quizCount
-      ? termLessons.length
-      : Math.min(termLessons.length, lessonInterval * quizOrder);
-  const startOrder =
-    quizOrder === 1 ? 1 : Math.min(endOrder, Math.max(1, lessonInterval * (quizOrder - 1) + 1));
-  const coveredLessons = termLessons.slice(startOrder - 1, endOrder);
+function buildQuizCoverage(termLessons: TOCUnit[], coverage: QuizCoverage) {
+  const coveredLessons = termLessons.filter((lesson) => coverage.lessonIds.includes(lesson.id));
   const weights = coveredLessons.map((lesson) => difficultyWeight(lesson.difficulty));
   const maxComplexity = weights.length > 0 ? Math.max(...weights) : 1;
   const averageComplexity =
@@ -159,22 +154,38 @@ function buildQuizCoverage(termLessons: TOCUnit[], lessonInterval: number, quizO
     coveredLessons.length > 0 &&
     (() => {
       const last = coveredLessons[coveredLessons.length - 1]!;
-      const next = termLessons[endOrder] ?? null;
+      const next = termLessons[coverage.endLessonOrder] ?? null;
       return !next || next.chapterId !== last.chapterId;
     })();
   const unresolvedHardRegionCount = termLessons
-    .slice(endOrder)
+    .slice(coverage.endLessonOrder)
     .filter((lesson) => difficultyWeight(lesson.difficulty) >= 3).length;
   const chapterBoundaryWeight = sameDifficulty && endsChapter ? 1 : 0;
 
   return {
-    startOrder,
-    endOrder,
+    startOrder: coverage.startLessonOrder,
+    endOrder: coverage.endLessonOrder,
     coveredLessons,
     maxComplexity,
     averageComplexity,
     unresolvedHardRegionCount,
     chapterBoundaryWeight,
+  };
+}
+
+function guaranteedMetadata(input: Record<string, unknown> = {}) {
+  return {
+    scheduleTier: "guaranteed",
+    dropPriority: 0,
+    ...input,
+  };
+}
+
+function elasticMetadata(input: Record<string, unknown> = {}, dropPriority = 100) {
+  return {
+    scheduleTier: "elastic",
+    dropPriority,
+    ...input,
   };
 }
 
@@ -220,10 +231,12 @@ export function buildBlocks(input: BuildBlocksInput): Block[] {
         preferredSessionType: "any",
         dependencies: [],
         metadata: {
-          termIndex: term.termIndex,
-          termKey: term.termKey,
-          anchoredSlot: "term_start",
-          lowPriority: false,
+          ...guaranteedMetadata({
+            termIndex: term.termIndex,
+            termKey: term.termKey,
+            anchoredSlot: "term_start",
+            lowPriority: false,
+          }),
         },
       });
     }
@@ -245,21 +258,23 @@ export function buildBlocks(input: BuildBlocksInput): Block[] {
         preferredSessionType: lesson.preferredSessionType,
         dependencies: [],
         metadata: {
-          termIndex: term.termIndex,
-          termKey: term.termKey,
-          lessonOrder,
-          globalLessonOrder: globalOrder,
-          lessonTitle: lesson.title,
-          lessonDifficulty: lesson.difficulty,
-          lessonInterval: term.lessonInterval,
-          highComplexity: lesson.difficulty === "high",
-          isFirstLessonOfTerm: lessonOrder === 1,
-          anchoredSlot:
-            lessonOrder === 1
-              ? term.termIndex === 0
-                ? "first_term_second_slot"
-                : "term_start"
-              : null,
+          ...guaranteedMetadata({
+            termIndex: term.termIndex,
+            termKey: term.termKey,
+            lessonOrder,
+            globalLessonOrder: globalOrder,
+            lessonTitle: lesson.title,
+            lessonDifficulty: lesson.difficulty,
+            lessonInterval: term.lessonInterval,
+            highComplexity: lesson.difficulty === "high",
+            isFirstLessonOfTerm: lessonOrder === 1,
+            anchoredSlot:
+              lessonOrder === 1
+                ? term.termIndex === 0
+                  ? "first_term_second_slot"
+                  : "term_start"
+                : null,
+          }),
         },
       });
     });
@@ -287,10 +302,12 @@ export function buildBlocks(input: BuildBlocksInput): Block[] {
         preferredSessionType: subcategory === "lab_report" ? "laboratory" : "any",
         dependencies: [],
         metadata: {
-          termIndex: term.termIndex,
-          termKey: term.termKey,
-          ptOrder,
-          lowPriority: false,
+          ...guaranteedMetadata({
+            termIndex: term.termIndex,
+            termKey: term.termKey,
+            ptOrder,
+            lowPriority: false,
+          }),
         },
       });
     }
@@ -316,24 +333,22 @@ export function buildBlocks(input: BuildBlocksInput): Block[] {
         preferredSessionType: "any",
         dependencies: [],
         metadata: {
-          termIndex: term.termIndex,
-          termKey: term.termKey,
-          wwOrder,
-          lowPriority: false,
+          ...guaranteedMetadata({
+            termIndex: term.termIndex,
+            termKey: term.termKey,
+            wwOrder,
+            lowPriority: false,
+          }),
         },
       });
     }
     globalWwOrder += term.termWW;
 
-    for (let index = 0; index < term.termQuizAmount; index += 1) {
+    for (let index = 0; index < term.quizCoverages.length; index += 1) {
       const quizOrder = globalQuizOrder + index + 1;
       const wwOrder = termWwOffset + nonQuizWrittenWorkCount + index + 1;
-      const coverage = buildQuizCoverage(
-        term.tocUnits,
-        term.lessonInterval,
-        index + 1,
-        term.termQuizAmount
-      );
+      const coverageRange = term.quizCoverages[index]!;
+      const coverage = buildQuizCoverage(term.tocUnits, coverageRange);
 
       blocks.push({
         id: makeId("quiz", input.courseId, termPrefix, index + 1),
@@ -348,22 +363,25 @@ export function buildBlocks(input: BuildBlocksInput): Block[] {
         preferredSessionType: "any",
         dependencies: [],
         metadata: {
-          termIndex: term.termIndex,
-          termKey: term.termKey,
-          globalWwOrder: wwOrder,
-          quizOrder,
-          termQuizOrder: index + 1,
-          afterLessonOrder: coverage.endOrder,
-          lessonInterval: term.lessonInterval,
-          coveredLessonStartOrder: coverage.startOrder,
-          coveredLessonEndOrder: coverage.endOrder,
-          coveredLessonOrders: coverage.coveredLessons.map((_, coveredIndex) => coverage.startOrder + coveredIndex),
-          coveredLessonIds: coverage.coveredLessons.map((lesson) => lesson.id),
-          quizMaxDifficulty: coverage.maxComplexity,
-          quizAverageDifficulty: coverage.averageComplexity,
-          unresolvedHardRegionCount: coverage.unresolvedHardRegionCount,
-          chapterBoundaryWeight: coverage.chapterBoundaryWeight,
-          lowPriority: false,
+          ...guaranteedMetadata({
+            termIndex: term.termIndex,
+            termKey: term.termKey,
+            globalWwOrder: wwOrder,
+            quizOrder,
+            termQuizOrder: index + 1,
+            afterLessonOrder: coverageRange.endLessonOrder,
+            lessonInterval: term.lessonInterval,
+            coveredLessonStartOrder: coverageRange.startLessonOrder,
+            coveredLessonEndOrder: coverageRange.endLessonOrder,
+            coveredLessonCount: coverageRange.lessonCount,
+            coveredLessonOrders: coverageRange.lessonOrders,
+            coveredLessonIds: coverageRange.lessonIds,
+            quizMaxDifficulty: coverage.maxComplexity,
+            quizAverageDifficulty: coverage.averageComplexity,
+            unresolvedHardRegionCount: coverage.unresolvedHardRegionCount,
+            chapterBoundaryWeight: coverage.chapterBoundaryWeight,
+            lowPriority: false,
+          }),
         },
         });
       }
@@ -383,10 +401,12 @@ export function buildBlocks(input: BuildBlocksInput): Block[] {
         preferredSessionType: "any",
         dependencies: [],
         metadata: {
-          termIndex: term.termIndex,
-          termKey: term.termKey,
-          extraCandidateType: "review_before_exam",
-          lowPriority: true,
+          ...elasticMetadata({
+            termIndex: term.termIndex,
+            termKey: term.termKey,
+            extraCandidateType: "review_before_exam",
+            lowPriority: true,
+          }, 20),
         },
       });
 
@@ -394,9 +414,7 @@ export function buildBlocks(input: BuildBlocksInput): Block[] {
         const targetQuizOrder = globalQuizOrder - term.termQuizAmount + quizIndex + 1;
         const linkedQuizCoverage = buildQuizCoverage(
           term.tocUnits,
-          term.lessonInterval,
-          quizIndex + 1,
-          term.termQuizAmount
+          term.quizCoverages[quizIndex]!
         );
         blocks.push({
           id: makeId("buffer", input.courseId, termPrefix, "review_before_quiz", quizIndex + 1),
@@ -411,15 +429,17 @@ export function buildBlocks(input: BuildBlocksInput): Block[] {
           preferredSessionType: "any",
           dependencies: [],
           metadata: {
-            termIndex: term.termIndex,
-            termKey: term.termKey,
-            extraCandidateType: "review_before_quiz",
-            targetQuizOrder,
-            quizMaxDifficulty: linkedQuizCoverage.maxComplexity,
-            quizAverageDifficulty: linkedQuizCoverage.averageComplexity,
-            unresolvedHardRegionCount: linkedQuizCoverage.unresolvedHardRegionCount,
-            chapterBoundaryWeight: linkedQuizCoverage.chapterBoundaryWeight,
-            lowPriority: true,
+            ...elasticMetadata({
+              termIndex: term.termIndex,
+              termKey: term.termKey,
+              extraCandidateType: "review_before_quiz",
+              targetQuizOrder,
+              quizMaxDifficulty: linkedQuizCoverage.maxComplexity,
+              quizAverageDifficulty: linkedQuizCoverage.averageComplexity,
+              unresolvedHardRegionCount: linkedQuizCoverage.unresolvedHardRegionCount,
+              chapterBoundaryWeight: linkedQuizCoverage.chapterBoundaryWeight,
+              lowPriority: true,
+            }, 10),
           },
         });
       }
@@ -439,13 +459,15 @@ export function buildBlocks(input: BuildBlocksInput): Block[] {
           preferredSessionType: lesson.preferredSessionType,
           dependencies: [],
           metadata: {
-            termIndex: term.termIndex,
-            termKey: term.termKey,
-            extraCandidateType: "lesson_extension",
-            lessonOrder: lessonIndex + 1,
-            globalLessonOrder: globalLessonOrder - term.tocUnits.length + lessonIndex + 1,
-            highComplexity: lesson.difficulty === "high",
-            lowPriority: true,
+            ...elasticMetadata({
+              termIndex: term.termIndex,
+              termKey: term.termKey,
+              extraCandidateType: "lesson_extension",
+              lessonOrder: lessonIndex + 1,
+              globalLessonOrder: globalLessonOrder - term.tocUnits.length + lessonIndex + 1,
+              highComplexity: lesson.difficulty === "high",
+              lowPriority: true,
+            }, 30),
           },
         });
       });
@@ -472,12 +494,14 @@ export function buildBlocks(input: BuildBlocksInput): Block[] {
           preferredSessionType: subcategory === "lab_report" ? "laboratory" : "any",
           dependencies: [],
           metadata: {
-            termIndex: term.termIndex,
-            termKey: term.termKey,
-            extraCandidateType: "pt_extension",
-            ptOrder,
-            prioritizeReporting: subcategory === "reporting",
-            lowPriority: true,
+            ...elasticMetadata({
+              termIndex: term.termIndex,
+              termKey: term.termKey,
+              extraCandidateType: "pt_extension",
+              ptOrder,
+              prioritizeReporting: subcategory === "reporting",
+              lowPriority: true,
+            }, 40),
           },
         });
       }
@@ -499,10 +523,12 @@ export function buildBlocks(input: BuildBlocksInput): Block[] {
         preferredSessionType: "any",
         dependencies: [],
         metadata: {
-          termIndex: term.termIndex,
-          termKey: term.termKey,
-          extraCandidateType: "extra_written_work",
-          lowPriority: true,
+          ...elasticMetadata({
+            termIndex: term.termIndex,
+            termKey: term.termKey,
+            extraCandidateType: "extra_written_work",
+            lowPriority: true,
+          }, 50),
         },
       });
 
@@ -525,10 +551,12 @@ export function buildBlocks(input: BuildBlocksInput): Block[] {
         preferredSessionType: "any",
         dependencies: [],
         metadata: {
-          termIndex: term.termIndex,
-          termKey: term.termKey,
-          extraCandidateType: "extra_performance_task",
-          lowPriority: true,
+          ...elasticMetadata({
+            termIndex: term.termIndex,
+            termKey: term.termKey,
+            extraCandidateType: "extra_performance_task",
+            lowPriority: true,
+          }, 60),
         },
       });
     }
@@ -548,24 +576,26 @@ export function buildBlocks(input: BuildBlocksInput): Block[] {
         preferredSessionType: "any",
         dependencies: [],
         metadata: {
-          termIndex: term.termIndex,
-          termKey: term.termKey,
-          anchoredSlot:
-            examTemplate.subcategory === "final" && examTemplate.preferredDate
-              ? "preferred_date"
-              : "term_end",
-          preferredDate: examTemplate.preferredDate ?? null,
-          rawTermSlots: term.rawTermSlots,
-          initialDelayCount: term.initialDelayCount,
-          termSlots: term.termSlots,
-          extraTermSlots: term.extraTermSlots,
-          futureDelayCount: 0,
-          lessonInterval: term.lessonInterval,
-          termLessons: term.termLessons,
-          termPT: term.termPT,
-          termWW: term.termWW,
-          termQuizAmount: term.termQuizAmount,
-          lowPriority: false,
+          ...guaranteedMetadata({
+            termIndex: term.termIndex,
+            termKey: term.termKey,
+            anchoredSlot:
+              examTemplate.subcategory === "final" && examTemplate.preferredDate
+                ? "preferred_date"
+                : "term_end",
+            preferredDate: examTemplate.preferredDate ?? null,
+            rawTermSlots: term.rawTermSlots,
+            initialDelayCount: term.initialDelayCount,
+            termSlots: term.termSlots,
+            extraTermSlots: term.extraTermSlots,
+            futureDelayCount: 0,
+            lessonInterval: term.lessonInterval,
+            termLessons: term.termLessons,
+            termPT: term.termPT,
+            termWW: term.termWW,
+            termQuizAmount: term.termQuizAmount,
+            lowPriority: false,
+          }),
         },
       });
     }

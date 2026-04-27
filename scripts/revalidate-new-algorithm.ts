@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { buildPacingPlan } from "../algorithm/buildPacingPlan";
 import { placeBlocks } from "../algorithm/placeBlocks";
 import type { Block, SessionSlot } from "../algorithm/types";
 
@@ -13,7 +12,10 @@ function slot(id: string, date: string): SessionSlot {
     sessionType: "lecture",
     minutes: 90,
     locked: false,
+    lockReason: null,
     placements: [],
+    termIndex: 0,
+    termKey: "final",
   };
 }
 
@@ -21,7 +23,7 @@ function block(overrides: Partial<Block> & Pick<Block, "id" | "title" | "type" |
   return {
     courseId: "course_1",
     sourceTocId: null,
-    estimatedMinutes: 60,
+    estimatedMinutes: 45,
     minMinutes: 15,
     maxMinutes: 120,
     required: true,
@@ -29,162 +31,111 @@ function block(overrides: Partial<Block> & Pick<Block, "id" | "title" | "type" |
     overlayMode: "major",
     preferredSessionType: "lecture",
     dependencies: [],
-    metadata: {},
+    metadata: { termIndex: 0, termKey: "final" },
     ...overrides,
   };
 }
 
-function placementMinutesByBlock(slot: SessionSlot, blockId: string) {
-  return slot.placements
-    .filter((placement) => placement.blockId === blockId)
-    .reduce((sum, placement) => sum + placement.minutesUsed, 0);
+function findPlacement(resultSlots: SessionSlot[], blockId: string) {
+  for (let slotIndex = 0; slotIndex < resultSlots.length; slotIndex += 1) {
+    const placementIndex = resultSlots[slotIndex]!.placements.findIndex(
+      (placement) => placement.blockId === blockId
+    );
+    if (placementIndex >= 0) {
+      return { slotIndex, placementIndex };
+    }
+  }
+  return null;
 }
 
 function run() {
   const slots: SessionSlot[] = [
     slot("slot_1", "2026-06-01"),
-    slot("slot_2", "2026-06-01"),
-    slot("slot_3", "2026-06-02"),
-    slot("slot_4", "2026-06-03"),
-    slot("slot_5", "2026-06-04"),
+    slot("slot_2", "2026-06-02"),
+    slot("slot_3", "2026-06-03"),
   ];
 
   const lesson1 = block({
     id: "lesson_1",
-    title: "Lesson 1",
+    title: "L1",
     type: "lesson",
     subcategory: "lecture",
-    estimatedMinutes: 120,
-    splittable: true,
+    sourceTocId: "lesson_1",
+    metadata: { termIndex: 0, termKey: "final", lessonOrder: 1, globalLessonOrder: 1 },
   });
-
-  const seatwork = block({
-    id: "seatwork_1",
-    title: "Seatwork",
-    type: "written_work",
-    subcategory: "seatwork",
-    estimatedMinutes: 60,
-    overlayMode: "minor",
-    preferredSessionType: "any",
-    dependencies: [lesson1.id],
-    metadata: {
-      linkedLessonBlockId: lesson1.id,
-    },
-  });
-
   const lesson2 = block({
     id: "lesson_2",
-    title: "Lesson 2",
+    title: "L2",
     type: "lesson",
     subcategory: "lecture",
-    estimatedMinutes: 120,
-    splittable: true,
+    sourceTocId: "lesson_2",
+    metadata: { termIndex: 0, termKey: "final", lessonOrder: 2, globalLessonOrder: 2 },
   });
-
-  const preparation = block({
-    id: "prep_reporting",
-    title: "Preparation for Reporting",
-    type: "buffer",
-    subcategory: "preparation",
-    estimatedMinutes: 30,
-    overlayMode: "minor",
-    preferredSessionType: "any",
-    dependencies: [lesson2.id],
+  const quiz1 = block({
+    id: "quiz_1",
+    title: "Q1",
+    type: "written_work",
+    subcategory: "quiz",
     metadata: {
-      linkedLessonBlockId: lesson2.id,
+      termIndex: 0,
+      termKey: "final",
+      quizOrder: 1,
+      globalQuizOrder: 1,
+      coveredLessonIds: ["lesson_1", "lesson_2"],
+      coveredLessonOrders: [1, 2],
+      coveredLessonStartOrder: 1,
+      coveredLessonEndOrder: 2,
+      coveredLessonCount: 2,
+      afterLessonOrder: 2,
     },
   });
-
-  const reporting = block({
-    id: "reporting_1",
-    title: "Reporting",
-    type: "performance_task",
-    subcategory: "reporting",
-    estimatedMinutes: 120,
-    splittable: true,
-    dependencies: [lesson2.id, preparation.id],
+  const exam = block({
+    id: "exam_1",
+    title: "Final Exam",
+    type: "exam",
+    subcategory: "final",
+    estimatedMinutes: 90,
+    overlayMode: "exclusive",
+    metadata: {
+      termIndex: 0,
+      termKey: "final",
+      preferredDate: "2026-06-03",
+      anchoredSlot: "preferred_date",
+      rawTermSlots: 3,
+      initialDelayCount: 0,
+      termSlots: 3,
+      extraTermSlots: 0,
+      futureDelayCount: 0,
+      termLessons: 2,
+      termPT: 0,
+      termWW: 1,
+      termQuizAmount: 1,
+    },
   });
-
-  const blocks = [lesson1, seatwork, lesson2, preparation, reporting];
-  const pacingPlan = buildPacingPlan({ slots, blocks });
-  const anchoredPlan = {
-    ...pacingPlan,
-    majorBlockOrder: [lesson1, lesson2, reporting],
-    anchors: [
-      {
-        blockId: lesson1.id,
-        preferredSlotId: "slot_1",
-        preferredDate: "2026-06-01",
-        anchorType: "distributed" as const,
-      },
-      {
-        blockId: lesson2.id,
-        preferredSlotId: "slot_3",
-        preferredDate: "2026-06-02",
-        anchorType: "distributed" as const,
-      },
-      {
-        blockId: reporting.id,
-        preferredSlotId: "slot_4",
-        preferredDate: "2026-06-03",
-        anchorType: "distributed" as const,
-      },
-    ],
-  };
 
   const result = placeBlocks({
     slots,
-    blocks,
-    pacingPlan: anchoredPlan,
-    teacherRules: {
-      allowLessonWrittenWorkOverlay: true,
-      preferLessonWrittenWorkOverlay: true,
-    },
+    blocks: [lesson1, lesson2, quiz1, exam],
   });
 
-  assert.equal(result.unscheduledBlocks.length, 0, "Expected every test block to be scheduled.");
+  assert.equal(result.unscheduledBlockIds.length, 0, "Expected every test block to be scheduled.");
 
-  const byId = new Map(result.slots.map((currentSlot) => [currentSlot.id, currentSlot]));
-  const slot1 = byId.get("slot_1")!;
-  const slot2 = byId.get("slot_2")!;
-  const slot3 = byId.get("slot_3")!;
-  const slot4 = byId.get("slot_4")!;
-  const slot5 = byId.get("slot_5")!;
+  const lesson2Placement = findPlacement(result.slots, lesson2.id);
+  const quizPlacement = findPlacement(result.slots, quiz1.id);
+  const examPlacement = findPlacement(result.slots, exam.id);
 
-  assert.equal(placementMinutesByBlock(slot1, lesson1.id), 90);
-  assert.equal(placementMinutesByBlock(slot2, lesson1.id), 30);
-  assert.equal(placementMinutesByBlock(slot2, seatwork.id), 60);
-
-  assert.equal(placementMinutesByBlock(slot3, lesson2.id), 60);
-  assert.equal(placementMinutesByBlock(slot3, preparation.id), 30);
-  assert.equal(placementMinutesByBlock(slot4, lesson2.id), 30);
-  assert.equal(placementMinutesByBlock(slot4, reporting.id), 60);
-  assert.equal(placementMinutesByBlock(slot5, lesson2.id), 30);
-  assert.equal(placementMinutesByBlock(slot5, reporting.id), 60);
-
-  const lesson2Placements = result.slots.flatMap((currentSlot) =>
-    currentSlot.placements.filter((placement) => placement.blockId === lesson2.id)
-  );
-  assert.deepEqual(
-    lesson2Placements.map((placement) => placement.segmentIndex),
-    [1, 2, 3],
-    "Expected Lesson 2 to expose a connected 3-segment chain."
-  );
+  assert.ok(lesson2Placement, "Expected Lesson 2 to be scheduled.");
+  assert.ok(quizPlacement, "Expected Quiz 1 to be scheduled.");
+  assert.ok(examPlacement, "Expected the exam to be scheduled.");
+  assert.equal(result.slots[examPlacement!.slotIndex]!.date, "2026-06-03");
   assert.ok(
-    lesson2Placements.every((placement) => placement.chainId === lesson2.id),
-    "Expected Lesson 2 segments to share a stable chain id."
+    quizPlacement!.slotIndex > lesson2Placement!.slotIndex ||
+      (quizPlacement!.slotIndex === lesson2Placement!.slotIndex &&
+        quizPlacement!.placementIndex > lesson2Placement!.placementIndex),
+    "Expected the quiz to be placed after its covered lessons."
   );
 
-  const reportingPlacements = result.slots.flatMap((currentSlot) =>
-    currentSlot.placements.filter((placement) => placement.blockId === reporting.id)
-  );
-  assert.deepEqual(
-    reportingPlacements.map((placement) => placement.segmentIndex),
-    [1, 2],
-    "Expected Reporting to expose a connected 2-segment chain."
-  );
-
-  console.log("new algorithm revalidation: split, shared-slot, and connected-span checks passed");
+  console.log("new algorithm revalidation: shared-slot placement and quiz coverage checks passed");
 }
 
 run();

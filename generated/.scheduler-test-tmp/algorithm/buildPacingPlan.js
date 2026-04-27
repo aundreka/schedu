@@ -118,33 +118,66 @@ function distributeLessonsByChapter(tocUnits, termCount) {
     }
     return allocations;
 }
-function buildQuizPlan(termLessons, termSlots, difficulty) {
-    let termQuizAmount = 0;
-    let lessonInterval = 1;
-    if (termLessons > 5) {
-        termQuizAmount = Math.floor(termLessons / 3);
-        lessonInterval = 3;
+function partitionLessonCountIntoQuizGroups(termLessons) {
+    if (termLessons < 2)
+        return [];
+    const quizCount = Math.ceil(termLessons / 3);
+    const groups = new Array(quizCount).fill(2);
+    let remaining = termLessons - quizCount * 2;
+    for (let index = groups.length - 1; index >= 0 && remaining > 0; index -= 1) {
+        groups[index] += 1;
+        remaining -= 1;
     }
-    else if (termLessons > 3) {
-        termQuizAmount = Math.floor(termLessons / 2);
-        lessonInterval = 2;
-    }
-    else if (termLessons < 4) {
-        if (difficulty === "easy") {
-            termQuizAmount = Math.min(2, Math.max(1, Math.floor(termLessons / 2) || 1));
-            lessonInterval = 2;
+    return groups;
+}
+function buildQuizPlan(tocUnits, termIndex, termSlots, difficulty) {
+    let lessonGroups = partitionLessonCountIntoQuizGroups(tocUnits.length);
+    if (termSlots < tocUnits.length + lessonGroups.length + 1 && lessonGroups.length > 1) {
+        // When slot pressure is high, keep coverage explicit but prefer fewer quizzes.
+        const collapsed = [];
+        for (const size of lessonGroups) {
+            if (collapsed.length === 0) {
+                collapsed.push(size);
+                continue;
+            }
+            const current = collapsed[collapsed.length - 1];
+            if (current + size <= 3) {
+                collapsed[collapsed.length - 1] = current + size;
+            }
+            else {
+                collapsed.push(size);
+            }
         }
-        else {
-            termQuizAmount = Math.max(1, Math.floor(termLessons));
-            lessonInterval = 1;
+        lessonGroups = collapsed.every((size) => size >= 2 && size <= 3) ? collapsed : lessonGroups;
+    }
+    if (lessonGroups.length === 0 && tocUnits.length > 0 && difficulty !== "easy") {
+        lessonGroups = [tocUnits.length];
+    }
+    const quizCoverages = [];
+    let cursor = 0;
+    lessonGroups.forEach((groupSize) => {
+        const coveredLessons = tocUnits.slice(cursor, cursor + groupSize);
+        if (coveredLessons.length < 2 || coveredLessons.length > 3) {
+            cursor += coveredLessons.length;
+            return;
         }
-    }
-    if (termSlots < termLessons + 3) {
-        termQuizAmount = Math.min(termQuizAmount, 1);
-    }
+        const lessonOrders = coveredLessons.map((_, lessonIndex) => cursor + lessonIndex + 1);
+        quizCoverages.push({
+            termIndex,
+            lessonIds: coveredLessons.map((lesson) => lesson.id),
+            lessonOrders,
+            startLessonOrder: lessonOrders[0] ?? 0,
+            endLessonOrder: lessonOrders[lessonOrders.length - 1] ?? 0,
+            lessonCount: coveredLessons.length,
+        });
+        cursor += coveredLessons.length;
+    });
     return {
-        termQuizAmount,
-        lessonInterval: Math.max(1, lessonInterval),
+        termQuizAmount: quizCoverages.length,
+        lessonInterval: quizCoverages.length > 0
+            ? Math.max(...quizCoverages.map((coverage) => coverage.lessonCount))
+            : Math.max(1, Math.min(3, tocUnits.length || 1)),
+        quizCoverages,
     };
 }
 function getTermLabel(termKey) {
@@ -187,7 +220,7 @@ function buildPacingPlan(input) {
         const tocUnits = lessonsByTerm[termIndex] ?? [];
         const averageDifficultyWeight = tocUnits.length > 0 ? sumDifficulty(tocUnits) / tocUnits.length : 2;
         const difficulty = averageDifficultyWeight >= 2.5 ? "high" : averageDifficultyWeight >= 1.5 ? "medium" : "easy";
-        const { termQuizAmount, lessonInterval } = buildQuizPlan(tocUnits.length, termSlots, difficulty);
+        const { termQuizAmount, lessonInterval, quizCoverages } = buildQuizPlan(tocUnits, termIndex, termSlots, difficulty);
         const termWW = wwCounts[termIndex] ?? 0;
         const termPT = ptCounts[termIndex] ?? 0;
         const extraTermSlots = termSlots - (tocUnits.length + termWW + termPT + termQuizAmount + 1);
@@ -205,6 +238,7 @@ function buildPacingPlan(input) {
             termPT,
             termQuizAmount,
             lessonInterval,
+            quizCoverages,
             termSlots,
             extraTermSlots,
             startDate: firstSlot?.date ?? null,

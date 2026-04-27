@@ -110,6 +110,15 @@ export type ExamBlockTemplate = {
 
 export type TermKey = "prelim" | "midterm" | "final";
 
+export type QuizCoverage = {
+  termIndex: number;
+  lessonIds: string[];
+  lessonOrders: number[];
+  startLessonOrder: number;
+  endLessonOrder: number;
+  lessonCount: number;
+};
+
 export type TermLessonAllocation = {
   termIndex: number;
   termKey: TermKey;
@@ -122,6 +131,7 @@ export type TermLessonAllocation = {
   termPT: number;
   termQuizAmount: number;
   lessonInterval: number;
+  quizCoverages: QuizCoverage[];
   termSlots: number;
   extraTermSlots: number;
   startDate: string | null;
@@ -167,4 +177,16 @@ export type ValidationIssue = {
 export type PlacementResult = {
   slots: SessionSlot[];
   unscheduledBlockIds: string[];
+};
+
+export type TermSchedulingDiagnostics = {
+  termIndex: number;
+  emptyEligibleSlotCount: number;
+  partiallyUsedSlotCount: number;
+  missingCanonicalBlockIds: string[];
+  unscheduledRequiredBlockIds: string[];
+  droppedElasticBlockIds: string[];
+  guaranteedPlacementSatisfied: boolean;
+  requiresCompression: boolean;
+  hasValidationErrors: boolean;
 };

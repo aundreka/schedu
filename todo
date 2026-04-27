@@ -1,1 +1,59 @@
-the lesson blocks in daily view are not redirecting to lesson_detail.tsx/library/lesson_detail.tsx) when clicked. also modify the ordering of blocks in daily view so that buffer blocks are always in front of the slot
+**Must-Fix Before Launch**
+
+- Add a clear post-action summary after `suspend` and `repopulate`.
+  - Show what moved, what was newly created, what was dropped, and what remains unscheduled.
+
+- Clearly label `manual` vs `auto` blocks in the calendar UI.
+  - Teachers need to know which items the system may move automatically.
+
+- Add a `date-sensitive` flag for manual blocks.
+  - Without this, the system can move teacher-created items that were meant for a specific day.
+
+- Surface unscheduled blocks visibly.
+  - They should not be hidden in metadata or only appear through indirect behavior.
+
+- Explain suspension scope clearly in the suspend modal.
+  - The choice between `all plans` and `selected plans only` needs unambiguous wording.
+
+- Show quiz scope directly on quiz entries.
+  - Teachers need to see what a quiz covers without opening details.
+
+**Important**
+
+- Show a short reason when a block moves.
+  - Example: `moved due to suspension`, `moved during repopulate`, `shifted after quiz scope update`.
+
+- Add recovery history per term.
+  - Teachers should be able to understand repeated changes over time.
+
+- Surface when optional blocks were dropped or compressed.
+  - A plan may still be usable, but the teacher should know what was sacrificed.
+
+- Improve readability when many blocks share a slot/date.
+  - Dense calendars become hard to scan quickly.
+
+- Distinguish hard constraints from preferences in UI messaging.
+  - Teachers should know whether something moved because it had to or because it was only preferred elsewhere.
+
+- Improve lab/room realism controls.
+  - Scheduling may be valid algorithmically but still awkward in real classroom conditions.
+
+**Nice-to-Have**
+
+- Add a term health / recovery badge.
+  - Example: `stable`, `adapted`, `compressed`.
+
+- Add a recovery preview before applying major reschedules.
+  - Useful for heavy suspensions or large repopulate operations.
+
+- Let teachers filter the calendar by `manual`, `auto`, `quiz`, `lesson`, `PT`, etc.
+  - This helps with auditing large plans.
+
+- Add a lightweight audit trail on each block.
+  - Example: `created automatically`, `moved on Apr 27 due to suspension`.
+
+- Add smarter visual grouping for lesson chains and dependent quizzes.
+  - Makes adapted plans easier to understand at a glance.
+
+- Add optional notifications/highlights for “recently moved” entries.
+  - Helps frequent users keep track of automatic adjustments.

@@ -23,11 +23,20 @@ import {
 } from "react-native";
 import { State as GestureState, PinchGestureHandler } from "react-native-gesture-handler";
 import { buildBlocks, type BuildBlocksInput } from "../../../algorithm/buildBlocks";
-import { compressTermPlan } from "../../../algorithm/compressplan";
-import { placeBlocks } from "../../../algorithm/placeBlocks";
+import {
+  applyTermRepairResult,
+  compressTermUsingCapacity,
+  repopulateTermIntoEmptySlots,
+} from "../../../algorithm/repopulateplan";
+import { classifySlot } from "../../../algorithm/slotState";
 import { buildSlots, type RawMeetingSchedule } from "../../../algorithm/buildSlots";
 import { buildPacingPlan } from "../../../algorithm/buildPacingPlan";
 import { extendTermPlan } from "../../../algorithm/extendplan";
+import {
+  compareBlocksByCanonicalSequence,
+  getCanonicalIdentity as getAlgorithmCanonicalIdentity,
+  getCanonicalSequenceValue as getAlgorithmCanonicalSequenceValue,
+} from "../../../algorithm/sequence";
 import type { Block, ExamBlockTemplate, SessionSlot, TeacherRules, TOCUnit } from "../../../algorithm/types";
 import { validatePlan } from "../../../algorithm/validatePlan";
 import { Radius, Spacing, Typography } from "../../../constants/fonts";
@@ -41,6 +50,7 @@ import {
   mapSlotRowsToAlgorithmSlots,
   normalizeWeekdayValue,
   toHm,
+  toMinutes,
   type ScheduledCalendarBlock,
   type PlanBlockRow,
   type PlanSlotRow,
@@ -91,6 +101,7 @@ type PlanEntry = {
   algorithm_block_key?: string | null;
   slot_id?: string | null;
   order_no?: number | null;
+  metadata?: Record<string, unknown> | null;
 };
 
 function compareEntriesChronologically(a: PlanEntry, b: PlanEntry) {
@@ -155,6 +166,15 @@ type EntryEditorState = {
   startTime: string;
   endTime: string;
   reviewDays: string;
+  quizScopeStartLessonId: string | null;
+  quizScopeEndLessonId: string | null;
+};
+
+type LessonScopeOption = {
+  lessonId: string;
+  lessonOrder: number;
+  label: string;
+  termIndex: number;
 };
 
 type DailyPlacedBlock = {
@@ -525,13 +545,28 @@ function getDailyBlockOrderRank(block: {
   orderNo?: number | null;
   title?: string | null;
 }) {
+  if (block.category === "buffer") return -1;
   if (block.category === "lesson") return 0;
   if (block.category === "exam") return 1;
   if (block.category === "written_work" && block.subcategory === "quiz") return 2;
   if (block.category === "written_work") return 3;
   if (block.category === "performance_task") return 4;
-  if (block.category === "buffer") return 5;
   return 9;
+}
+
+function getCanonicalSequenceValue(input: {
+  category?: string | null;
+  type?: string | null;
+  subcategory?: string | null;
+  metadata?: Record<string, unknown> | null;
+  title?: string | null;
+}) {
+  return getAlgorithmCanonicalSequenceValue({
+    type: input.category ?? input.type,
+    subcategory: input.subcategory,
+    metadata: input.metadata,
+    title: input.title,
+  });
 }
 
 function getChipLabel(entry: PlanEntry) {
@@ -544,11 +579,17 @@ function getChipLabel(entry: PlanEntry) {
 
 function getDailyMetaLabel(entry: PlanEntry) {
   if (entry.category === "lesson") return "";
+  if (entry.category === "written_work" && entry.session_subcategory === "quiz") {
+    return entry.subtitle?.trim() || "Quiz";
+  }
   return formatEditorChoiceLabel(entry.category || "");
 }
 
 function getDailyPrimaryLabel(entry: PlanEntry) {
-  if (entry.category === "lesson") return entry.title;
+  if (entry.category === "lesson") {
+    const lessonOrder = Number(entry.metadata?.globalLessonOrder ?? entry.metadata?.lessonOrder ?? 0);
+    return lessonOrder > 0 ? `Lesson ${lessonOrder}: ${entry.title}` : entry.title;
+  }
   const orderMatch = entry.title.match(/(\d+)\s*$/);
   const order = orderMatch?.[1] ?? "";
   const subtypeSource = entry.session_subcategory ?? entry.ww_subtype ?? entry.pt_subtype ?? "";
@@ -572,55 +613,14 @@ function buildAutoBlockIdentity(input: {
   metadata?: Record<string, unknown> | null;
   title?: string | null;
 }) {
-  const metadata = input.metadata ?? {};
-  const title = (input.title ?? "").trim();
-  const extraCandidateType =
-    typeof metadata.extraCandidateType === "string" ? metadata.extraCandidateType : null;
-  const lessonTitleOrder = title.match(/(?:^L|lesson\s*)(\d+)$/i)?.[1] ?? null;
-  const quizTitleOrder = title.match(/(?:^|:\s*)(?:Q|quiz\s*)(\d+)/i)?.[1] ?? null;
-  const wwTitleOrder = title.match(/(?:^WW|written\s*work\s*)(\d+)/i)?.[1] ?? null;
-  const ptTitleOrder = title.match(/(?:^PT|performance\s*task\s*)(\d+)/i)?.[1] ?? null;
-  if (input.category === "lesson") {
-    const globalOrder = Number(metadata.globalLessonOrder ?? metadata.lessonOrder ?? lessonTitleOrder ?? 0);
-    if (extraCandidateType) {
-      return globalOrder > 0
-        ? `lesson|extra|${extraCandidateType}|${globalOrder}`
-        : `lesson|extra|${extraCandidateType}|${input.sourceTocId ?? input.lessonId ?? title.toLowerCase()}`;
-    }
-    if (globalOrder > 0) return `lesson|order|${globalOrder}`;
-    const source =
-      input.sourceTocId ??
-      input.lessonId ??
-      (typeof metadata.sourceTocId === "string" ? metadata.sourceTocId : null) ??
-      null;
-    return source ? `lesson|source|${source}` : null;
-  }
-  if (input.category === "written_work" && input.subcategory === "quiz") {
-    const order = Number(metadata.globalQuizOrder ?? metadata.quizOrder ?? quizTitleOrder ?? 0);
-    return order > 0 ? `quiz|${order}` : null;
-  }
-  if (input.category === "written_work") {
-    const order = Number(metadata.globalWwOrder ?? metadata.wwOrder ?? wwTitleOrder ?? 0);
-    if (extraCandidateType) {
-      return order > 0 ? `ww|extra|${extraCandidateType}|${order}` : `ww|extra|${extraCandidateType}`;
-    }
-    return order > 0 ? `ww|${order}` : null;
-  }
-  if (input.category === "performance_task") {
-    const order = Number(metadata.globalPtOrder ?? metadata.ptOrder ?? ptTitleOrder ?? 0);
-    if (extraCandidateType) {
-      return order > 0 ? `pt|extra|${extraCandidateType}|${order}` : `pt|extra|${extraCandidateType}`;
-    }
-    return order > 0 ? `pt|${order}` : null;
-  }
-  if (input.category === "exam") {
-    const termKey = typeof metadata.termKey === "string" ? metadata.termKey : String(metadata.termIndex ?? "");
-    return `exam|${termKey}|${input.subcategory ?? ""}`;
-  }
-  if (input.category === "buffer") {
-    return `buffer|${String(metadata.extraCandidateType ?? input.subcategory ?? "")}|${String(metadata.targetQuizOrder ?? "")}|${String(metadata.termIndex ?? "")}`;
-  }
-  return null;
+  return getAlgorithmCanonicalIdentity({
+    type: input.category,
+    subcategory: input.subcategory,
+    lessonId: input.lessonId,
+    sourceTocId: input.sourceTocId,
+    metadata: input.metadata,
+    title: input.title,
+  });
 }
 
 function getWrittenWorkSubtypeCode(subcategory?: string | null) {
@@ -634,6 +634,14 @@ function getPerformanceTaskSubtypeCode(subcategory?: string | null) {
   if (subcategory === "reporting") return "REP";
   if (subcategory === "project") return "PROJ";
   return "ACT";
+}
+
+function getQuizScopeLabel(metadata?: Record<string, unknown> | null) {
+  const source = metadata ?? {};
+  const start = Number(source.coveredLessonStartOrder ?? source.coveredLessonStart ?? 0);
+  const end = Number(source.coveredLessonEndOrder ?? source.coveredLessonEnd ?? 0);
+  if (!(start > 0) || !(end > 0)) return null;
+  return start === end ? `Lesson ${start}` : `Lessons ${start}-${end}`;
 }
 
 function getDisplayLabelsForBlockLike(input: {
@@ -653,8 +661,7 @@ function getDisplayLabelsForBlockLike(input: {
   }
   if (input.category === "written_work" && input.subcategory === "quiz") {
     const quizOrder = Number(metadata.globalQuizOrder ?? metadata.quizOrder ?? 0);
-    const wwOrder = Number(metadata.globalWwOrder ?? 0);
-    if (quizOrder > 0 && wwOrder > 0) return { title: `Q${quizOrder}`, subtitle: `WW${wwOrder}` };
+    if (quizOrder > 0) return { title: `Q${quizOrder}`, subtitle: getQuizScopeLabel(metadata) };
   }
   if (input.category === "written_work") {
     const wwOrder = Number(metadata.globalWwOrder ?? metadata.wwOrder ?? 0);
@@ -687,6 +694,18 @@ function applyEntryDisplayOrders(entries: PlanEntry[]) {
 
   for (const entry of chronologicalEntries) {
     if (entry.category === "written_work") {
+      if (entry.session_subcategory === "quiz") {
+        const code = getWrittenWorkSubtypeCode(entry.session_subcategory ?? entry.ww_subtype ?? "quiz");
+        const subtypeCount = (writtenSubtypeCounts.get(code) ?? 0) + 1;
+        writtenSubtypeCounts.set(code, subtypeCount);
+        writtenCount += 1;
+        relabeledByKey.set(`${entry.plan_entry_id}|${entry.scheduled_date ?? ""}`, {
+          ...entry,
+          title: `${code}${subtypeCount}`,
+          subtitle: getQuizScopeLabel(entry.metadata) ?? entry.subtitle ?? null,
+        });
+        continue;
+      }
       const code = getWrittenWorkSubtypeCode(entry.session_subcategory ?? entry.ww_subtype ?? "assignment");
       const subtypeCount = (writtenSubtypeCounts.get(code) ?? 0) + 1;
       writtenSubtypeCounts.set(code, subtypeCount);
@@ -738,8 +757,16 @@ function getCanonicalAutoBlockTitle(input: {
   }
   if (input.category === "written_work" && input.subcategory === "quiz") {
     const quizOrder = Number(metadata.globalQuizOrder ?? metadata.quizOrder ?? 0);
-    const wwOrder = Number(metadata.globalWwOrder ?? 0);
-    return quizOrder > 0 && wwOrder > 0 ? `WW${wwOrder}: Q${quizOrder}` : input.fallbackTitle;
+    const start = Number(metadata.coveredLessonStartOrder ?? metadata.coveredLessonStart ?? 0);
+    const end = Number(metadata.coveredLessonEndOrder ?? metadata.coveredLessonEnd ?? 0);
+
+    if (quizOrder > 0 && start > 0 && end > 0) {
+      return start === end
+        ? `Q${quizOrder}: Lesson ${start}`
+        : `Q${quizOrder}: Lessons ${start}-${end}`;
+    }
+
+    return quizOrder > 0 ? `Q${quizOrder}` : input.fallbackTitle;
   }
   if (input.category === "written_work") {
     const wwOrder = Number(metadata.globalWwOrder ?? metadata.wwOrder ?? 0);
@@ -920,228 +947,6 @@ function canonicalizeLoadedPlanBlocks(blockRows: PlanBlockRow[]) {
   });
 }
 
-function buildSyntheticRequiredTermBlocks(input: {
-  lessonPlanId: string;
-  allPlanBlocks: PlanBlockRow[];
-  currentTermBlocks: Block[];
-  termIndex: number;
-  termSlots: SessionSlot[];
-}) {
-  const examRow =
-    input.allPlanBlocks.find(
-      (block) =>
-        block.session_category === "exam" && Number(block.metadata?.termIndex ?? -1) === input.termIndex
-    ) ?? null;
-  if (!examRow) return [] as Block[];
-
-  const examMetadata = { ...(examRow.metadata ?? {}) };
-  const offsets = getTermRequirementOffsets(input.allPlanBlocks);
-  const termOffsets = offsets.get(input.termIndex) ?? { lesson: 0, ww: 0, pt: 0, quiz: 0 };
-  const termKey =
-    typeof examMetadata.termKey === "string" && examMetadata.termKey
-      ? examMetadata.termKey
-      : input.termIndex === 0
-        ? "prelim"
-        : input.termIndex === 1
-          ? "midterm"
-          : "final";
-
-  const expectedLessons = Math.max(0, Number(examMetadata.termLessons ?? 0));
-  const expectedWW = Math.max(0, Number(examMetadata.termWW ?? 0));
-  const expectedPT = Math.max(0, Number(examMetadata.termPT ?? 0));
-  const expectedQuiz = Math.max(0, Number(examMetadata.termQuizAmount ?? 0));
-  const expectedNonQuizWW = Math.max(0, expectedWW - expectedQuiz);
-
-  const lessonTemplate =
-    input.currentTermBlocks.find((block) => block.type === "lesson" && !block.metadata.extraCandidateType) ?? null;
-  const wwTemplate =
-    input.currentTermBlocks.find(
-      (block) =>
-        block.type === "written_work" &&
-        block.subcategory !== "quiz" &&
-        !block.metadata.extraCandidateType
-    ) ?? null;
-  const ptTemplate =
-    input.currentTermBlocks.find(
-      (block) => block.type === "performance_task" && !block.metadata.extraCandidateType
-    ) ?? null;
-  const quizTemplate =
-    input.currentTermBlocks.find(
-      (block) => block.type === "written_work" && block.subcategory === "quiz"
-    ) ?? null;
-
-  const hasOrientation = input.currentTermBlocks.some(
-    (block) => block.type === "buffer" && block.subcategory === "orientation"
-  );
-  const existingLessons = new Set(
-    input.currentTermBlocks
-      .filter((block) => block.type === "lesson" && !block.metadata.extraCandidateType)
-      .map((block) => Number(block.metadata.globalLessonOrder ?? block.metadata.lessonOrder ?? 0))
-      .filter((value) => value > 0)
-  );
-  const existingWW = new Set(
-    input.currentTermBlocks
-      .filter(
-        (block) =>
-          block.type === "written_work" &&
-          block.subcategory !== "quiz" &&
-          !block.metadata.extraCandidateType
-      )
-      .map((block) => Number(block.metadata.globalWwOrder ?? block.metadata.wwOrder ?? 0))
-      .filter((value) => value > 0)
-  );
-  const existingPT = new Set(
-    input.currentTermBlocks
-      .filter((block) => block.type === "performance_task" && !block.metadata.extraCandidateType)
-      .map((block) => Number(block.metadata.globalPtOrder ?? block.metadata.ptOrder ?? 0))
-      .filter((value) => value > 0)
-  );
-  const existingQuiz = new Set(
-    input.currentTermBlocks
-      .filter((block) => block.type === "written_work" && block.subcategory === "quiz")
-      .map((block) => Number(block.metadata.globalQuizOrder ?? block.metadata.quizOrder ?? 0))
-      .filter((value) => value > 0)
-  );
-
-  const synthesized: Block[] = [];
-
-  if (input.termIndex === 0 && input.termSlots.length > 0 && !hasOrientation) {
-    synthesized.push({
-      id: `buffer__repopulate__${input.lessonPlanId}__${termKey}_${input.termIndex + 1}__orientation`,
-      courseId: input.lessonPlanId,
-      type: "buffer",
-      subcategory: "orientation",
-      title: "Orientation",
-      estimatedMinutes: 60,
-      required: true,
-      splittable: false,
-      overlayMode: "exclusive",
-      preferredSessionType: "any",
-      dependencies: [],
-      metadata: {
-        termIndex: input.termIndex,
-        termKey,
-        anchoredSlot: "term_start",
-        lowPriority: false,
-      },
-    });
-  }
-
-  for (let localOrder = 1; localOrder <= expectedLessons; localOrder += 1) {
-    const globalOrder = termOffsets.lesson + localOrder;
-    if (existingLessons.has(globalOrder)) continue;
-    synthesized.push({
-      id: `lesson__repopulate__${input.lessonPlanId}__${termKey}_${input.termIndex + 1}__${localOrder}`,
-      courseId: input.lessonPlanId,
-      type: "lesson",
-      subcategory: lessonTemplate?.subcategory === "laboratory" ? "laboratory" : "lecture",
-      title: `L${globalOrder}`,
-      sourceTocId: null,
-      estimatedMinutes: Math.max(30, lessonTemplate?.estimatedMinutes ?? 60),
-      required: true,
-      splittable: false,
-      overlayMode: "major",
-      preferredSessionType: lessonTemplate?.preferredSessionType ?? "any",
-      dependencies: [],
-      metadata: {
-        termIndex: input.termIndex,
-        termKey,
-        lessonOrder: localOrder,
-        globalLessonOrder: globalOrder,
-        isFirstLessonOfTerm: localOrder === 1,
-        anchoredSlot:
-          localOrder === 1
-            ? input.termIndex === 0
-              ? "first_term_second_slot"
-              : "term_start"
-            : null,
-        lowPriority: false,
-      },
-    });
-  }
-
-  for (let localOrder = 1; localOrder <= expectedPT; localOrder += 1) {
-    const globalOrder = termOffsets.pt + localOrder;
-    if (existingPT.has(globalOrder)) continue;
-    synthesized.push({
-      id: `pt__repopulate__${input.lessonPlanId}__${termKey}_${input.termIndex + 1}__${localOrder}`,
-      courseId: input.lessonPlanId,
-      type: "performance_task",
-      subcategory: ptTemplate?.subcategory ?? "activity",
-      title: `PT${globalOrder}`,
-      estimatedMinutes: Math.max(30, ptTemplate?.estimatedMinutes ?? 60),
-      required: true,
-      splittable: false,
-      overlayMode: "major",
-      preferredSessionType: ptTemplate?.preferredSessionType ?? "any",
-      dependencies: [],
-      metadata: {
-        termIndex: input.termIndex,
-        termKey,
-        ptOrder: globalOrder,
-        globalPtOrder: globalOrder,
-        lowPriority: false,
-      },
-    });
-  }
-
-  for (let localOrder = 1; localOrder <= expectedNonQuizWW; localOrder += 1) {
-    const globalOrder = termOffsets.ww + localOrder;
-    if (existingWW.has(globalOrder)) continue;
-    synthesized.push({
-      id: `ww__repopulate__${input.lessonPlanId}__${termKey}_${input.termIndex + 1}__${localOrder}`,
-      courseId: input.lessonPlanId,
-      type: "written_work",
-      subcategory:
-        wwTemplate?.subcategory && wwTemplate.subcategory !== "quiz" ? wwTemplate.subcategory : "assignment",
-      title: `WW${globalOrder}`,
-      estimatedMinutes: Math.max(15, wwTemplate?.estimatedMinutes ?? 30),
-      required: true,
-      splittable: false,
-      overlayMode: "minor",
-      preferredSessionType: wwTemplate?.preferredSessionType ?? "any",
-      dependencies: [],
-      metadata: {
-        termIndex: input.termIndex,
-        termKey,
-        wwOrder: globalOrder,
-        globalWwOrder: globalOrder,
-        lowPriority: false,
-      },
-    });
-  }
-
-  for (let localOrder = 1; localOrder <= expectedQuiz; localOrder += 1) {
-    const globalOrder = termOffsets.quiz + localOrder;
-    const wwDisplayOrder = termOffsets.ww + expectedNonQuizWW + localOrder;
-    if (existingQuiz.has(globalOrder)) continue;
-    synthesized.push({
-      id: `quiz__repopulate__${input.lessonPlanId}__${termKey}_${input.termIndex + 1}__${localOrder}`,
-      courseId: input.lessonPlanId,
-      type: "written_work",
-      subcategory: "quiz",
-      title: `Q${globalOrder}`,
-      estimatedMinutes: Math.max(15, quizTemplate?.estimatedMinutes ?? 30),
-      required: true,
-      splittable: false,
-      overlayMode: "major",
-      preferredSessionType: quizTemplate?.preferredSessionType ?? "any",
-      dependencies: [],
-      metadata: {
-        termIndex: input.termIndex,
-        termKey,
-        quizOrder: globalOrder,
-        globalQuizOrder: globalOrder,
-        globalWwOrder: wwDisplayOrder,
-        termQuizOrder: localOrder,
-        lowPriority: false,
-      },
-    });
-  }
-
-  return synthesized;
-}
-
 function getDisplayTitleForBlockLike(input: {
   title: string;
   category?: string | null;
@@ -1170,11 +975,17 @@ function getDailyDisplayTitleForBlockLike(input: {
 }
 
 function getLibraryRouteForEntry(entry: PlanEntry, subjectId?: string | null) {
-  if (entry.category === "lesson" && entry.lesson_id) {
+  const metadataSourceLessonId =
+    typeof entry.metadata?.sourceTocId === "string" && isUuid(entry.metadata.sourceTocId)
+      ? entry.metadata.sourceTocId
+      : null;
+  const lessonId = entry.lesson_id ?? metadataSourceLessonId;
+
+  if (entry.category === "lesson" && lessonId) {
     return {
       pathname: "/library/lesson_detail" as const,
       params: {
-        lessonId: entry.lesson_id,
+        lessonId,
         ...(subjectId ? { subjectId } : {}),
       },
     };
@@ -1348,6 +1159,7 @@ function buildPlanEntriesFromScheduledSlots(slots: ScheduledCalendarSlot[]): Pla
       algorithm_block_key: block.algorithmBlockKey,
       slot_id: block.slotId,
       order_no: block.orderNo,
+      metadata: block.metadata,
     }))
   );
 }
@@ -1401,6 +1213,124 @@ function buildRecurringSchedulesFromSlotRows(slotRows: PlanSlotRow[]): RawMeetin
   return Array.from(unique.values());
 }
 
+function getSlotCapacityMinutes(slot: Pick<PlanSlotRow, "start_time" | "end_time">) {
+  return toMinutes(slot.start_time, slot.end_time);
+}
+
+function getPlannedMinutesForSlot(slotId: string, blockRows: PlanBlockRow[]) {
+  return blockRows
+    .filter((block) => block.slot_id === slotId)
+    .reduce((sum, block) => sum + Math.max(15, Number(block.estimated_minutes ?? 0)), 0);
+}
+
+function slotHasRemainingCapacity(slot: PlanSlotRow, blockRows: PlanBlockRow[]) {
+  const capacity = getSlotCapacityMinutes(slot);
+  if (capacity <= 0) return true;
+  return getPlannedMinutesForSlot(slot.slot_id, blockRows) < capacity;
+}
+
+function classifyPlanSlotState(
+  slot: PlanSlotRow,
+  blockRows: PlanBlockRow[],
+  algorithmSlot?: SessionSlot | null
+) {
+  const fallbackAlgorithmSlot = mapSlotRowsToAlgorithmSlots([slot])[0];
+  if (!fallbackAlgorithmSlot) return "blocked" as const;
+  const slotSeed = buildPlacementSeed([slot], blockRows)[slot.slot_id] ?? [];
+  const blockMap = new Map(
+    mapBlockRowsToAlgorithmBlocks(blockRows).map((block) => [block.id, block] as const)
+  );
+  return classifySlot(
+    {
+      ...(algorithmSlot ?? fallbackAlgorithmSlot),
+      locked: Boolean(slot.is_locked),
+      placements: [...slotSeed],
+    },
+    blockMap
+  );
+}
+
+function isEligibleEmptyPlanSlot(
+  slot: PlanSlotRow,
+  blockRows: PlanBlockRow[],
+  algorithmSlot?: SessionSlot | null
+) {
+  return classifyPlanSlotState(slot, blockRows, algorithmSlot) === "empty";
+}
+
+function getQuizCoverageFromMetadata(
+  metadata: Record<string, unknown> | null | undefined
+) {
+  const source = metadata ?? {};
+  const coveredLessonIds = Array.isArray(source.coveredLessonIds)
+    ? source.coveredLessonIds.filter((value): value is string => typeof value === "string")
+    : [];
+  const coveredLessonOrders = Array.isArray(source.coveredLessonOrders)
+    ? source.coveredLessonOrders
+        .map((value) => Number(value))
+        .filter((value) => Number.isFinite(value) && value > 0)
+    : [];
+  const startOrder = Number(source.coveredLessonStartOrder ?? 0);
+  const endOrder = Number(source.coveredLessonEndOrder ?? 0);
+  const lessonCount = Number(source.coveredLessonCount ?? coveredLessonOrders.length);
+  if (coveredLessonIds.length === 0 || coveredLessonOrders.length === 0 || startOrder <= 0 || endOrder <= 0) {
+    return null;
+  }
+  return {
+    coveredLessonIds,
+    coveredLessonOrders,
+    startOrder,
+    endOrder,
+    lessonCount,
+  };
+}
+
+function buildQuizCoverageMetadataFromLessons(input: {
+  lessons: LessonScopeOption[];
+  existingMetadata?: Record<string, unknown> | null;
+  globalQuizOrder: number;
+  termQuizOrder: number;
+  globalWwOrder: number;
+}) {
+  const { lessons, existingMetadata, globalQuizOrder, termQuizOrder, globalWwOrder } = input;
+  const firstLesson = lessons[0] ?? null;
+  const lastLesson = lessons[lessons.length - 1] ?? null;
+  return {
+    ...(existingMetadata ?? {}),
+    quizOrder: globalQuizOrder,
+    globalQuizOrder,
+    termQuizOrder,
+    globalWwOrder,
+    coveredLessonIds: lessons.map((lesson) => lesson.lessonId),
+    coveredLessonOrders: lessons.map((lesson) => lesson.lessonOrder),
+    coveredLessonStartOrder: firstLesson?.lessonOrder ?? 0,
+    coveredLessonEndOrder: lastLesson?.lessonOrder ?? 0,
+    coveredLessonCount: lessons.length,
+    afterLessonOrder: lastLesson?.lessonOrder ?? 0,
+  };
+}
+
+function splitLessonOptionsIntoContiguousRanges(lessons: LessonScopeOption[]) {
+  if (lessons.length === 0) return [] as LessonScopeOption[][];
+  const sorted = [...lessons].sort((a, b) => a.lessonOrder - b.lessonOrder);
+  const ranges: LessonScopeOption[][] = [];
+  let current: LessonScopeOption[] = [sorted[0]!];
+
+  for (let index = 1; index < sorted.length; index += 1) {
+    const lesson = sorted[index]!;
+    const previous = current[current.length - 1]!;
+    if (lesson.lessonOrder === previous.lessonOrder + 1) {
+      current.push(lesson);
+      continue;
+    }
+    ranges.push(current);
+    current = [lesson];
+  }
+
+  ranges.push(current);
+  return ranges;
+}
+
 function inferLessonOrder(title: string, fallback: number) {
   const matched = title.match(/lesson\s+(\d+)/i);
   return matched ? Number(matched[1]) : fallback;
@@ -1417,15 +1347,23 @@ function buildTocUnitsFromBlockRows(lessonPlanId: string, blockRows: PlanBlockRo
 
   requiredLessons.forEach((block, index) => {
     const lessonOrder =
-      typeof block.metadata?.globalLessonOrder === "number"
-        ? Number(block.metadata.globalLessonOrder)
-        : typeof block.metadata?.lessonOrder === "number"
-          ? Number(block.metadata.lessonOrder)
-          : inferLessonOrder(block.title, index + 1);
+      getCanonicalSequenceValue({
+        category: "lesson",
+        metadata: block.metadata,
+        title: block.title,
+      }) || inferLessonOrder(block.title, index + 1);
+    const resolvedSourceTocId =
+      typeof block.metadata?.sourceTocId === "string" && block.metadata.sourceTocId.trim()
+        ? block.metadata.sourceTocId.trim()
+        : null;
+    const resolvedLessonTitle =
+      typeof block.metadata?.lessonTitle === "string" && block.metadata.lessonTitle.trim()
+        ? block.metadata.lessonTitle.trim()
+        : block.title.trim();
     const sourceId =
-      (lessonOrder > 0 ? `lesson_order_${lessonOrder}` : null) ||
-      (typeof block.metadata?.sourceTocId === "string" && block.metadata.sourceTocId) ||
+      resolvedSourceTocId ||
       block.lesson_id ||
+      (lessonOrder > 0 ? `lesson_order_${lessonOrder}` : null) ||
       block.block_key ||
       block.algorithm_block_key ||
       block.block_id;
@@ -1442,7 +1380,7 @@ function buildTocUnitsFromBlockRows(lessonPlanId: string, blockRows: PlanBlockRo
       courseId: lessonPlanId,
       chapterId: typeof block.metadata?.chapterId === "string" ? block.metadata.chapterId : null,
       chapterTitle: typeof block.metadata?.chapterTitle === "string" ? block.metadata.chapterTitle : null,
-      title: block.title,
+      title: resolvedLessonTitle,
       order: lessonOrder,
       estimatedMinutes: Math.max(30, Number(block.estimated_minutes ?? 60)),
       difficulty,
@@ -1651,10 +1589,6 @@ function buildBlockMap(blocks: Block[]) {
   return new Map(blocks.map((block) => [block.id, block]));
 }
 
-function getMajorPlacement(slot: SessionSlot) {
-  return slot.placements.find((placement) => placement.lane === "major") ?? null;
-}
-
 function rebuildSlotPlacementOrder(slot: SessionSlot, blockMap: Map<string, Block>) {
   const rank = (placement: { blockId: string; lane: "major" | "minor" }) => {
     const block = blockMap.get(placement.blockId);
@@ -1669,7 +1603,27 @@ function rebuildSlotPlacementOrder(slot: SessionSlot, blockMap: Map<string, Bloc
   };
 
   slot.placements = [...slot.placements]
-    .sort((a, b) => rank(a) - rank(b) || a.blockId.localeCompare(b.blockId))
+    .sort((a, b) => {
+      const rankDiff = rank(a) - rank(b);
+      if (rankDiff !== 0) return rankDiff;
+      const aBlock = blockMap.get(a.blockId) ?? null;
+      const bBlock = blockMap.get(b.blockId) ?? null;
+      const sequenceDiff =
+        getCanonicalSequenceValue({
+          category: aBlock?.type,
+          subcategory: aBlock?.subcategory,
+          metadata: aBlock?.metadata,
+          title: aBlock?.title,
+        }) -
+        getCanonicalSequenceValue({
+          category: bBlock?.type,
+          subcategory: bBlock?.subcategory,
+          metadata: bBlock?.metadata,
+          title: bBlock?.title,
+        });
+      if (sequenceDiff !== 0) return sequenceDiff;
+      return a.blockId.localeCompare(b.blockId);
+    })
     .map((placement, index) => ({
       ...placement,
       id: `placement__${placement.blockId}__${slot.id}__${index + 1}`,
@@ -1702,35 +1656,80 @@ function addRecoveredPlacement(
   });
 }
 
-function createMajorGapAt(termSlots: SessionSlot[], targetIndex: number) {
+function getMissingRequiredBlockIds(termSlots: SessionSlot[], termBlocks: Block[]) {
+  const placedIds = new Set(termSlots.flatMap((slot) => slot.placements.map((placement) => placement.blockId)));
+  return termBlocks
+    .filter((block) => {
+      if (!block.required) return false;
+      if (block.type === "exam") return false;
+      if (block.metadata.extraCandidateType) return false;
+      return !placedIds.has(block.id);
+    })
+    .map((block) => block.id);
+}
+
+function comparePlacementOrder(
+  a: { slotIndex: number; placementIndex: number } | null,
+  b: { slotIndex: number; placementIndex: number } | null
+) {
+  if (!a && !b) return 0;
+  if (!a) return -1;
+  if (!b) return 1;
+  if (a.slotIndex !== b.slotIndex) return a.slotIndex - b.slotIndex;
+  return a.placementIndex - b.placementIndex;
+}
+
+function buildFirstPlacementOrderMap(termSlots: SessionSlot[]) {
   const sortedTermSlots = [...termSlots].sort((a, b) => {
     const dateCompare = a.date.localeCompare(b.date);
     if (dateCompare !== 0) return dateCompare;
     return (a.startTime ?? "").localeCompare(b.startTime ?? "");
   });
-  const lastUsableIndex = Math.max(0, sortedTermSlots.length - 2);
-  if (targetIndex < 0 || targetIndex > lastUsableIndex) return false;
-  const targetSlot = sortedTermSlots[targetIndex];
-  if (!targetSlot || targetSlot.locked) return false;
-  if (!getMajorPlacement(targetSlot)) return true;
-
-  let emptyIndex = -1;
-  for (let index = lastUsableIndex; index >= targetIndex; index -= 1) {
-    const slot = sortedTermSlots[index];
-    if (!slot || slot.locked || getMajorPlacement(slot)) continue;
-    emptyIndex = index;
-    break;
-  }
-  if (emptyIndex === -1) return false;
-
-  for (let index = emptyIndex; index > targetIndex; index -= 1) {
-    swapMajorPlacements(sortedTermSlots, index - 1, index);
-  }
-
-  return !getMajorPlacement(sortedTermSlots[targetIndex]!);
+  const firstPlacementOrderByBlockId = new Map<string, { slotIndex: number; placementIndex: number }>();
+  sortedTermSlots.forEach((slot, slotIndex) => {
+    slot.placements.forEach((placement, placementIndex) => {
+      if (!firstPlacementOrderByBlockId.has(placement.blockId)) {
+        firstPlacementOrderByBlockId.set(placement.blockId, { slotIndex, placementIndex });
+      }
+    });
+  });
+  return firstPlacementOrderByBlockId;
 }
 
-function recoverMissingRequiredBlocks(termSlots: SessionSlot[], termBlocks: Block[]) {
+function getValidationBlockKey(block: Block) {
+  return (
+    buildAutoBlockIdentity({
+      category: block.type,
+      subcategory: block.subcategory,
+      sourceTocId: block.sourceTocId ?? null,
+      metadata: block.metadata,
+      title: block.title,
+    }) ?? block.id
+  );
+}
+
+function buildFirstPlacementOrderMapByValidationKey(termSlots: SessionSlot[], termBlocks: Block[]) {
+  const sortedTermSlots = [...termSlots].sort((a, b) => {
+    const dateCompare = a.date.localeCompare(b.date);
+    if (dateCompare !== 0) return dateCompare;
+    return (a.startTime ?? "").localeCompare(b.startTime ?? "");
+  });
+  const blockMap = buildBlockMap(termBlocks);
+  const firstPlacementOrderByValidationKey = new Map<string, { slotIndex: number; placementIndex: number }>();
+  sortedTermSlots.forEach((slot, slotIndex) => {
+    slot.placements.forEach((placement, placementIndex) => {
+      const block = blockMap.get(placement.blockId) ?? null;
+      if (!block) return;
+      const key = getValidationBlockKey(block);
+      if (!firstPlacementOrderByValidationKey.has(key)) {
+        firstPlacementOrderByValidationKey.set(key, { slotIndex, placementIndex });
+      }
+    });
+  });
+  return firstPlacementOrderByValidationKey;
+}
+
+function applyLegacyRequiredBlockRecoveryFallback(termSlots: SessionSlot[], termBlocks: Block[]) {
   const sortedTermSlots = [...termSlots].sort((a, b) => {
     const dateCompare = a.date.localeCompare(b.date);
     if (dateCompare !== 0) return dateCompare;
@@ -1738,182 +1737,98 @@ function recoverMissingRequiredBlocks(termSlots: SessionSlot[], termBlocks: Bloc
   });
   const blockMap = buildBlockMap(termBlocks);
   const placedIds = new Set(sortedTermSlots.flatMap((slot) => slot.placements.map((placement) => placement.blockId)));
-  const examIndex = sortedTermSlots.findIndex((slot) => {
-    const major = getMajorPlacement(slot);
-    const block = major ? blockMap.get(major.blockId) ?? null : null;
-    return block?.type === "exam";
-  });
-  const lastUsableIndex = examIndex >= 0 ? examIndex - 1 : sortedTermSlots.length - 1;
-
-  const findAnchorSlotIndex = (preferredOrderKey: string, preferredOrder: number) => {
-    const exact = sortedTermSlots.findIndex((slot) =>
-      slot.placements.some((placement) => {
-        const block = blockMap.get(placement.blockId);
-        return Number(block?.metadata[preferredOrderKey] ?? -1) === preferredOrder;
-      })
-    );
-    if (exact >= 0) return exact;
-
-    const lessonIndex = sortedTermSlots.findIndex((slot) => {
-      const major = getMajorPlacement(slot);
-      const block = major ? blockMap.get(major.blockId) ?? null : null;
-      return block?.type === "lesson" && Number(block.metadata.lessonOrder ?? -1) >= preferredOrder;
-    });
-    if (lessonIndex >= 0) return lessonIndex;
-
-    for (let index = 0; index <= lastUsableIndex; index += 1) {
-      const slot = sortedTermSlots[index]!;
-      const major = getMajorPlacement(slot);
-      const block = major ? blockMap.get(major.blockId) ?? null : null;
-      if (!slot.locked && block?.type !== "exam") return index;
-    }
-
-    return Math.max(0, lastUsableIndex);
-  };
-
-  const placeMinorFallback = (block: Block, preferredIndex: number) => {
-    const boundedIndex = Math.max(0, Math.min(preferredIndex, lastUsableIndex));
-    for (let offset = 0; offset <= lastUsableIndex; offset += 1) {
-      const leftIndex = boundedIndex - offset;
-      const rightIndex = boundedIndex + offset;
-      const candidates = [leftIndex, rightIndex].filter(
-        (index, candidateIndex, arr) =>
-          index >= 0 &&
-          index <= lastUsableIndex &&
-          arr.indexOf(index) === candidateIndex
-      );
-      for (const index of candidates) {
-        const slot = sortedTermSlots[index]!;
-        if (slot.locked) continue;
-        const major = getMajorPlacement(slot);
-        const majorBlock = major ? blockMap.get(major.blockId) ?? null : null;
-        if (majorBlock?.type === "exam") continue;
-        addRecoveredPlacement(slot, block, "minor");
-        placedIds.add(block.id);
-        return true;
+  const examIndex = sortedTermSlots.findIndex((slot) =>
+    slot.placements.some((placement) => {
+      const block = blockMap.get(placement.blockId) ?? null;
+      return block?.type === "exam";
+    })
+  );
+  const firstPlacementOrderByBlockId = buildFirstPlacementOrderMap(sortedTermSlots);
+  const candidateSlotIndexes = sortedTermSlots
+    .map((slot, index) => {
+      if (slot.locked) return -1;
+      if (examIndex >= 0 && index > examIndex) return -1;
+      if (
+        slot.placements.some((placement) => {
+          const block = blockMap.get(placement.blockId) ?? null;
+          return block?.type === "exam";
+        })
+      ) {
+        return -1;
       }
+      return index;
+    })
+    .filter((index) => index >= 0);
+  if (candidateSlotIndexes.length === 0) return;
+
+  const findPreferredSlotIndex = (block: Block) => {
+    const orderedPeers = termBlocks
+      .filter(
+        (candidate) =>
+          candidate.id !== block.id &&
+          candidate.type === block.type &&
+          candidate.subcategory === block.subcategory &&
+          !candidate.metadata.extraCandidateType
+      )
+      .sort((a, b) => compareBlocksByCanonicalSequence(a, b));
+    const previousPeer = [...orderedPeers]
+      .reverse()
+      .find(
+        (candidate) =>
+          getCanonicalSequenceValue(candidate) < getCanonicalSequenceValue(block) &&
+          firstPlacementOrderByBlockId.has(candidate.id)
+      );
+    if (previousPeer) {
+      return firstPlacementOrderByBlockId.get(previousPeer.id)?.slotIndex ?? candidateSlotIndexes[0]!;
     }
-    return false;
+    return candidateSlotIndexes[0]!;
   };
 
-  const placeMajorBlock = (
-    block: Block,
-    preferredIndex: number,
-    allowMinorFallback = false
-  ) => {
+  const placeBlockInNearestSlot = (block: Block, preferredIndex: number) => {
     if (placedIds.has(block.id)) return;
-    const boundedIndex = Math.max(0, Math.min(preferredIndex, lastUsableIndex));
-    if (createMajorGapAt(sortedTermSlots, boundedIndex)) {
-      addRecoveredPlacement(sortedTermSlots[boundedIndex]!, block, "major");
-      placedIds.add(block.id);
-      return;
-    }
-
-    for (let index = 0; index <= lastUsableIndex; index += 1) {
-      const slot = sortedTermSlots[index]!;
-      if (slot.locked || getMajorPlacement(slot)) continue;
-      addRecoveredPlacement(slot, block, "major");
-      placedIds.add(block.id);
-      return;
-    }
-
-    if (allowMinorFallback) {
-      placeMinorFallback(block, boundedIndex);
+    const orderedCandidateIndexes = [...candidateSlotIndexes].sort((a, b) => {
+      const distanceDiff = Math.abs(a - preferredIndex) - Math.abs(b - preferredIndex);
+      if (distanceDiff !== 0) return distanceDiff;
+      return a - b;
+    });
+    const targetIndex = orderedCandidateIndexes[0];
+    if (typeof targetIndex !== "number") return;
+    addRecoveredPlacement(
+      sortedTermSlots[targetIndex]!,
+      block,
+      block.type === "exam" ? "major" : "minor"
+    );
+    placedIds.add(block.id);
+    if (!firstPlacementOrderByBlockId.has(block.id)) {
+      firstPlacementOrderByBlockId.set(block.id, {
+        slotIndex: targetIndex,
+        placementIndex: sortedTermSlots[targetIndex]!.placements.length - 1,
+      });
     }
   };
 
-  const placeMinorBlock = (block: Block, preferredIndex: number) => {
-    if (placedIds.has(block.id)) return;
-    placeMinorFallback(block, preferredIndex);
-  };
-
-  const missingOrientation =
-    termBlocks.find(
-      (block) => block.type === "buffer" && block.subcategory === "orientation" && !placedIds.has(block.id)
-    ) ?? null;
-  if (missingOrientation) {
-    placeMajorBlock(missingOrientation, 0);
-  }
-
-  const missingLessons = termBlocks
-    .filter((block) => block.type === "lesson" && !block.metadata.extraCandidateType && !placedIds.has(block.id))
-    .sort((a, b) => Number(a.metadata.lessonOrder ?? 0) - Number(b.metadata.lessonOrder ?? 0));
-  for (const block of missingLessons) {
-    const targetIndex = findAnchorSlotIndex("lessonOrder", Number(block.metadata.lessonOrder ?? 0));
-    placeMajorBlock(block, targetIndex);
-  }
-
-  const missingPerformanceTasks = termBlocks
-    .filter(
-      (block) =>
-        block.type === "performance_task" &&
-        !block.metadata.extraCandidateType &&
-        !placedIds.has(block.id)
-    )
-    .sort((a, b) => Number(a.metadata.ptOrder ?? 0) - Number(b.metadata.ptOrder ?? 0));
-  for (const block of missingPerformanceTasks) {
-    const targetIndex = findAnchorSlotIndex("ptOrder", Number(block.metadata.ptOrder ?? 0));
-    placeMajorBlock(block, targetIndex, true);
-  }
-
-  const missingWrittenWorks = termBlocks
-    .filter(
-      (block) =>
-        block.type === "written_work" &&
-        block.subcategory !== "quiz" &&
-        !block.metadata.extraCandidateType &&
-        !placedIds.has(block.id)
-    )
-    .sort((a, b) => Number(a.metadata.wwOrder ?? 0) - Number(b.metadata.wwOrder ?? 0));
-  for (const block of missingWrittenWorks) {
-    const targetIndex = findAnchorSlotIndex("wwOrder", Number(block.metadata.wwOrder ?? 0));
-    placeMinorBlock(block, targetIndex);
-  }
-
-  const missingQuizzes = termBlocks
-    .filter(
-      (block) =>
-        block.type === "written_work" &&
-        block.subcategory === "quiz" &&
-        !placedIds.has(block.id)
-    )
-    .sort((a, b) => Number(a.metadata.quizOrder ?? 0) - Number(b.metadata.quizOrder ?? 0));
-  const finalQuizId =
-    termBlocks
-      .filter((block) => block.type === "written_work" && block.subcategory === "quiz")
-      .sort((a, b) => Number(b.metadata.quizOrder ?? 0) - Number(a.metadata.quizOrder ?? 0))[0]?.id ??
-    null;
-  for (const block of missingQuizzes) {
-    const targetIndex = findAnchorSlotIndex("quizOrder", Number(block.metadata.quizOrder ?? 0));
-    placeMajorBlock(block, targetIndex, block.id !== finalQuizId);
-  }
+  const missingRequiredBlocks = termBlocks
+    .filter((block) => block.required && !block.metadata.extraCandidateType && !placedIds.has(block.id))
+    .filter((block) => block.type !== "exam")
+    .sort((a, b) => {
+      const categoryRank = (candidate: Block) => {
+        if (candidate.type === "buffer" && candidate.subcategory === "orientation") return 0;
+        if (candidate.type === "lesson") return 1;
+        if (candidate.type === "performance_task") return 2;
+        if (candidate.type === "written_work" && candidate.subcategory === "quiz") return 3;
+        if (candidate.type === "written_work") return 4;
+        if (candidate.type === "buffer") return 5;
+        return 99;
+      };
+      const rankDiff = categoryRank(a) - categoryRank(b);
+      if (rankDiff !== 0) return rankDiff;
+      return compareBlocksByCanonicalSequence(a, b);
+    });
+  missingRequiredBlocks.forEach((block) => {
+    placeBlockInNearestSlot(block, findPreferredSlotIndex(block));
+  });
 
   sortedTermSlots.forEach((slot) => rebuildSlotPlacementOrder(slot, blockMap));
-}
-
-function swapMajorPlacements(termSlots: SessionSlot[], fromIndex: number, toIndex: number) {
-  const fromSlot = termSlots[fromIndex];
-  const toSlot = termSlots[toIndex];
-  if (!fromSlot || !toSlot) return false;
-  const fromMajor = getMajorPlacement(fromSlot);
-  const toMajor = getMajorPlacement(toSlot);
-  if (!fromMajor) return false;
-
-  fromSlot.placements = fromSlot.placements.filter((placement) => placement.blockId !== fromMajor.blockId);
-  if (toMajor) {
-    toSlot.placements = toSlot.placements.filter((placement) => placement.blockId !== toMajor.blockId);
-    fromSlot.placements.push({
-      ...toMajor,
-      slotId: fromSlot.id,
-      id: `placement__${toMajor.blockId}__${fromSlot.id}__${fromSlot.placements.length + 1}`,
-    });
-  }
-  toSlot.placements.push({
-    ...fromMajor,
-    slotId: toSlot.id,
-    id: `placement__${fromMajor.blockId}__${toSlot.id}__${toSlot.placements.length + 1}`,
-  });
-  return true;
 }
 
 function normalizeTermPlacements(termSlots: SessionSlot[], termBlocks: Block[]) {
@@ -1923,221 +1838,92 @@ function normalizeTermPlacements(termSlots: SessionSlot[], termBlocks: Block[]) 
     return (a.startTime ?? "").localeCompare(b.startTime ?? "");
   });
   const blockMap = buildBlockMap(termBlocks);
-  const moveMajorBlockStepwiseToIndex = (blockId: string, targetIndex: number) => {
-    let currentIndex = sortedTermSlots.findIndex(
-      (slot) => getMajorPlacement(slot)?.blockId === blockId
+
+  const reorderPlacementsByFirstAppearance = (matcher: (block: Block) => boolean) => {
+    const orderedBlocks = termBlocks
+      .filter((block) => matcher(block))
+      .sort((a, b) => compareBlocksByCanonicalSequence(a, b));
+    const positions = sortedTermSlots.flatMap((slot) =>
+      slot.placements
+        .map((placement, placementIndex) => ({
+          slot,
+          placementIndex,
+          block: blockMap.get(placement.blockId) ?? null,
+        }))
+        .filter(
+          (entry): entry is { slot: SessionSlot; placementIndex: number; block: Block } =>
+            Boolean(entry.block && matcher(entry.block))
+        )
     );
-    if (currentIndex < 0 || targetIndex < 0 || targetIndex >= sortedTermSlots.length) return;
-    while (currentIndex < targetIndex) {
-      if (!swapMajorPlacements(sortedTermSlots, currentIndex, currentIndex + 1)) break;
-      currentIndex += 1;
-    }
-    while (currentIndex > targetIndex) {
-      if (!swapMajorPlacements(sortedTermSlots, currentIndex, currentIndex - 1)) break;
-      currentIndex -= 1;
+    const count = Math.min(orderedBlocks.length, positions.length);
+    for (let index = 0; index < count; index += 1) {
+      const targetBlock = orderedBlocks[index]!;
+      const targetPosition = positions[index]!;
+      const existingPlacement = targetPosition.slot.placements[targetPosition.placementIndex];
+      if (!existingPlacement) continue;
+      targetPosition.slot.placements[targetPosition.placementIndex] = {
+        ...existingPlacement,
+        blockId: targetBlock.id,
+        chainId: targetBlock.id,
+      };
     }
   };
 
-  const reorderMajorsByKey = (matcher: (block: Block) => boolean, orderKey: string) => {
-    const indexes = sortedTermSlots
-      .map((slot, index) => {
-        const major = getMajorPlacement(slot);
-        const block = major ? blockMap.get(major.blockId) ?? null : null;
-        return block && matcher(block) ? index : -1;
-      })
-      .filter((index) => index >= 0);
-    const blocks = indexes
-      .map((index) => {
-        const major = getMajorPlacement(sortedTermSlots[index]!);
-        return major ? blockMap.get(major.blockId) ?? null : null;
-      })
-      .filter((block): block is Block => Boolean(block))
-      .sort((a, b) => Number(a.metadata[orderKey] ?? 0) - Number(b.metadata[orderKey] ?? 0));
+  reorderPlacementsByFirstAppearance(
+    (block) => block.type === "lesson" && !block.metadata.extraCandidateType
+  );
+  reorderPlacementsByFirstAppearance(
+    (block) => block.type === "performance_task" && !block.metadata.extraCandidateType
+  );
+  reorderPlacementsByFirstAppearance(
+    (block) => block.type === "written_work" && block.subcategory === "quiz" && !block.metadata.extraCandidateType
+  );
+  reorderPlacementsByFirstAppearance(
+    (block) => block.type === "written_work" && block.subcategory !== "quiz" && !block.metadata.extraCandidateType
+  );
 
-    indexes.forEach((slotIndex, blockIndex) => {
-      const targetBlock = blocks[blockIndex];
-      if (!targetBlock) return;
-      const currentIndex = sortedTermSlots.findIndex(
-        (slot) => getMajorPlacement(slot)?.blockId === targetBlock.id
-      );
-      if (currentIndex >= 0 && currentIndex !== slotIndex) {
-        moveMajorBlockStepwiseToIndex(targetBlock.id, slotIndex);
-      }
+  const orderedLessonsAndQuizzes = termBlocks
+    .filter(
+      (block) =>
+        !block.metadata.extraCandidateType &&
+        (block.type === "lesson" ||
+          (block.type === "written_work" && block.subcategory === "quiz"))
+    )
+    .sort((a, b) => {
+      const categoryDiff =
+        Number(a.type === "written_work" && a.subcategory === "quiz") -
+        Number(b.type === "written_work" && b.subcategory === "quiz");
+      if (categoryDiff !== 0) return categoryDiff;
+      return compareBlocksByCanonicalSequence(a, b);
     });
-  };
-
-  const reorderMinorByKey = (matcher: (block: Block) => boolean, orderKey: string) => {
-    const carriers = sortedTermSlots
-      .map((slot) => ({
+  const lessonAndQuizPositions = sortedTermSlots.flatMap((slot) =>
+    slot.placements
+      .map((placement, placementIndex) => ({
         slot,
-        placements: slot.placements.filter((placement) => {
-          const block = blockMap.get(placement.blockId);
-          return block ? matcher(block) : false;
-        }),
+        placementIndex,
+        block: blockMap.get(placement.blockId) ?? null,
       }))
-      .filter((entry) => entry.placements.length > 0);
-    const orderedBlocks = carriers
-      .flatMap((entry) => entry.placements.map((placement) => blockMap.get(placement.blockId) ?? null))
-      .filter((block): block is Block => Boolean(block))
-      .sort((a, b) => Number(a.metadata[orderKey] ?? 0) - Number(b.metadata[orderKey] ?? 0));
-
-    let cursor = 0;
-    for (const carrier of carriers) {
-      carrier.slot.placements = carrier.slot.placements.filter((placement) => {
-        const block = blockMap.get(placement.blockId);
-        return block ? !matcher(block) : true;
-      });
-      for (let index = 0; index < carrier.placements.length; index += 1) {
-        const block = orderedBlocks[cursor];
-        if (!block) continue;
-        carrier.slot.placements.push({
-          id: `placement__${block.id}__${carrier.slot.id}__${carrier.slot.placements.length + 1}`,
-          blockId: block.id,
-          slotId: carrier.slot.id,
-          lane: "minor",
-          minutesUsed: Math.min(carrier.slot.minutes || block.estimatedMinutes, block.estimatedMinutes),
-          chainId: block.id,
-          segmentIndex: 1,
-          segmentCount: 1,
-          continuesFromPrevious: false,
-          continuesToNext: false,
-          startTime: null,
-          endTime: null,
-        });
-        cursor += 1;
-      }
-    }
-  };
-
-  const findNextNonExamMajorCarrierIndex = (startIndex: number) => {
-    for (let index = Math.max(0, startIndex); index < sortedTermSlots.length; index += 1) {
-      const major = getMajorPlacement(sortedTermSlots[index]!);
-      const block = major ? blockMap.get(major.blockId) ?? null : null;
-      if (block?.type === "exam") continue;
-      return index;
-    }
-    return -1;
-  };
-
-  reorderMajorsByKey(
-    (block) => block.type === "lesson" && !block.metadata.extraCandidateType,
-    "lessonOrder"
+      .filter(
+        (entry): entry is { slot: SessionSlot; placementIndex: number; block: Block } =>
+          Boolean(
+            entry.block &&
+              !entry.block.metadata.extraCandidateType &&
+              (entry.block.type === "lesson" ||
+                (entry.block.type === "written_work" && entry.block.subcategory === "quiz"))
+          )
+      )
   );
-  reorderMajorsByKey((block) => block.type === "performance_task" && !block.metadata.extraCandidateType, "ptOrder");
-  reorderMajorsByKey((block) => block.type === "written_work" && block.subcategory === "quiz", "quizOrder");
-  reorderMinorByKey((block) => block.type === "written_work" && block.subcategory !== "quiz", "wwOrder");
-
-  const orientationIndex = sortedTermSlots.findIndex((slot) => {
-    const major = getMajorPlacement(slot);
-    const block = major ? blockMap.get(major.blockId) ?? null : null;
-    return block?.type === "buffer" && block.subcategory === "orientation";
-  });
-  if (orientationIndex > 0) {
-    swapMajorPlacements(sortedTermSlots, orientationIndex, 0);
-  }
-  const firstLesson = termBlocks
-    .filter((block) => block.type === "lesson" && !block.metadata.extraCandidateType)
-    .sort((a, b) => Number(a.metadata.lessonOrder ?? 0) - Number(b.metadata.lessonOrder ?? 0))[0] ?? null;
-  const normalizedOrientationIndex = sortedTermSlots.findIndex((slot) => {
-    const major = getMajorPlacement(slot);
-    const block = major ? blockMap.get(major.blockId) ?? null : null;
-    return block?.type === "buffer" && block.subcategory === "orientation";
-  });
-  const desiredFirstLessonIndex = normalizedOrientationIndex === 0 ? 1 : 0;
-  const currentFirstLessonIndex =
-    firstLesson ? sortedTermSlots.findIndex((slot) => getMajorPlacement(slot)?.blockId === firstLesson.id) : -1;
-  if (
-    firstLesson &&
-    desiredFirstLessonIndex >= 0 &&
-    desiredFirstLessonIndex < sortedTermSlots.length &&
-    currentFirstLessonIndex >= 0 &&
-    currentFirstLessonIndex !== desiredFirstLessonIndex
-  ) {
-    swapMajorPlacements(sortedTermSlots, currentFirstLessonIndex, desiredFirstLessonIndex);
-  }
-
-  let normalizedFirstLessonIndex =
-    firstLesson ? sortedTermSlots.findIndex((slot) => getMajorPlacement(slot)?.blockId === firstLesson.id) : -1;
-  if (normalizedFirstLessonIndex > 0) {
-    for (let index = normalizedFirstLessonIndex - 1; index >= 0; index -= 1) {
-      const major = getMajorPlacement(sortedTermSlots[index]!);
-      const block = major ? blockMap.get(major.blockId) ?? null : null;
-      if (
-        block?.type === "performance_task" ||
-        (block?.type === "written_work" && block.subcategory === "quiz")
-      ) {
-        swapMajorPlacements(sortedTermSlots, index, index + 1);
-        normalizedFirstLessonIndex -= 1;
-      }
-    }
-  }
-  if (normalizedFirstLessonIndex >= 0) {
-    const wwBlocksToMove: Block[] = [];
-    for (let index = 0; index < normalizedFirstLessonIndex; index += 1) {
-      const slot = sortedTermSlots[index]!;
-      const movedPlacements = slot.placements.filter((placement) => {
-        const block = blockMap.get(placement.blockId) ?? null;
-        return block?.type === "written_work" && block.subcategory !== "quiz" && !block.metadata.extraCandidateType;
-      });
-      if (movedPlacements.length === 0) continue;
-      slot.placements = slot.placements.filter((placement) => !movedPlacements.includes(placement));
-      movedPlacements.forEach((placement) => {
-        const block = blockMap.get(placement.blockId) ?? null;
-        if (block) wwBlocksToMove.push(block);
-      });
-    }
-    for (const block of wwBlocksToMove) {
-      const targetIndex = findNextNonExamMajorCarrierIndex(normalizedFirstLessonIndex);
-      if (targetIndex < 0) break;
-      addRecoveredPlacement(sortedTermSlots[targetIndex]!, block, "minor");
-    }
-  }
-
-  const examIndex = sortedTermSlots.findIndex((slot) => {
-    const major = getMajorPlacement(slot);
-    const block = major ? blockMap.get(major.blockId) ?? null : null;
-    return block?.type === "exam";
-  });
-  const examReviewIndex = sortedTermSlots.findIndex((slot) => {
-    const major = getMajorPlacement(slot);
-    const block = major ? blockMap.get(major.blockId) ?? null : null;
-    return block?.metadata.extraCandidateType === "review_before_exam";
-  });
-  const quizBlocks = termBlocks
-    .filter((block) => block.type === "written_work" && block.subcategory === "quiz")
-    .sort((a, b) => Number(a.metadata.quizOrder ?? 0) - Number(b.metadata.quizOrder ?? 0));
-  const finalQuiz = quizBlocks[quizBlocks.length - 1] ?? null;
-  if (examIndex > 0 && finalQuiz) {
-    const targetFinalQuizIndex = examReviewIndex === examIndex - 1 ? examIndex - 2 : examIndex - 1;
-    if (targetFinalQuizIndex >= 0) {
-      moveMajorBlockStepwiseToIndex(finalQuiz.id, targetFinalQuizIndex);
-    }
-
-    const currentQuizIndex = sortedTermSlots.findIndex((slot) => getMajorPlacement(slot)?.blockId === finalQuiz.id);
-    const latestLessonBeforeExamIndex = sortedTermSlots.reduce((latest, slot, index) => {
-      if (index >= examIndex) return latest;
-      const major = getMajorPlacement(slot);
-      const block = major ? blockMap.get(major.blockId) ?? null : null;
-      return block?.type === "lesson" ? index : latest;
-    }, -1);
-    if (currentQuizIndex >= 0 && latestLessonBeforeExamIndex > currentQuizIndex) {
-      moveMajorBlockStepwiseToIndex(finalQuiz.id, latestLessonBeforeExamIndex);
-    }
-  }
-
-  reorderMajorsByKey(
-    (block) => block.type === "lesson" && !block.metadata.extraCandidateType,
-    "lessonOrder"
-  );
-  reorderMajorsByKey((block) => block.type === "performance_task" && !block.metadata.extraCandidateType, "ptOrder");
-  reorderMajorsByKey((block) => block.type === "written_work" && block.subcategory === "quiz", "quizOrder");
-  reorderMinorByKey((block) => block.type === "written_work" && block.subcategory !== "quiz", "wwOrder");
-
-  if (examIndex > 0 && finalQuiz) {
-    const targetFinalQuizIndex = examReviewIndex === examIndex - 1 ? examIndex - 2 : examIndex - 1;
-    if (targetFinalQuizIndex >= 0) {
-      moveMajorBlockStepwiseToIndex(finalQuiz.id, targetFinalQuizIndex);
-    }
+  const lessonAndQuizCount = Math.min(orderedLessonsAndQuizzes.length, lessonAndQuizPositions.length);
+  for (let index = 0; index < lessonAndQuizCount; index += 1) {
+    const targetBlock = orderedLessonsAndQuizzes[index]!;
+    const targetPosition = lessonAndQuizPositions[index]!;
+    const existingPlacement = targetPosition.slot.placements[targetPosition.placementIndex];
+    if (!existingPlacement) continue;
+    targetPosition.slot.placements[targetPosition.placementIndex] = {
+      ...existingPlacement,
+      blockId: targetBlock.id,
+      chainId: targetBlock.id,
+    };
   }
 
   sortedTermSlots.forEach((slot) => rebuildSlotPlacementOrder(slot, blockMap));
@@ -2150,160 +1936,164 @@ function validateAdjustedTerm(termSlots: SessionSlot[], termBlocks: Block[]) {
     return (a.startTime ?? "").localeCompare(b.startTime ?? "");
   });
   const blockMap = buildBlockMap(termBlocks);
-  const examBlock = termBlocks.find((block) => block.type === "exam") ?? null;
+  const validationBlocks = dedupeCurrentTermBlocks(termBlocks);
+  const examBlock = validationBlocks.find((block) => block.type === "exam") ?? null;
   if (!examBlock) return;
 
-  const placedIds = new Set(sortedTermSlots.flatMap((slot) => slot.placements.map((placement) => placement.blockId)));
-  const placedLessons = termBlocks.filter((block) => block.type === "lesson" && !block.metadata.extraCandidateType && placedIds.has(block.id)).length;
-  const placedWW = termBlocks.filter((block) => block.type === "written_work" && block.subcategory !== "quiz" && !block.metadata.extraCandidateType && placedIds.has(block.id)).length;
-  const placedPT = termBlocks.filter((block) => block.type === "performance_task" && !block.metadata.extraCandidateType && placedIds.has(block.id)).length;
-  const placedQuiz = termBlocks.filter((block) => block.type === "written_work" && block.subcategory === "quiz" && placedIds.has(block.id)).length;
+  const placedValidationKeys = new Set(
+    sortedTermSlots.flatMap((slot) =>
+      slot.placements.flatMap((placement) => {
+        const block = blockMap.get(placement.blockId) ?? null;
+        return block ? [getValidationBlockKey(block)] : [];
+      })
+    )
+  );
+  const placedLessons = validationBlocks.filter(
+    (block) =>
+      block.type === "lesson" &&
+      !block.metadata.extraCandidateType &&
+      placedValidationKeys.has(getValidationBlockKey(block))
+  ).length;
+    const placedWW = validationBlocks.filter(
+      (block) =>
+        block.type === "written_work" &&
+        !block.metadata.extraCandidateType &&
+        placedValidationKeys.has(getValidationBlockKey(block))
+    ).length;
+
+    const placedPT = validationBlocks.filter(
+      (block) =>
+        block.type === "performance_task" &&
+        !block.metadata.extraCandidateType &&
+        placedValidationKeys.has(getValidationBlockKey(block))
+    ).length;
 
   const expectedLessons = Number(examBlock.metadata.termLessons ?? 0);
   const expectedWW = Number(examBlock.metadata.termWW ?? 0);
   const expectedPT = Number(examBlock.metadata.termPT ?? 0);
-  const expectedQuiz = Number(examBlock.metadata.termQuizAmount ?? 0);
 
   if (
-    placedLessons !== expectedLessons ||
-    placedWW !== expectedWW ||
-    placedPT !== expectedPT ||
-    placedQuiz !== expectedQuiz
+    placedLessons < expectedLessons ||
+    placedWW < expectedWW ||
+    placedPT < expectedPT 
   ) {
     const missingParts: string[] = [];
-    if (placedLessons !== expectedLessons) {
+    if (placedLessons < expectedLessons) {
       missingParts.push(`lessons ${placedLessons}/${expectedLessons}`);
     }
-    if (placedWW !== expectedWW) {
+    if (placedWW < expectedWW) {
       missingParts.push(`written works ${placedWW}/${expectedWW}`);
     }
-    if (placedPT !== expectedPT) {
+    if (placedPT < expectedPT) {
       missingParts.push(`performance tasks ${placedPT}/${expectedPT}`);
     }
-    if (placedQuiz !== expectedQuiz) {
-      missingParts.push(`quizzes ${placedQuiz}/${expectedQuiz}`);
-    }
     throw new Error(
-      `Term requirements are no longer fully scheduled after this adjustment (${missingParts.join(", ")}).`
+  `Term requirements are incomplete after this adjustment (${missingParts.join(", ")}).`
     );
   }
 
-  const placedBlocks = sortedTermSlots
-    .flatMap((slot) =>
-      slot.placements.map((placement) => ({
-        slot,
-        placement,
-        block: blockMap.get(placement.blockId) ?? null,
-      }))
-    )
-    .filter(
-      (item): item is { slot: SessionSlot; placement: SessionSlot["placements"][number]; block: Block } =>
-        Boolean(item.block)
-    );
-  const majorBlocks = sortedTermSlots
-    .map((slot) => {
-      const major = getMajorPlacement(slot);
-      return major ? blockMap.get(major.blockId) ?? null : null;
+  const firstPlacementOrderByValidationKey = buildFirstPlacementOrderMapByValidationKey(sortedTermSlots, termBlocks);
+  const examPlacement = sortedTermSlots.findIndex((slot) =>
+    slot.placements.some((placement) => {
+      const block = blockMap.get(placement.blockId) ?? null;
+      return block?.type === "exam" && placement.lane === "major";
     })
-    .filter((block): block is Block => Boolean(block));
-  const lessonsInOrder = majorBlocks
-    .filter((block) => block.type === "lesson")
-    .every((block, index, list) => index === 0 || Number(list[index - 1]!.metadata.lessonOrder ?? 0) <= Number(block.metadata.lessonOrder ?? 0));
-  const ptInOrder = majorBlocks
-    .filter((block) => block.type === "performance_task" && !block.metadata.extraCandidateType)
-    .every((block, index, list) => index === 0 || Number(list[index - 1]!.metadata.ptOrder ?? 0) <= Number(block.metadata.ptOrder ?? 0));
-  const quizInOrder = majorBlocks
-    .filter((block) => block.type === "written_work" && block.subcategory === "quiz")
-    .every((block, index, list) => index === 0 || Number(list[index - 1]!.metadata.quizOrder ?? 0) <= Number(block.metadata.quizOrder ?? 0));
-  const wwInOrder = placedBlocks
-    .map((item) => item.block)
-    .filter((block) => block.type === "written_work" && block.subcategory !== "quiz" && !block.metadata.extraCandidateType)
-    .every((block, index, list) => index === 0 || Number(list[index - 1]!.metadata.wwOrder ?? 0) <= Number(block.metadata.wwOrder ?? 0));
-  const ptPlacedInOrder = placedBlocks
-    .map((item) => item.block)
-    .filter((block) => block.type === "performance_task" && !block.metadata.extraCandidateType)
-    .every((block, index, list) => index === 0 || Number(list[index - 1]!.metadata.ptOrder ?? 0) <= Number(block.metadata.ptOrder ?? 0));
+  );
+  if (examPlacement < 0) {
+    throw new Error("Exam must remain scheduled as a major block.");
+  }
 
-  const examIndex = sortedTermSlots.findIndex((slot) => {
-    const major = getMajorPlacement(slot);
-    const block = major ? blockMap.get(major.blockId) ?? null : null;
-    return block?.type === "exam";
-  });
-  const finalQuizIndex = sortedTermSlots.findIndex((slot) => {
-    const major = getMajorPlacement(slot);
-    return major?.blockId === termBlocks
-      .filter((block) => block.type === "written_work" && block.subcategory === "quiz")
-      .sort((a, b) => Number(b.metadata.quizOrder ?? 0) - Number(a.metadata.quizOrder ?? 0))[0]?.id;
-  });
-  const lastLessonIndex = sortedTermSlots.reduce((latest, slot, index) => {
-    const major = getMajorPlacement(slot);
-    const block = major ? blockMap.get(major.blockId) ?? null : null;
-    return block?.type === "lesson" ? index : latest;
-  }, -1);
-  const firstLessonIndex = sortedTermSlots.findIndex((slot) => {
-    const major = getMajorPlacement(slot);
-    const block = major ? blockMap.get(major.blockId) ?? null : null;
-    return block?.type === "lesson" && !block.metadata.extraCandidateType;
-  });
-  const hasPtOrQuizBeforeFirstLesson =
-    firstLessonIndex > 0 &&
-    sortedTermSlots.slice(0, firstLessonIndex).some((slot) => {
-      const major = getMajorPlacement(slot);
-      const block = major ? blockMap.get(major.blockId) ?? null : null;
-      return block?.type === "performance_task" || (block?.type === "written_work" && block.subcategory === "quiz");
-    });
-  const hasWwBeforeFirstLesson =
-    firstLessonIndex > 0 &&
-    sortedTermSlots.slice(0, firstLessonIndex).some((slot) =>
-      slot.placements.some((placement) => {
-        const block = blockMap.get(placement.blockId) ?? null;
-        return block?.type === "written_work" && block.subcategory !== "quiz" && !block.metadata.extraCandidateType;
-      })
-    );
-  const hasLessonAfterFinalQuiz =
-    finalQuizIndex >= 0 &&
-    sortedTermSlots
-      .slice(finalQuizIndex + 1, examIndex >= 0 ? examIndex : undefined)
-      .some((slot) => {
-        const major = getMajorPlacement(slot);
-        const block = major ? blockMap.get(major.blockId) ?? null : null;
-        return block?.type === "lesson";
-      });
-  const examReviewIndex = sortedTermSlots.findIndex((slot) => {
-    const major = getMajorPlacement(slot);
-    const block = major ? blockMap.get(major.blockId) ?? null : null;
-    return block?.metadata.extraCandidateType === "review_before_exam";
-  });
-  const targetFinalQuizIndex =
-    examIndex > 0 ? (examReviewIndex === examIndex - 1 ? examIndex - 2 : examIndex - 1) : -1;
-  const hasNonTerminalMajorBetweenFinalQuizAndExam =
-    finalQuizIndex >= 0 &&
-    examIndex >= 0 &&
-    sortedTermSlots
-      .slice(finalQuizIndex + 1, examIndex)
-      .some((slot) => {
-        const major = getMajorPlacement(slot);
-        const block = major ? blockMap.get(major.blockId) ?? null : null;
-        return Boolean(block) && block?.metadata.extraCandidateType !== "review_before_exam";
-      });
+  const hasRequiredAfterExam = sortedTermSlots.slice(examPlacement + 1).some((slot) =>
+    slot.placements.some((placement) => {
+      const block = blockMap.get(placement.blockId) ?? null;
+      return Boolean(block?.required) && block?.type !== "exam" && !block?.metadata.extraCandidateType;
+    })
+  );
+  if (hasRequiredAfterExam) {
+    throw new Error("Required blocks cannot appear after the exam slot in a term.");
+  }
 
-  if (!lessonsInOrder || !ptInOrder || !ptPlacedInOrder || !quizInOrder || !wwInOrder) {
-    throw new Error("Term block ordering became invalid after this adjustment.");
-  }
-  if (finalQuizIndex >= 0 && lastLessonIndex >= 0 && finalQuizIndex <= lastLessonIndex) {
-    throw new Error("Final quiz must appear after all lesson blocks in a term.");
-  }
-  if (hasLessonAfterFinalQuiz) {
-    throw new Error("Lessons cannot appear after the final quiz in a term.");
-  }
-  if (targetFinalQuizIndex >= 0 && finalQuizIndex !== targetFinalQuizIndex) {
-    throw new Error("Final quiz must occupy the slot immediately before the exam or exam review.");
-  }
-  if (hasNonTerminalMajorBetweenFinalQuizAndExam) {
-    throw new Error("No major blocks may appear between the final quiz and the exam boundary.");
-  }
-  if (hasPtOrQuizBeforeFirstLesson || hasWwBeforeFirstLesson) {
+  const assertOrderedByFirstAppearance = (
+    matcher: (block: Block) => boolean,
+    label: string
+  ) => {
+    const orderedBlocks = validationBlocks
+      .filter((block) => matcher(block))
+      .sort((a, b) => compareBlocksByCanonicalSequence(a, b));
+    let previous: { slotIndex: number; placementIndex: number } | null = null;
+    let previousBlock: Block | null = null;
+    for (const block of orderedBlocks) {
+      const current = firstPlacementOrderByValidationKey.get(getValidationBlockKey(block)) ?? null;
+      if (!current) {
+        throw new Error(`Required ${label} block is not scheduled.`);
+      }
+      if (comparePlacementOrder(previous, current) > 0) {
+        const previousOrder = previousBlock
+          ? getCanonicalSequenceValue(previousBlock)
+          : null;
+        const currentOrder = getCanonicalSequenceValue(block);
+        throw new Error(
+          `Required ${label} ordering became invalid after this adjustment: ` +
+            `${previousBlock?.title ?? previousBlock?.id ?? "previous"} ` +
+            `(order ${previousOrder ?? "?"}, slot ${previous?.slotIndex ?? "?"}) appears after ` +
+            `${block.title || block.id} (order ${currentOrder}, slot ${current.slotIndex}).`
+        );
+      }
+      previous = current;
+      previousBlock = block;
+    }
+  };
+
+  assertOrderedByFirstAppearance(
+    (block) => block.type === "lesson" && !block.metadata.extraCandidateType,
+    "lesson"
+  );
+  assertOrderedByFirstAppearance(
+    (block) => block.type === "performance_task" && !block.metadata.extraCandidateType,
+    "performance task"
+  );
+  assertOrderedByFirstAppearance(
+    (block) => block.type === "written_work" && block.subcategory === "quiz",
+    "quiz"
+  );
+  assertOrderedByFirstAppearance(
+    (block) => block.type === "written_work" && block.subcategory !== "quiz" && !block.metadata.extraCandidateType,
+    "written work"
+  );
+
+  const lessonBlocks = validationBlocks
+    .filter((block) => block.type === "lesson" && !block.metadata.extraCandidateType)
+    .sort((a, b) => compareBlocksByCanonicalSequence(a, b));
+  const firstLessonPlacement = lessonBlocks.length > 0
+    ? (firstPlacementOrderByValidationKey.get(getValidationBlockKey(lessonBlocks[0]!)) ?? null)
+    : null;
+  const nonLessonLeadingBlocks = validationBlocks
+    .filter(
+      (block) =>
+        (block.type === "performance_task" ||
+          block.type === "written_work") &&
+        !block.metadata.extraCandidateType
+    )
+    .map((block) => firstPlacementOrderByValidationKey.get(getValidationBlockKey(block)) ?? null)
+    .filter((value): value is { slotIndex: number; placementIndex: number } => Boolean(value))
+    .some((placement) => comparePlacementOrder(placement, firstLessonPlacement) < 0);
+  if (firstLessonPlacement && nonLessonLeadingBlocks) {
     throw new Error("Written work and performance tasks cannot appear before the first lesson in a term.");
+  }
+
+  const finalQuiz = validationBlocks
+    .filter((block) => block.type === "written_work" && block.subcategory === "quiz" && !block.metadata.extraCandidateType)
+    .sort((a, b) => compareBlocksByCanonicalSequence(a, b))
+    .at(-1) ?? null;
+  const finalQuizPlacement = finalQuiz
+    ? (firstPlacementOrderByValidationKey.get(getValidationBlockKey(finalQuiz)) ?? null)
+    : null;
+  const lastLessonPlacement = lessonBlocks
+    .map((block) => firstPlacementOrderByValidationKey.get(getValidationBlockKey(block)) ?? null)
+    .filter((value): value is { slotIndex: number; placementIndex: number } => Boolean(value))
+    .at(-1) ?? null;
+  if (finalQuizPlacement && lastLessonPlacement && comparePlacementOrder(finalQuizPlacement, lastLessonPlacement) <= 0) {
+    throw new Error("Final quiz must appear after all lesson blocks in a term.");
   }
 }
 
@@ -2326,7 +2116,6 @@ function summarizeBlockRowCounts(blocks: PlanBlockRow[]) {
     writtenWork: blocks.filter(
       (block) =>
         block.session_category === "written_work" &&
-        block.session_subcategory !== "quiz" &&
         Boolean(block.required) &&
         !Boolean(block.metadata?.extraCandidateType)
     ).length,
@@ -2422,6 +2211,255 @@ function buildCalendarAlgorithmSlots(input: {
       : slot;
   });
 }
+function repairTermAfterRepopulation(termSlots: SessionSlot[], termBlocks: Block[]) {
+  const sortedSlots = [...termSlots].sort((a, b) => {
+    const dateCompare = a.date.localeCompare(b.date);
+    if (dateCompare !== 0) return dateCompare;
+    return (a.startTime ?? "").localeCompare(b.startTime ?? "");
+  });
+
+  const blockMap = buildBlockMap(termBlocks);
+  const termIndex = Number(sortedSlots[0]?.termIndex ?? 0);
+  const firstSlot = sortedSlots[0];
+  if (!firstSlot) return;
+
+  const isRequiredRealBlock = (block: Block | null | undefined) =>
+    Boolean(block?.required && !block.metadata.extraCandidateType);
+
+  const isLesson = (block: Block | null | undefined) =>
+    block?.type === "lesson" && !block.metadata.extraCandidateType;
+
+  const isOrientation = (block: Block | null | undefined) =>
+    block?.type === "buffer" && block.subcategory === "orientation";
+
+  const isAssessment = (block: Block | null | undefined) =>
+    Boolean(
+      block &&
+        !block.metadata.extraCandidateType &&
+        (block.type === "written_work" || block.type === "performance_task")
+    );
+
+  const isExam = (block: Block | null | undefined) => block?.type === "exam";
+
+  const examIndex = sortedSlots.findIndex((slot) =>
+    slot.placements.some((p) => isExam(blockMap.get(p.blockId)))
+  );
+
+  const lastAllowedIndex = examIndex >= 0 ? examIndex - 1 : sortedSlots.length - 1;
+
+  const removeBlockEverywhere = (blockId: string) => {
+    for (const slot of sortedSlots) {
+      slot.placements = slot.placements.filter((p) => p.blockId !== blockId);
+    }
+  };
+
+  const makePlacement = (block: Block, slot: SessionSlot, lane: "major" | "minor") => ({
+    id: makePlacementId(block.id, slot.id, slot.placements.length + 1),
+    blockId: block.id,
+    slotId: slot.id,
+    lane,
+    minutesUsed: Math.min(slot.minutes || block.estimatedMinutes, block.estimatedMinutes),
+    chainId: block.id,
+    segmentIndex: 1,
+    segmentCount: 1,
+    continuesFromPrevious: false,
+    continuesToNext: false,
+    startTime: null,
+    endTime: null,
+  });
+
+  /**
+   * 1. Collect first-slot invalid blocks BEFORE clearing first slot.
+   */
+  const displaced: { block: Block; lane: "major" | "minor" }[] = [];
+
+  for (const placement of firstSlot.placements) {
+    const block = blockMap.get(placement.blockId);
+    if (!block) continue;
+
+    if (isAssessment(block)) {
+      displaced.push({
+        block,
+        lane: block.type === "exam" ? "major" : "minor"
+      });
+    }
+  }
+
+  /**
+   * 2. First slot rule.
+   * First term = orientation only.
+   * Later terms = first lesson only.
+   */
+  const requiredFirstBlock =
+    termIndex === 0
+      ? termBlocks.find((block) => isOrientation(block)) ?? null
+      : termBlocks
+          .filter((block) => isLesson(block))
+          .sort((a, b) => compareBlocksByCanonicalSequence(a, b))[0] ?? null;
+
+  if (requiredFirstBlock) {
+    removeBlockEverywhere(requiredFirstBlock.id);
+    firstSlot.placements = [makePlacement(requiredFirstBlock, firstSlot, "major")];
+  }
+
+  /**
+   * 3. Build the required block list.
+   */
+  const placedIds = new Set(
+    sortedSlots.flatMap((slot) => slot.placements.map((p) => p.blockId))
+  );
+
+  const requiredUnplaced = termBlocks
+    .filter((block) => isRequiredRealBlock(block))
+    .filter((block) => block.type !== "exam")
+    .filter((block) => !placedIds.has(block.id))
+    .sort((a, b) => compareBlocksByCanonicalSequence(a, b));
+
+  for (const block of requiredUnplaced) {
+    displaced.push({
+      block,
+      lane: block.type === "exam" ? "major" : "minor"
+    });
+  }
+
+  /**
+   * 4. Place displaced blocks.
+   * Priority:
+   * - use empty major slots first
+   * - minor written works may overlay lessons
+   * - if no empty slot remains, controlled overflow is allowed after lesson 1
+   */
+const findAnyValidSlot = (startIndex: number) =>
+  sortedSlots.find((slot, index) => {
+    if (index < startIndex) return false;
+    if (index > lastAllowedIndex) return false;
+    if (slot.locked) return false;
+
+    const blocks = slot.placements
+      .map((p) => blockMap.get(p.blockId))
+      .filter((b): b is Block => Boolean(b));
+
+    if (blocks.some((block) => isExam(block))) return false;
+    if (blocks.some((block) => isOrientation(block))) return false;
+
+    return blocks.length < 4;
+  }) ?? null;
+
+
+
+  const findControlledOverflowSlot = (startIndex: number) =>
+    sortedSlots.find((slot, index) => {
+      if (index < startIndex) return false;
+      if (index > lastAllowedIndex) return false;
+      if (slot.locked) return false;
+
+      const blocks = slot.placements
+        .map((p) => blockMap.get(p.blockId))
+        .filter((b): b is Block => Boolean(b));
+
+      if (blocks.some((block) => isExam(block))) return false;
+      if (blocks.some((block) => isOrientation(block))) return false;
+
+      return blocks.length < 4;
+    }) ?? null;
+
+  for (const item of displaced) {
+    removeBlockEverywhere(item.block.id);
+
+const startIndex = termIndex === 0 ? 1 : 0;
+const target = findAnyValidSlot(startIndex);
+if (!target) continue;
+
+target.placements.push(makePlacement(item.block, target, "minor"));
+    placedIds.add(item.block.id);
+  }
+
+  sortedSlots.forEach((slot) => rebuildSlotPlacementOrder(slot, blockMap));
+}
+function enforceNoAssessmentsBeforeFirstLesson(termSlots: SessionSlot[], termBlocks: Block[]) {
+  const sortedSlots = [...termSlots].sort((a, b) => {
+    const dateCompare = a.date.localeCompare(b.date);
+    if (dateCompare !== 0) return dateCompare;
+    return (a.startTime ?? "").localeCompare(b.startTime ?? "");
+  });
+
+  const blockMap = buildBlockMap(termBlocks);
+
+  const firstLessonIndex = sortedSlots.findIndex((slot) =>
+    slot.placements.some((placement) => {
+      const block = blockMap.get(placement.blockId);
+      return block?.type === "lesson" && !block.metadata.extraCandidateType;
+    })
+  );
+
+  if (firstLessonIndex < 0) return;
+
+  const examIndex = sortedSlots.findIndex((slot) =>
+    slot.placements.some((placement) => blockMap.get(placement.blockId)?.type === "exam")
+  );
+
+  const misplaced: SessionSlot["placements"] = [];
+
+  sortedSlots.forEach((slot, slotIndex) => {
+    slot.placements = slot.placements.filter((placement, placementIndex) => {
+      const block = blockMap.get(placement.blockId);
+      if (!block) return true;
+
+      const isAssessment =
+        !block.metadata.extraCandidateType &&
+        (block.type === "written_work" || block.type === "performance_task");
+
+      if (!isAssessment) return true;
+
+      const appearsBeforeFirstLesson =
+        slotIndex < firstLessonIndex ||
+        (slotIndex === firstLessonIndex &&
+          placementIndex <
+            slot.placements.findIndex((p) => {
+              const candidate = blockMap.get(p.blockId);
+              return candidate?.type === "lesson" && !candidate.metadata.extraCandidateType;
+            }));
+
+      if (!appearsBeforeFirstLesson) return true;
+
+      misplaced.push(placement);
+      return false;
+    });
+  });
+
+  for (const placement of misplaced) {
+    const block = blockMap.get(placement.blockId);
+    if (!block) continue;
+
+    const targetSlot = sortedSlots.find((slot, index) => {
+      if (index < firstLessonIndex) return false;
+      if (examIndex >= 0 && index >= examIndex) return false;
+      if (slot.locked) return false;
+
+      if (block.overlayMode === "minor") {
+        return slot.placements.some((p) => {
+          const placedBlock = blockMap.get(p.blockId);
+          return placedBlock?.type === "lesson";
+        });
+      }
+
+      return !slot.placements.some((p) => {
+        const placedBlock = blockMap.get(p.blockId);
+        return placedBlock && placedBlock.overlayMode !== "minor";
+      });
+    });
+
+    if (!targetSlot) continue;
+
+    targetSlot.placements.push({
+      ...placement,
+      slotId: targetSlot.id,
+      id: makePlacementId(placement.blockId, targetSlot.id, targetSlot.placements.length + 1),
+    });
+  }
+
+  sortedSlots.forEach((slot) => rebuildSlotPlacementOrder(slot, blockMap));
+}
 
 function schedulePlanEntries(input: {
   planStartDate: string;
@@ -2450,13 +2488,6 @@ function schedulePlanEntries(input: {
   const tocUnits = buildTocUnitsFromBlockRows(input.lessonPlanId, input.blocks);
   const examBlockTemplates = buildExamTemplatesFromBlockRows(input.blocks);
   const teacherRules = buildTeacherRulesFromBlockRows(input.blocks);
-  const expectedBlocks = buildBlocks({
-    courseId: input.lessonPlanId,
-    tocUnits,
-    teacherRules,
-    examBlockTemplates,
-    initialDelayDates: input.blackoutDates,
-  } satisfies BuildBlocksInput);
   const algorithmSlots = buildCalendarAlgorithmSlots({
     planStartDate: input.planStartDate,
     planEndDate: input.planEndDate,
@@ -2468,6 +2499,14 @@ function schedulePlanEntries(input: {
   const rebuiltSlots = algorithmSlots.filter((slot) => typeof slot.termIndex === "number");
 
   const algorithmBlocks = mapBlockRowsToAlgorithmBlocks(input.blocks);
+  const expectedBlocks = buildBlocks({
+  courseId: input.lessonPlanId,
+  tocUnits,
+  teacherRules,
+  examBlockTemplates,
+  slots: algorithmSlots,
+  initialDelayDates: input.blackoutDates,
+} satisfies BuildBlocksInput);
   const placementSeed = buildPlacementSeed(
     input.slots,
     input.blocks.filter((block) => Boolean(block.slot_id))
@@ -2575,6 +2614,8 @@ export default function CalendarScreen() {
   const [zoomLevel, setZoomLevel] = useState<ZoomLevel>("monthly");
   const [suspendMutating, setSuspendMutating] = useState(false);
   const [repopulateMutating, setRepopulateMutating] = useState(false);
+  const [suspensionPickerVisible, setSuspensionPickerVisible] = useState(false);
+  const [suspensionSelectedPlanIds, setSuspensionSelectedPlanIds] = useState<string[]>([]);
   const [entryEditor, setEntryEditor] = useState<EntryEditorState>({
     visible: false,
     mode: "create",
@@ -2590,6 +2631,8 @@ export default function CalendarScreen() {
     startTime: "",
     endTime: "",
     reviewDays: "1",
+    quizScopeStartLessonId: null,
+    quizScopeEndLessonId: null,
   });
   const createSubtypeReveal = useRef(new Animated.Value(0)).current;
   const createTimeReveal = useRef(new Animated.Value(0)).current;
@@ -2678,7 +2721,11 @@ export default function CalendarScreen() {
 
       if (mappedPlans.length > 0) {
         const lessonPlanIds = mappedPlans.map((plan) => plan.lesson_plan_id);
-        const [{ data: slotRows, error: slotsError }, { data: blockRows, error: blocksError }] = await Promise.all([
+        const [
+          { data: slotRows, error: slotsError },
+          { data: blockRows, error: blocksError },
+          { data: planContentRows, error: planContentError },
+        ] = await Promise.all([
           supabase
             .from("slots")
             .select("slot_id, lesson_plan_id, title, slot_date, weekday, start_time, end_time, meeting_type, room, slot_number, series_key, is_locked")
@@ -2690,6 +2737,11 @@ export default function CalendarScreen() {
             .select("block_id, lesson_plan_id, slot_id, root_block_id, lesson_id, algorithm_block_key, block_key, title, description, session_category, session_subcategory, meeting_type, estimated_minutes, min_minutes, max_minutes, required, splittable, overlay_mode, preferred_session_type, dependency_keys, order_no, is_locked, ww_subtype, pt_subtype, metadata, lesson:lessons(title)")
             .in("lesson_plan_id", lessonPlanIds)
             .order("created_at", { ascending: true }),
+          supabase
+            .from("plan_subject_content")
+            .select("lesson_plan_id, lesson_id, lesson:lessons(lesson_id, title, sequence_no, chapter:chapters(sequence_no))")
+            .in("lesson_plan_id", lessonPlanIds)
+            .eq("content_level", "lesson"),
         ]);
 
         if (slotsError) {
@@ -2719,17 +2771,107 @@ export default function CalendarScreen() {
         if (blocksError) {
           console.warn("[calendar] Unable to load blocks", blocksError.message);
         } else {
-          for (const row of blockRows ?? []) {
+          const normalizedBlockRows = blockRows ?? [];
+          const lessonCatalogByPlanId = new Map<string, { lesson_id: string; title: string; chapterSequence: number; lessonSequence: number }[]>();
+          if (planContentError) {
+            console.warn("[calendar] Unable to load plan lesson content", planContentError.message);
+          } else {
+            for (const row of planContentRows ?? []) {
+              if (!row?.lesson_plan_id || !row?.lesson_id) continue;
+              const lessonRaw = row?.lesson;
+              const lesson = Array.isArray(lessonRaw) ? lessonRaw[0] : lessonRaw;
+              const chapterRaw = lesson?.chapter;
+              const chapter = Array.isArray(chapterRaw) ? chapterRaw[0] : chapterRaw;
+              const current = lessonCatalogByPlanId.get(String(row.lesson_plan_id)) ?? [];
+              current.push({
+                lesson_id: String(row.lesson_id),
+                title: lesson?.title ? String(lesson.title) : "Untitled Lesson",
+                chapterSequence: typeof chapter?.sequence_no === "number" ? Number(chapter.sequence_no) : Number.MAX_SAFE_INTEGER,
+                lessonSequence: typeof lesson?.sequence_no === "number" ? Number(lesson.sequence_no) : Number.MAX_SAFE_INTEGER,
+              });
+              lessonCatalogByPlanId.set(String(row.lesson_plan_id), current);
+            }
+            for (const [planId, lessons] of lessonCatalogByPlanId.entries()) {
+              lessonCatalogByPlanId.set(
+                planId,
+                [...lessons].sort((a, b) => {
+                  if (a.chapterSequence !== b.chapterSequence) return a.chapterSequence - b.chapterSequence;
+                  if (a.lessonSequence !== b.lessonSequence) return a.lessonSequence - b.lessonSequence;
+                  return a.lesson_id.localeCompare(b.lesson_id);
+                })
+              );
+            }
+          }
+          const lessonIdsToHydrate = Array.from(
+            new Set(
+              normalizedBlockRows
+                .map((row) => {
+                  const metadata =
+                    row?.metadata && typeof row.metadata === "object"
+                      ? (row.metadata as Record<string, unknown>)
+                      : null;
+                  const sourceTocId =
+                    typeof metadata?.sourceTocId === "string" && isUuid(metadata.sourceTocId)
+                      ? metadata.sourceTocId
+                      : null;
+                  return row?.lesson_id ? String(row.lesson_id) : sourceTocId;
+                })
+                .filter((value): value is string => Boolean(value))
+            )
+          );
+          const lessonTitleById = new Map<string, string>();
+          if (lessonIdsToHydrate.length > 0) {
+            const { data: lessonRows, error: lessonsError } = await supabase
+              .from("lessons")
+              .select("lesson_id, title")
+              .in("lesson_id", lessonIdsToHydrate);
+            if (lessonsError) {
+              console.warn("[calendar] Unable to hydrate lesson titles", lessonsError.message);
+            } else {
+              for (const lessonRow of lessonRows ?? []) {
+                if (!lessonRow?.lesson_id) continue;
+                lessonTitleById.set(
+                  String(lessonRow.lesson_id),
+                  lessonRow?.title ? String(lessonRow.title) : "Untitled Lesson"
+                );
+              }
+            }
+          }
+
+          for (const row of normalizedBlockRows) {
             const planId = String(row.lesson_plan_id);
             const current = blocksMap[planId] ?? [];
             const lessonRaw = row?.lesson;
             const lesson = Array.isArray(lessonRaw) ? lessonRaw[0] : lessonRaw;
+            const metadata =
+              row?.metadata && typeof row.metadata === "object"
+                ? (row.metadata as Record<string, unknown>)
+                : {};
+            const sourceTocId =
+              typeof metadata.sourceTocId === "string" && isUuid(metadata.sourceTocId)
+                ? metadata.sourceTocId
+                : null;
+            const blockLessonOrder = Number(metadata.globalLessonOrder ?? metadata.lessonOrder ?? 0);
+            const lessonCatalog = lessonCatalogByPlanId.get(planId) ?? [];
+            const orderedLessonMatch =
+              row?.session_category === "lesson" && blockLessonOrder > 0
+                ? (lessonCatalog[blockLessonOrder - 1] ?? null)
+                : null;
+            const resolvedLessonId = row?.lesson_id
+              ? String(row.lesson_id)
+              : sourceTocId ?? orderedLessonMatch?.lesson_id ?? null;
+            const resolvedLessonTitle =
+              lesson?.title
+                ? String(lesson.title)
+                : resolvedLessonId
+                  ? (lessonTitleById.get(resolvedLessonId) ?? orderedLessonMatch?.title ?? null)
+                  : null;
             current.push({
               block_id: String(row.block_id),
               lesson_plan_id: planId,
               slot_id: row?.slot_id ? String(row.slot_id) : null,
               root_block_id: row?.root_block_id ? String(row.root_block_id) : null,
-              lesson_id: row?.lesson_id ? String(row.lesson_id) : null,
+              lesson_id: resolvedLessonId,
               algorithm_block_key: String(row.algorithm_block_key ?? ""),
               block_key: String(row.block_key ?? row.algorithm_block_key ?? row.block_id),
               title: String(row.title ?? "Untitled"),
@@ -2750,10 +2892,9 @@ export default function CalendarScreen() {
               ww_subtype: row?.ww_subtype ? String(row.ww_subtype) : null,
               pt_subtype: row?.pt_subtype ? String(row.pt_subtype) : null,
               metadata: {
-                ...(row?.metadata && typeof row.metadata === "object" ? (row.metadata as Record<string, unknown>) : {}),
-                ...(lesson?.title
-                  ? { lessonTitle: String(lesson.title) }
-                  : {}),
+                ...metadata,
+                ...(resolvedLessonId ? { sourceTocId: resolvedLessonId } : {}),
+                ...(resolvedLessonTitle ? { lessonTitle: resolvedLessonTitle } : {}),
               },
             });
             blocksMap[planId] = current;
@@ -2954,6 +3095,20 @@ export default function CalendarScreen() {
     () => new Set(selectedPlanId ? suspendedByPlan[selectedPlanId] ?? [] : []),
     [selectedPlanId, suspendedByPlan]
   );
+  const suspendablePlansOnSelectedDate = useMemo(
+    () =>
+      plans.filter((plan) => {
+        const planSlots = slotsByPlan[plan.lesson_plan_id] ?? [];
+        const planBlocks = blocksByPlan[plan.lesson_plan_id] ?? [];
+        const hasSlotOnDate = planSlots.some((slot) => slot.slot_date === selectedDate);
+        const hasBlockOnDate = planBlocks.some((block) => {
+          if (!block.slot_id) return false;
+          return planSlots.some((slot) => slot.slot_id === block.slot_id && slot.slot_date === selectedDate);
+        });
+        return hasSlotOnDate || hasBlockOnDate;
+      }),
+    [blocksByPlan, plans, selectedDate, slotsByPlan]
+  );
   const selectedDateAlgorithmSlots = useMemo(() => {
     if (!selectedPlan) return [] as SessionSlot[];
     const autoBlockRows = selectedPlanBlocks.filter((block) => !Boolean(block.metadata?.manual));
@@ -2967,6 +3122,407 @@ export default function CalendarScreen() {
       examBlockTemplates: examTemplates,
     });
   }, [selectedPlan, selectedPlanBlocks, selectedPlanSlots]);
+  const quizScopeLessonOptions = useMemo(() => {
+    if (!selectedPlan) return [] as LessonScopeOption[];
+
+    const targetDate = isIsoDate(entryEditor.startDate) ? entryEditor.startDate : selectedDate;
+    const targetTermIndex =
+      selectedDateAlgorithmSlots.find((slot) => slot.date === targetDate)?.termIndex ??
+      selectedDateAlgorithmSlots.find((slot) => slot.date === selectedDate)?.termIndex ??
+      -1;
+    if (targetTermIndex < 0) return [];
+
+    return selectedPlanBlocks
+      .filter((block) => block.session_category === "lesson" && !Boolean(block.metadata?.manual))
+      .filter((block) => Number(block.metadata?.termIndex ?? -1) === targetTermIndex)
+      .map((block) => {
+        const lessonId =
+          (typeof block.metadata?.sourceTocId === "string" && block.metadata.sourceTocId) ||
+          block.lesson_id ||
+          block.block_id;
+        const lessonOrder = Number(block.metadata?.lessonOrder ?? block.metadata?.globalLessonOrder ?? 0);
+        const lessonTitle =
+          typeof block.metadata?.lessonTitle === "string" && block.metadata.lessonTitle.trim()
+            ? block.metadata.lessonTitle.trim()
+            : block.title;
+        return {
+          lessonId,
+          lessonOrder,
+          termIndex: targetTermIndex,
+          label: lessonOrder > 0 ? `L${lessonOrder} - ${lessonTitle}` : lessonTitle,
+        };
+      })
+      .sort((a, b) => a.lessonOrder - b.lessonOrder);
+  }, [entryEditor.startDate, selectedDate, selectedDateAlgorithmSlots, selectedPlan, selectedPlanBlocks]);
+  const fetchPlanBlockRows = useCallback(async () => {
+    if (!selectedPlan) return [] as PlanBlockRow[];
+    const { data, error } = await supabase
+      .from("blocks")
+      .select("block_id, lesson_plan_id, slot_id, root_block_id, algorithm_block_key, block_key, lesson_id, title, description, session_category, session_subcategory, meeting_type, estimated_minutes, min_minutes, max_minutes, required, splittable, overlay_mode, preferred_session_type, dependency_keys, order_no, is_locked, ww_subtype, pt_subtype, metadata")
+      .eq("lesson_plan_id", selectedPlan.lesson_plan_id)
+      .order("order_no", { ascending: true });
+    if (error) throw error;
+    return (data ?? []).map((row: any) => ({
+      block_id: String(row.block_id),
+      lesson_plan_id: String(row.lesson_plan_id),
+      slot_id: row?.slot_id ? String(row.slot_id) : null,
+      root_block_id: row?.root_block_id ? String(row.root_block_id) : null,
+      algorithm_block_key: String(row.algorithm_block_key),
+      block_key: String(row.block_key),
+      lesson_id: row?.lesson_id ? String(row.lesson_id) : null,
+      title: String(row.title),
+      description: row?.description ? String(row.description) : null,
+      session_category: row?.session_category ? String(row.session_category) : null,
+      session_subcategory: row?.session_subcategory ? String(row.session_subcategory) : null,
+      meeting_type: row?.meeting_type ? String(row.meeting_type) : null,
+      estimated_minutes: typeof row?.estimated_minutes === "number" ? Number(row.estimated_minutes) : null,
+      min_minutes: typeof row?.min_minutes === "number" ? Number(row.min_minutes) : null,
+      max_minutes: typeof row?.max_minutes === "number" ? Number(row.max_minutes) : null,
+      required: typeof row?.required === "boolean" ? Boolean(row.required) : null,
+      splittable: typeof row?.splittable === "boolean" ? Boolean(row.splittable) : null,
+      overlay_mode: row?.overlay_mode ? String(row.overlay_mode) : null,
+      preferred_session_type: row?.preferred_session_type ? String(row.preferred_session_type) : null,
+      dependency_keys: Array.isArray(row?.dependency_keys) ? row.dependency_keys.map(String) : [],
+      order_no: typeof row?.order_no === "number" ? Number(row.order_no) : null,
+      is_locked: typeof row?.is_locked === "boolean" ? Boolean(row.is_locked) : null,
+      ww_subtype: row?.ww_subtype ? String(row.ww_subtype) : null,
+      pt_subtype: row?.pt_subtype ? String(row.pt_subtype) : null,
+      metadata: row?.metadata && typeof row.metadata === "object" ? row.metadata : {},
+    })) satisfies PlanBlockRow[];
+  }, [selectedPlan]);
+  const fetchPlanSlotRows = useCallback(async () => {
+    if (!selectedPlan) return [] as PlanSlotRow[];
+    const { data, error } = await supabase
+      .from("slots")
+      .select("slot_id, lesson_plan_id, title, slot_date, weekday, start_time, end_time, meeting_type, room, slot_number, series_key, is_locked")
+      .eq("lesson_plan_id", selectedPlan.lesson_plan_id)
+      .order("slot_date", { ascending: true })
+      .order("start_time", { ascending: true });
+    if (error) throw error;
+    return (data ?? []).map((row: any) => ({
+      slot_id: String(row.slot_id),
+      lesson_plan_id: String(row.lesson_plan_id),
+      title: row?.title ? String(row.title) : null,
+      slot_date: String(row.slot_date),
+      weekday: row?.weekday ? String(row.weekday) : null,
+      start_time: row?.start_time ? String(row.start_time) : null,
+      end_time: row?.end_time ? String(row.end_time) : null,
+      meeting_type: row?.meeting_type ? String(row.meeting_type) : null,
+      room: row?.room ? String(row.room) : null,
+      slot_number: typeof row?.slot_number === "number" ? Number(row.slot_number) : null,
+      series_key: row?.series_key ? String(row.series_key) : null,
+      is_locked: typeof row?.is_locked === "boolean" ? Boolean(row.is_locked) : null,
+    })) satisfies PlanSlotRow[];
+  }, [selectedPlan]);
+  const assertNoOverlappingManualQuizScope = useCallback((input: {
+    termIndex: number;
+    startLessonId: string | null;
+    endLessonId: string | null;
+    excludeBlockId?: string | null;
+  }) => {
+    const startIndex = quizScopeLessonOptions.findIndex((lesson) => lesson.lessonId === input.startLessonId);
+    const endIndex = quizScopeLessonOptions.findIndex((lesson) => lesson.lessonId === input.endLessonId);
+    if (startIndex < 0 || endIndex < 0 || endIndex < startIndex) {
+      throw new Error("Pick a valid quiz lesson scope.");
+    }
+    const selectedOrders = new Set(
+      quizScopeLessonOptions.slice(startIndex, endIndex + 1).map((lesson) => lesson.lessonOrder)
+    );
+    const conflictingManualQuiz = selectedPlanBlocks.find((block) => {
+      if (block.block_id === input.excludeBlockId || block.root_block_id === input.excludeBlockId) return false;
+      if (!Boolean(block.metadata?.manual)) return false;
+      if (block.session_category !== "written_work" || block.session_subcategory !== "quiz") return false;
+      if (Number(block.metadata?.termIndex ?? -1) !== input.termIndex) return false;
+      const coverage = getQuizCoverageFromMetadata(block.metadata);
+      if (!coverage) return false;
+      return coverage.coveredLessonOrders.some((order) => selectedOrders.has(order));
+    });
+    if (conflictingManualQuiz) {
+      throw new Error("Manual quiz scopes cannot overlap within the same term.");
+    }
+  }, [quizScopeLessonOptions, selectedPlanBlocks]);
+  const reconcileTermQuizScopes = useCallback(async (termIndex: number) => {
+    if (!selectedPlan) return;
+
+    const blockRows = await fetchPlanBlockRows();
+    const lessonOptions = blockRows
+      .filter((block) => block.session_category === "lesson" && !Boolean(block.metadata?.extraCandidateType))
+      .filter((block) => Number(block.metadata?.termIndex ?? -1) === termIndex)
+      .map((block) => {
+        const lessonId =
+          (typeof block.metadata?.sourceTocId === "string" && block.metadata.sourceTocId) ||
+          block.lesson_id ||
+          block.block_id;
+        const lessonOrder = Number(block.metadata?.lessonOrder ?? block.metadata?.globalLessonOrder ?? 0);
+        const lessonTitle =
+          typeof block.metadata?.lessonTitle === "string" && block.metadata.lessonTitle.trim()
+            ? block.metadata.lessonTitle.trim()
+            : block.title;
+        return {
+          lessonId,
+          lessonOrder,
+          label: lessonOrder > 0 ? `L${lessonOrder} - ${lessonTitle}` : lessonTitle,
+          termIndex,
+        } satisfies LessonScopeOption;
+      })
+      .sort((a, b) => a.lessonOrder - b.lessonOrder);
+    if (lessonOptions.length === 0) return;
+
+    const quizzesInTerm = blockRows
+      .filter((block) => block.session_category === "written_work" && block.session_subcategory === "quiz")
+      .filter((block) => Number(block.metadata?.termIndex ?? -1) === termIndex);
+    const manualQuizzes = quizzesInTerm
+      .filter((block) => Boolean(block.metadata?.manual))
+      .map((block) => ({
+        row: block,
+        coverage: getQuizCoverageFromMetadata(block.metadata),
+      }))
+      .filter((entry): entry is { row: PlanBlockRow; coverage: NonNullable<ReturnType<typeof getQuizCoverageFromMetadata>> } => Boolean(entry.coverage))
+      .sort((a, b) => a.coverage.startOrder - b.coverage.startOrder || a.coverage.endOrder - b.coverage.endOrder);
+
+    const manuallyCoveredOrders = new Set<number>();
+    for (const quiz of manualQuizzes) {
+      for (const order of quiz.coverage.coveredLessonOrders) {
+        if (manuallyCoveredOrders.has(order)) {
+          throw new Error("Manual quiz scopes cannot overlap within the same term.");
+        }
+        manuallyCoveredOrders.add(order);
+      }
+    }
+
+    const uncoveredLessons = lessonOptions.filter((lesson) => !manuallyCoveredOrders.has(lesson.lessonOrder));
+    const uncoveredRanges = splitLessonOptionsIntoContiguousRanges(uncoveredLessons);
+    const autoQuizRows = quizzesInTerm
+      .filter((block) => !Boolean(block.metadata?.manual))
+      .sort((a, b) => Number(a.metadata?.quizOrder ?? 0) - Number(b.metadata?.quizOrder ?? 0) || a.block_id.localeCompare(b.block_id));
+
+    const examRows = blockRows
+      .filter((block) => block.session_category === "exam")
+      .sort((a, b) => Number(a.metadata?.termIndex ?? -1) - Number(b.metadata?.termIndex ?? -1));
+    const quizCountByTerm = new Map<number, number>();
+    for (const examRow of examRows) {
+      quizCountByTerm.set(
+        Number(examRow.metadata?.termIndex ?? -1),
+        examRow.session_category === "exam"
+          ? blockRows.filter(
+              (block) =>
+                block.session_category === "written_work" &&
+                block.session_subcategory === "quiz" &&
+                Number(block.metadata?.termIndex ?? -1) === Number(examRow.metadata?.termIndex ?? -1)
+            ).length
+          : 0
+      );
+    }
+    quizCountByTerm.set(termIndex, manualQuizzes.length + uncoveredRanges.length);
+    const globalQuizOffset = Array.from(quizCountByTerm.entries())
+      .filter(([currentTermIndex]) => currentTermIndex >= 0 && currentTermIndex < termIndex)
+      .sort((a, b) => a[0] - b[0])
+      .reduce((sum, [, count]) => sum + count, 0);
+    const nonQuizWwCountInTerm = blockRows.filter(
+      (block) =>
+        block.session_category === "written_work" &&
+        block.session_subcategory !== "quiz" &&
+        Number(block.metadata?.termIndex ?? -1) === termIndex
+    ).length;
+    const wwOffset = examRows
+      .filter((block) => Number(block.metadata?.termIndex ?? -1) < termIndex)
+      .reduce((sum, block) => sum + Number(block.metadata?.termWW ?? 0), 0);
+
+    const autoRowBySegment = uncoveredRanges.map((range, index) => ({
+      range,
+      row: autoQuizRows[index] ?? null,
+    }));
+    const extraAutoRows = autoQuizRows.slice(uncoveredRanges.length);
+    if (extraAutoRows.length > 0) {
+      const { error } = await supabase
+        .from("blocks")
+        .delete()
+        .in("block_id", extraAutoRows.map((row) => row.block_id));
+      if (error) throw error;
+    }
+
+    const orderedManualAndAuto = [
+      ...manualQuizzes.map((quiz) => ({
+        row: quiz.row,
+        lessons: lessonOptions.filter((lesson) => quiz.coverage.coveredLessonOrders.includes(lesson.lessonOrder)),
+        manual: true,
+      })),
+      ...autoRowBySegment.map((entry) => ({
+        row: entry.row,
+        lessons: entry.range,
+        manual: false,
+      })),
+    ].sort((a, b) => {
+      const aStart = a.lessons[0]?.lessonOrder ?? Number.MAX_SAFE_INTEGER;
+      const bStart = b.lessons[0]?.lessonOrder ?? Number.MAX_SAFE_INTEGER;
+      if (aStart !== bStart) return aStart - bStart;
+      return Number(b.manual) - Number(a.manual);
+    });
+
+    const updates: Array<PromiseLike<{ error: any }>> = [];
+    const createdRows: any[] = [];
+    orderedManualAndAuto.forEach((entry, index) => {
+      const globalQuizOrder = globalQuizOffset + index + 1;
+      const termQuizOrder = index + 1;
+      const globalWwOrder = wwOffset + nonQuizWwCountInTerm + termQuizOrder;
+      const nextMetadata = buildQuizCoverageMetadataFromLessons({
+        lessons: entry.lessons,
+        existingMetadata: entry.row?.metadata ?? {},
+        globalQuizOrder,
+        termQuizOrder,
+        globalWwOrder,
+      });
+      const nextTitle = getCanonicalAutoBlockTitle({
+        category: "written_work",
+        subcategory: "quiz",
+        metadata: nextMetadata,
+        fallbackTitle: `Q${globalQuizOrder}`,
+      });
+
+      if (entry.row) {
+        updates.push(
+          supabase
+            .from("blocks")
+            .update({
+              title: nextTitle,
+              metadata: nextMetadata,
+            })
+            .eq("block_id", entry.row.block_id)
+            .eq("lesson_plan_id", selectedPlan.lesson_plan_id)
+        );
+        return;
+      }
+
+      createdRows.push({
+        lesson_plan_id: selectedPlan.lesson_plan_id,
+        slot_id: null,
+        root_block_id: null,
+        lesson_id: null,
+        algorithm_block_key: `quiz__term_${termIndex}__${makeId()}`,
+        block_key: makeId(),
+        title: nextTitle,
+        description: null,
+        session_category: "written_work",
+        session_subcategory: "quiz",
+        meeting_type: null,
+        estimated_minutes: 30,
+        min_minutes: null,
+        max_minutes: null,
+        required: true,
+        splittable: false,
+        overlay_mode: "major",
+        preferred_session_type: "any",
+        dependency_keys: [],
+        order_no: 1,
+        is_locked: false,
+        ww_subtype: "quiz",
+        pt_subtype: null,
+        metadata: {
+          ...nextMetadata,
+          termIndex,
+          termKey:
+            typeof examRows.find((row) => Number(row.metadata?.termIndex ?? -1) === termIndex)?.metadata?.termKey === "string"
+              ? examRows.find((row) => Number(row.metadata?.termIndex ?? -1) === termIndex)?.metadata?.termKey
+              : "final",
+        },
+      });
+    });
+
+    if (createdRows.length > 0) {
+      const { error } = await supabase.from("blocks").insert(createdRows);
+      if (error) throw error;
+    }
+
+    const updateResults = await Promise.all(updates);
+    const updateError = updateResults.find((result: any) => result?.error)?.error;
+    if (updateError) throw updateError;
+
+    const examRow = examRows.find((row) => Number(row.metadata?.termIndex ?? -1) === termIndex) ?? null;
+    if (examRow) {
+      const { error } = await supabase
+        .from("blocks")
+        .update({
+          metadata: {
+            ...(examRow.metadata ?? {}),
+            termQuizAmount: orderedManualAndAuto.length,
+          },
+        })
+        .eq("block_id", examRow.block_id)
+        .eq("lesson_plan_id", selectedPlan.lesson_plan_id);
+      if (error) throw error;
+    }
+  }, [fetchPlanBlockRows, selectedPlan]);
+  const rescheduleAutoBlocksForTerm = useCallback(async (termIndex: number) => {
+    if (!selectedPlan) return;
+
+    const blockRows = await fetchPlanBlockRows();
+    const slotRows = await fetchPlanSlotRows();
+    const autoBlockRows = blockRows.filter((block) => !Boolean(block.metadata?.manual));
+    const manualBlockRows = blockRows.filter((block) => Boolean(block.metadata?.manual));
+    const examTemplates = buildExamTemplatesFromBlockRows(autoBlockRows);
+    const algorithmSlots = buildCalendarAlgorithmSlots({
+      planStartDate: selectedPlan.start_date,
+      planEndDate: selectedPlan.end_date,
+      lessonPlanId: selectedPlan.lesson_plan_id,
+      slots: slotRows,
+      blackoutDates: [],
+      examBlockTemplates: examTemplates,
+    }).filter((slot) => typeof slot.termIndex === "number");
+
+    const termSlots = algorithmSlots.filter((slot) => slot.termIndex === termIndex);
+    const termBlocks = mapBlockRowsToAlgorithmBlocks(
+      autoBlockRows.filter((block) => Number(block.metadata?.termIndex ?? -1) === termIndex)
+    );
+    const manualSlotIds = new Set(
+      manualBlockRows
+        .filter(
+          (block) => block.slot_id && Number(block.metadata?.termIndex ?? -1) === termIndex
+        )
+        .map((block) => String(block.slot_id))
+    );
+    const placeResult = compressTermUsingCapacity({
+      termSlots: termSlots.map((slot) => ({
+        ...slot,
+        locked: slot.locked || manualSlotIds.has(slot.id),
+        lockReason:
+          slot.locked || manualSlotIds.has(slot.id)
+            ? slot.lockReason ?? "Manual block constraint"
+            : slot.lockReason,
+      })),
+      blocks: termBlocks,
+    });
+    applyTermRepairResult(termSlots, placeResult);
+    normalizeTermPlacements(termSlots, termBlocks);
+
+    const placementByBlockId = new Map(
+      termSlots.flatMap((slot) =>
+        slot.placements.map((placement, index) => [
+          placement.blockId,
+          { slotId: slot.id, orderNo: index + 1 },
+        ] as const)
+      )
+    );
+
+    const updateResults = await Promise.all(
+      autoBlockRows
+        .filter((block) => Number(block.metadata?.termIndex ?? -1) === termIndex)
+        .map((row) => {
+          const placement = placementByBlockId.get(row.block_id) ?? null;
+          return supabase
+            .from("blocks")
+            .update({
+              slot_id: placement?.slotId ?? null,
+              order_no:
+                placement?.orderNo ??
+                (typeof row.order_no === "number" && Number.isFinite(row.order_no) ? row.order_no : 1),
+            })
+            .eq("block_id", row.block_id)
+            .eq("lesson_plan_id", selectedPlan.lesson_plan_id);
+        })
+    );
+    const updateError = updateResults.find((result) => result.error)?.error;
+    if (updateError) throw updateError;
+  }, [fetchPlanBlockRows, fetchPlanSlotRows, selectedPlan]);
   const repopulatableDates = useMemo(() => {
     if (!selectedPlan) return new Set<string>();
 
@@ -2984,6 +3540,20 @@ export default function CalendarScreen() {
       slotRowsByDate.set(slot.slot_date, current);
     }
 
+    const validation = validatePlan({
+      slots: selectedDateAlgorithmSlots,
+      blocks: mapBlockRowsToAlgorithmBlocks(
+        selectedPlanBlocks.filter((block) => !Boolean(block.metadata?.manual))
+      ),
+      tocUnits: buildTocUnitsFromBlockRows(
+        selectedPlan.lesson_plan_id,
+        selectedPlanBlocks.filter((block) => !Boolean(block.metadata?.manual))
+      ),
+    });
+    const diagnosticsByTermIndex = new Map(
+      validation.termDiagnostics.map((diagnostic) => [diagnostic.termIndex, diagnostic])
+    );
+
     const dates = new Set<string>();
     for (const [date, dateSlots] of Array.from(slotRowsByDate.entries())) {
       const termIndex =
@@ -2992,11 +3562,20 @@ export default function CalendarScreen() {
 
       if (selectedPlanSuspendedSet.has(date)) continue;
 
-      const hasOpenSelectedDateSlot = dateSlots.some((slot) => {
+      const hasEmptySelectedDateSlot = dateSlots.some((slot) => {
+        const slotBlocks = selectedPlanBlocks.filter((block) => block.slot_id === slot.slot_id);
+        return isEligibleEmptyPlanSlot(
+          slot,
+          slotBlocks,
+          algorithmSlotsByDate.get(date)?.find((candidate) => candidate.id === slot.slot_id) ?? null
+        );
+      });
+      const hasOverloadedSelectedDateSlot = dateSlots.some((slot) => {
         const slotBlocks = selectedPlanBlocks.filter(
           (block) => block.slot_id === slot.slot_id && !Boolean(block.metadata?.manual)
         );
-        return slotBlocks.length === 0 || slotBlocks.every((block) => block.overlay_mode === "minor");
+        const capacity = getSlotCapacityMinutes(slot);
+        return capacity > 0 && getPlannedMinutesForSlot(slot.slot_id, slotBlocks) > capacity;
       });
       const hasUnscheduledAutoBlockInTerm = selectedPlanBlocks.some(
         (block) =>
@@ -3004,8 +3583,17 @@ export default function CalendarScreen() {
           !block.slot_id &&
           Number(block.metadata?.termIndex ?? -1) === termIndex
       );
+      const termDiagnostics = diagnosticsByTermIndex.get(termIndex) ?? null;
+      const hasTermValidationError = Boolean(termDiagnostics?.hasValidationErrors);
 
-      if (!hasOpenSelectedDateSlot && !hasUnscheduledAutoBlockInTerm) continue;
+      if (
+        !hasEmptySelectedDateSlot &&
+        !hasUnscheduledAutoBlockInTerm &&
+        !hasOverloadedSelectedDateSlot &&
+        !hasTermValidationError
+      ) {
+        continue;
+      }
 
       dates.add(date);
     }
@@ -3300,8 +3888,10 @@ export default function CalendarScreen() {
 
     const openSlot =
       selectedDaySlots.find((slot) => {
-        const slotBlocks = selectedPlanBlocks.filter((block) => block.slot_id === slot.slot_id);
-        return slotBlocks.length === 0 || slotBlocks.every((block) => block.overlay_mode === "minor");
+        return slotHasRemainingCapacity(
+          slot,
+          selectedPlanBlocks.filter((block) => block.slot_id === slot.slot_id)
+        );
       }) ?? null;
     const slotStart = toHm(openSlot?.start_time);
     const slotEnd = toHm(openSlot?.end_time);
@@ -3325,6 +3915,8 @@ export default function CalendarScreen() {
       startTime: createEntrySeedTimes.startTime,
       endTime: createEntrySeedTimes.endTime,
       reviewDays: "1",
+      quizScopeStartLessonId: null,
+      quizScopeEndLessonId: null,
     });
   }, [createEntrySeedTimes.endTime, createEntrySeedTimes.startTime, selectedDate]);
 
@@ -3342,6 +3934,9 @@ export default function CalendarScreen() {
             : entry.category === "lesson"
               ? (entry.meeting_type ?? "lecture")
               : "");
+    const coveredLessonIds = Array.isArray(entry.metadata?.coveredLessonIds)
+      ? entry.metadata.coveredLessonIds.filter((value): value is string => typeof value === "string")
+      : [];
     setEntryEditor({
       visible: true,
       mode: "edit",
@@ -3357,6 +3952,8 @@ export default function CalendarScreen() {
       startTime: (entry.start_time ?? "").slice(0, 5),
       endTime: (entry.end_time ?? "").slice(0, 5),
       reviewDays: "1",
+      quizScopeStartLessonId: coveredLessonIds[0] ?? null,
+      quizScopeEndLessonId: coveredLessonIds.at(-1) ?? null,
     });
   }, [selectedDate]);
 
@@ -3422,14 +4019,12 @@ export default function CalendarScreen() {
       const expectedLessons = Number(examBlock.metadata?.termLessons ?? 0);
       const expectedWW = Number(examBlock.metadata?.termWW ?? 0);
       const expectedPT = Number(examBlock.metadata?.termPT ?? 0);
-      const expectedQuiz = Number(examBlock.metadata?.termQuizAmount ?? 0);
       const expectedExam = 1;
 
       const violations: string[] = [];
       if (counts.lesson < expectedLessons) violations.push(`lessons ${counts.lesson}/${expectedLessons}`);
       if (counts.writtenWork < expectedWW) violations.push(`written works ${counts.writtenWork}/${expectedWW}`);
       if (counts.performanceTask < expectedPT) violations.push(`performance tasks ${counts.performanceTask}/${expectedPT}`);
-      if (counts.quiz < expectedQuiz) violations.push(`quizzes ${counts.quiz}/${expectedQuiz}`);
       if (counts.exam < expectedExam) violations.push(`exams ${counts.exam}/${expectedExam}`);
 
       if (violations.length > 0) {
@@ -3488,6 +4083,32 @@ export default function CalendarScreen() {
         Alert.alert("Custom label required", "Enter a label for the Other subcategory.");
         return;
       }
+
+      const buildManualQuizScopeMetadata = (baseMetadata: Record<string, unknown>) => {
+        if (!(createCategory === "written_work" && storedSubtype === "quiz")) {
+          return baseMetadata;
+        }
+        const startLessonId = entryEditor.quizScopeStartLessonId;
+        const endLessonId = entryEditor.quizScopeEndLessonId;
+        const startIndex = quizScopeLessonOptions.findIndex((lesson) => lesson.lessonId === startLessonId);
+        const endIndex = quizScopeLessonOptions.findIndex((lesson) => lesson.lessonId === endLessonId);
+        if (startIndex < 0 || endIndex < 0 || endIndex < startIndex) {
+          throw new Error("Pick a valid quiz lesson scope.");
+        }
+        const coveredLessons = quizScopeLessonOptions.slice(startIndex, endIndex + 1);
+        if (coveredLessons.length < 1) {
+          throw new Error("Quiz scope must cover at least 1 lesson.");
+        }
+        return {
+          ...baseMetadata,
+          coveredLessonIds: coveredLessons.map((lesson) => lesson.lessonId),
+          coveredLessonOrders: coveredLessons.map((lesson) => lesson.lessonOrder),
+          coveredLessonStartOrder: coveredLessons[0]!.lessonOrder,
+          coveredLessonEndOrder: coveredLessons[coveredLessons.length - 1]!.lessonOrder,
+          coveredLessonCount: coveredLessons.length,
+          afterLessonOrder: coveredLessons[coveredLessons.length - 1]!.lessonOrder,
+        };
+      };
 
       try {
         const parsedStart = entryEditor.startTime.trim() ? parseSqlTime(entryEditor.startTime.trim()) : null;
@@ -3559,6 +4180,15 @@ export default function CalendarScreen() {
           algorithmSlot?.termKey === "prelim" || algorithmSlot?.termKey === "midterm" || algorithmSlot?.termKey === "final"
             ? algorithmSlot.termKey
             : "final";
+        const algorithmTermIndex = Number(algorithmSlot?.termIndex ?? -1);
+        if (createCategory === "written_work" && storedSubtype === "quiz" && algorithmTermIndex >= 0) {
+          assertNoOverlappingManualQuizScope({
+            termIndex: algorithmTermIndex,
+            startLessonId: entryEditor.quizScopeStartLessonId,
+            endLessonId: entryEditor.quizScopeEndLessonId,
+            excludeBlockId: entryEditor.targetEntryId,
+          });
+        }
 
         const slotPositionById = new Map(slotRowsForOrdering.map((slot, index) => [slot.slot_id, index]));
         const targetSlotPosition = slotPositionById.get(targetSlot.slot_id) ?? Number.MAX_SAFE_INTEGER;
@@ -3644,6 +4274,7 @@ export default function CalendarScreen() {
                 resolvedEnd: parsedEnd,
                 manualLabel: selectedSubtype === "other" ? customLabel : null,
               };
+        const scopedMetadata = buildManualQuizScopeMetadata(createdMetadata);
 
         const { error: createError } = await supabase
           .from("blocks")
@@ -3670,14 +4301,14 @@ export default function CalendarScreen() {
             max_minutes: null,
             required: true,
             splittable: false,
-            overlay_mode: createCategory === "written_work" && storedSubtype !== "quiz" ? "minor" : "major",
+            overlay_mode: "major",
             preferred_session_type: createCategory === "lesson" ? storedSubtype : "any",
             dependency_keys: [],
             order_no: targetOrderNo,
             is_locked: true,
             ww_subtype: createCategory === "written_work" ? storedSubtype : null,
             pt_subtype: createCategory === "performance_task" ? storedSubtype : null,
-            metadata: createdMetadata,
+            metadata: scopedMetadata,
           });
         if (createError) throw createError;
 
@@ -3745,6 +4376,31 @@ export default function CalendarScreen() {
     }
     if (rangeDates.length === 0) return;
     const selectedMeetingType = effectiveCategory === "lesson" ? selectedSubtype : null;
+    const buildManualQuizScopeMetadata = (baseMetadata: Record<string, unknown>) => {
+      if (!(effectiveCategory === "written_work" && sessionSubcategory === "quiz")) {
+        return baseMetadata;
+      }
+      const startLessonId = entryEditor.quizScopeStartLessonId;
+      const endLessonId = entryEditor.quizScopeEndLessonId;
+      const startIndex = quizScopeLessonOptions.findIndex((lesson) => lesson.lessonId === startLessonId);
+      const endIndex = quizScopeLessonOptions.findIndex((lesson) => lesson.lessonId === endLessonId);
+      if (startIndex < 0 || endIndex < 0 || endIndex < startIndex) {
+        throw new Error("Pick a valid quiz lesson scope.");
+      }
+      const coveredLessons = quizScopeLessonOptions.slice(startIndex, endIndex + 1);
+      if (coveredLessons.length < 1) {
+        throw new Error("Quiz scope must cover at least 1 lesson.");
+      }
+      return {
+        ...baseMetadata,
+        coveredLessonIds: coveredLessons.map((lesson) => lesson.lessonId),
+        coveredLessonOrders: coveredLessons.map((lesson) => lesson.lessonOrder),
+        coveredLessonStartOrder: coveredLessons[0]!.lessonOrder,
+        coveredLessonEndOrder: coveredLessons[coveredLessons.length - 1]!.lessonOrder,
+        coveredLessonCount: coveredLessons.length,
+        afterLessonOrder: coveredLessons[coveredLessons.length - 1]!.lessonOrder,
+      };
+    };
 
     const chooseExistingSlotForDate = (date: string) => {
       const dayTimes = resolveEditorTimesForDate(date, selectedMeetingType, startTime, endTime);
@@ -3848,19 +4504,19 @@ export default function CalendarScreen() {
           max_minutes: null,
           required: true,
           splittable: false,
-          overlay_mode: sessionCategory === "written_work" && sessionSubcategory !== "quiz" ? "minor" : "major",
+          overlay_mode: "major",
           preferred_session_type: meetingType ?? "any",
           dependency_keys: [],
           order_no: orderNo,
           is_locked: true,
           ww_subtype: wwSubtype,
           pt_subtype: ptSubtype,
-          metadata: {
+          metadata: buildManualQuizScopeMetadata({
             preferredDate: date,
             manual: true,
             resolvedStart: dayTimes.start,
             resolvedEnd: dayTimes.end,
-          },
+          }),
         };
       };
 
@@ -3981,17 +4637,35 @@ export default function CalendarScreen() {
         }
       }
 
+      const affectedTermIndex =
+        effectiveCategory === "written_work" && sessionSubcategory === "quiz"
+          ? (
+              quizScopeLessonOptions.find((lesson) => lesson.lessonId === entryEditor.quizScopeStartLessonId)?.termIndex ??
+              quizScopeLessonOptions[0]?.termIndex ??
+              -1
+            )
+          : -1;
+      if (
+        effectiveCategory === "written_work" &&
+        sessionSubcategory === "quiz" &&
+        affectedTermIndex >= 0
+      ) {
+        await reconcileTermQuizScopes(affectedTermIndex);
+        await rescheduleAutoBlocksForTerm(affectedTermIndex);
+      }
+
       setEntryEditor((prev) => ({ ...prev, visible: false }));
       await cleanupEmptyManualSlots();
       await loadCalendarData();
     } catch (error: any) {
       Alert.alert("Save failed", error?.message ?? "Could not save entry.");
     }
-  }, [cleanupEmptyManualSlots, entryEditor, loadCalendarData, resolveEditorTimesForDate, selectedDate, selectedPlan, selectedPlanBlackoutSet, selectedPlanBlocks, selectedPlanSlots]);
+  }, [assertNoOverlappingManualQuizScope, cleanupEmptyManualSlots, entryEditor, loadCalendarData, reconcileTermQuizScopes, resolveEditorTimesForDate, rescheduleAutoBlocksForTerm, selectedDate, selectedPlan, selectedPlanBlackoutSet, selectedPlanBlocks, selectedPlanSlots]);
 
   const deleteSelectedEntry = useCallback(async () => {
     if (!selectedPlan || !entryEditor.targetEntryId) return;
     const rootId = entryEditor.targetEntryId;
+    const rootBlock = selectedPlanBlocks.find((block) => block.block_id === rootId) ?? null;
     const targetBlocks = selectedPlanBlocks
       .filter((block) => block.block_id === rootId || block.root_block_id === rootId)
       .map((block) => block.block_id);
@@ -4013,13 +4687,22 @@ export default function CalendarScreen() {
         .eq("block_id", rootId)
         .eq("lesson_plan_id", selectedPlan.lesson_plan_id);
       if (error) throw error;
+      const affectedTermIndex = Number(rootBlock?.metadata?.termIndex ?? -1);
+      if (
+        rootBlock?.session_category === "written_work" &&
+        rootBlock?.session_subcategory === "quiz" &&
+        affectedTermIndex >= 0
+      ) {
+        await reconcileTermQuizScopes(affectedTermIndex);
+        await rescheduleAutoBlocksForTerm(affectedTermIndex);
+      }
       setEntryEditor((prev) => ({ ...prev, visible: false }));
       await cleanupEmptyManualSlots();
       await loadCalendarData();
     } catch (deleteError: any) {
       Alert.alert("Delete failed", deleteError?.message ?? "Could not delete entry.");
     }
-  }, [cleanupEmptyManualSlots, entryEditor.targetEntryId, getBlockDeletionWarning, loadCalendarData, selectedPlan, selectedPlanBlocks]);
+  }, [cleanupEmptyManualSlots, entryEditor.targetEntryId, getBlockDeletionWarning, loadCalendarData, reconcileTermQuizScopes, rescheduleAutoBlocksForTerm, selectedPlan, selectedPlanBlocks]);
 
   const deleteCalendarEntry = useCallback(async (entry: PlanEntry) => {
     if (!selectedPlan) return;
@@ -4035,11 +4718,16 @@ export default function CalendarScreen() {
         .eq("lesson_plan_id", selectedPlan.lesson_plan_id)
         .eq("block_id", entry.plan_entry_id);
       if (error) throw error;
+      const affectedTermIndex = Number(entry.metadata?.termIndex ?? -1);
+      if (entry.category === "written_work" && entry.session_subcategory === "quiz" && affectedTermIndex >= 0) {
+        await reconcileTermQuizScopes(affectedTermIndex);
+        await rescheduleAutoBlocksForTerm(affectedTermIndex);
+      }
       await loadCalendarData();
     } catch (deleteError: any) {
       Alert.alert("Delete failed", deleteError?.message ?? "Could not delete entry.");
     }
-  }, [getBlockDeletionWarning, loadCalendarData, selectedPlan]);
+  }, [getBlockDeletionWarning, loadCalendarData, reconcileTermQuizScopes, rescheduleAutoBlocksForTerm, selectedPlan]);
 
   const saveBlockTimeAdjustment = useCallback(async (blockId: string, startMinutes: number, endMinutes: number) => {
     if (!selectedPlan) return;
@@ -4070,51 +4758,121 @@ export default function CalendarScreen() {
     }
   }, [loadCalendarData, selectedPlan, selectedPlanBlocks]);
 
-  const applySuspensionCompression = useCallback(async () => {
-    if (!selectedPlan) return;
+  const applySuspensionRecoveryForPlan = useCallback(async (planId: string, suspendedDate: string) => {
+    const plan = plans.find((candidate) => candidate.lesson_plan_id === planId) ?? null;
+    if (!plan) return;
 
-    const autoBlockRows = selectedPlanBlocks.filter((block) => !Boolean(block.metadata?.manual));
-    const manualBlocksOnDate = selectedPlanBlocks.filter(
-      (block) => Boolean(block.metadata?.manual) && block.slot_id && selectedPlanSlots.some((slot) => slot.slot_id === block.slot_id && slot.slot_date === selectedDate)
-    );
-    if (autoBlockRows.length === 0 && manualBlocksOnDate.length === 0) return;
+    const planSlots = slotsByPlan[planId] ?? [];
+    const planBlocks = blocksByPlan[planId] ?? [];
+    const autoBlockRows = planBlocks.filter((block) => !Boolean(block.metadata?.manual));
+    if (planSlots.length === 0 || planBlocks.length === 0 || autoBlockRows.length === 0) return;
 
+    const tocUnits = buildTocUnitsFromBlockRows(plan.lesson_plan_id, autoBlockRows);
+    const teacherRules = buildTeacherRulesFromBlockRows(autoBlockRows);
     const examTemplates = buildExamTemplatesFromBlockRows(autoBlockRows);
     const algorithmSlots = buildCalendarAlgorithmSlots({
-      planStartDate: selectedPlan.start_date,
-      planEndDate: selectedPlan.end_date,
-      lessonPlanId: selectedPlan.lesson_plan_id,
-      slots: selectedPlanSlots,
+      planStartDate: plan.start_date,
+      planEndDate: plan.end_date,
+      lessonPlanId: plan.lesson_plan_id,
+      slots: planSlots,
       blackoutDates: [],
       examBlockTemplates: examTemplates,
     }).filter((slot) => typeof slot.termIndex === "number");
+    const affectedTermIndex =
+      algorithmSlots.find((slot) => slot.date === suspendedDate && typeof slot.termIndex === "number")?.termIndex ?? null;
+    if (affectedTermIndex === null) return;
+
+    const expectedBlocks = buildBlocks({
+      courseId: plan.lesson_plan_id,
+      tocUnits,
+      teacherRules,
+      examBlockTemplates: examTemplates,
+      slots: algorithmSlots,
+      initialDelayDates: [],
+    } satisfies BuildBlocksInput);
+    const currentAutoBlocks = mapBlockRowsToAlgorithmBlocks(autoBlockRows);
+    const currentAutoIdentitySet = new Set(
+      currentAutoBlocks
+        .map((block) =>
+          buildAutoBlockIdentity({
+            category: block.type,
+            subcategory: block.subcategory,
+            sourceTocId: block.sourceTocId ?? null,
+            metadata: block.metadata,
+            title: block.title,
+          })
+        )
+        .filter((value): value is string => Boolean(value))
+    );
+    const missingAutoBlocks = expectedBlocks.filter((block) => {
+      if (Number(block.metadata.termIndex ?? -1) !== affectedTermIndex) return false;
+      const identity = buildAutoBlockIdentity({
+        category: block.type,
+        subcategory: block.subcategory,
+        sourceTocId: block.sourceTocId ?? null,
+        metadata: block.metadata,
+        title: block.title,
+      });
+      return Boolean(identity && !currentAutoIdentitySet.has(identity));
+    });
+
+    const allBlocks = [...mapBlockRowsToAlgorithmBlocks(planBlocks), ...missingAutoBlocks].map((block) => {
+      const isInAffectedTerm = Number(block.metadata.termIndex ?? -1) === affectedTermIndex;
+      if (!isInAffectedTerm) return block;
+      const isManual = Boolean(planBlocks.find((row) => row.block_id === block.id)?.metadata?.manual);
+      return {
+        ...block,
+        metadata: {
+          ...block.metadata,
+          ...(isManual ? { manualPlacementPolicy: block.metadata.manualPlacementPolicy ?? "movable" } : {}),
+        },
+      };
+    });
+
     const placementSeed = buildPlacementSeed(
-      selectedPlanSlots,
-      autoBlockRows.filter((block) => Boolean(block.slot_id))
+      planSlots,
+      planBlocks.filter((block) => Boolean(block.slot_id))
     );
     const seededSlots = algorithmSlots.map((slot) => ({
       ...slot,
-      locked: slot.locked || slot.date === selectedDate,
-      lockReason: slot.date === selectedDate ? "Suspended day" : slot.lockReason,
+      locked: slot.locked || slot.date === suspendedDate,
+      lockReason: slot.date === suspendedDate ? "Suspended day" : slot.lockReason,
       placements: placementSeed[slot.id] ? [...placementSeed[slot.id]!] : [],
     }));
-    const affectedTermIndex =
-      seededSlots.find((slot) => slot.date === selectedDate && typeof slot.termIndex === "number")?.termIndex ?? null;
-    if (affectedTermIndex === null) return;
+    const termSlots = seededSlots.filter((slot) => slot.termIndex === affectedTermIndex);
+    const termBlocks = allBlocks.filter((block) => Number(block.metadata.termIndex ?? -1) === affectedTermIndex);
 
-    const algorithmBlocks = mapBlockRowsToAlgorithmBlocks(autoBlockRows).map((block) => {
-      if (block.type !== "exam" || Number(block.metadata.termIndex ?? -1) !== affectedTermIndex) {
-        return block;
-      }
+    const blockRowById = new Map(planBlocks.map((row) => [row.block_id, row]));
+    const displacedBlockIds = new Set<string>();
+    for (const slot of termSlots) {
+      if (slot.date < suspendedDate) continue;
+      for (const placement of slot.placements) displacedBlockIds.add(placement.blockId);
+      slot.placements = [];
+    }
 
+    const updatedTermBlocks = termBlocks.map((block) => {
+      const originalRow = blockRowById.get(block.id) ?? null;
+      const isDisplaced = displacedBlockIds.has(block.id);
+      if (!isDisplaced) return block;
+      return {
+        ...block,
+        metadata: {
+          ...block.metadata,
+          lastRecoveryReason: "suspension",
+          lastRecoveryDate: suspendedDate,
+          displacedFromSlotId: originalRow?.slot_id ?? null,
+        },
+      };
+    }).map((block) => {
+      if (block.type !== "exam") return block;
+      if (Number(block.metadata.termIndex ?? -1) !== affectedTermIndex) return block;
       const suspendedDates = Array.isArray(block.metadata.suspendedDates)
         ? block.metadata.suspendedDates.filter((value): value is string => typeof value === "string")
         : [];
+      if (suspendedDates.includes(suspendedDate)) return block;
       const repopulatedDates = Array.isArray(block.metadata.repopulatedDates)
         ? block.metadata.repopulatedDates.filter((value): value is string => typeof value === "string")
         : [];
-      if (suspendedDates.includes(selectedDate)) return block;
-
       return {
         ...block,
         metadata: {
@@ -4122,98 +4880,133 @@ export default function CalendarScreen() {
           rawTermSlots: Math.max(0, Number(block.metadata.rawTermSlots ?? 0) - 1),
           termSlots: Math.max(0, Number(block.metadata.termSlots ?? 0) - 1),
           extraTermSlots: Number(block.metadata.extraTermSlots ?? 0) - 1,
-          suspendedDates: [...suspendedDates, selectedDate],
-          repopulatedDates: repopulatedDates.filter((value) => value !== selectedDate),
+          suspendedDates: [...suspendedDates, suspendedDate],
+          repopulatedDates: repopulatedDates.filter((value) => value !== suspendedDate),
         },
       };
     });
-    const termSlots = seededSlots.filter((slot) => slot.termIndex === affectedTermIndex);
-    const termBlocks = algorithmBlocks.filter((block) => Number(block.metadata.termIndex ?? -1) === affectedTermIndex);
-    compressTermPlan({
+
+    const placementResult = compressTermUsingCapacity({
       termSlots,
-      blocks: termBlocks,
+      blocks: updatedTermBlocks,
+      missingCanonicalBlockIds: missingAutoBlocks.map((block) => block.id),
     });
-
-    for (const slot of termSlots) {
-      if (slot.date !== selectedDate) continue;
-      slot.placements = [];
-    }
-
-    normalizeTermPlacements(termSlots, termBlocks);
-    validateAdjustedTerm(termSlots, termBlocks);
+    applyTermRepairResult(termSlots, placementResult);
+    normalizeTermPlacements(termSlots, updatedTermBlocks);
+    validateAdjustedTerm(termSlots, updatedTermBlocks);
 
     const placementByBlockId = new Map(
       seededSlots.flatMap((slot) =>
         slot.placements.map((placement, index) => [
           placement.blockId,
-          {
-            slotId: slot.id,
-            orderNo: index + 1,
-          },
+          { slotId: slot.id, orderNo: index + 1 },
         ] as const)
       )
     );
-    const updatedMetadataByBlockId = new Map(algorithmBlocks.map((block) => [block.id, block.metadata]));
+    const updatedMetadataByBlockId = new Map(updatedTermBlocks.map((block) => [block.id, block.metadata]));
+    const droppedElasticBlockIdSet = new Set(placementResult.unscheduledBlockIds);
 
-    const suspendedSlotRows = selectedPlanSlots.filter((slot) => slot.slot_date === selectedDate);
+    const suspendedSlotRows = planSlots.filter((slot) => slot.slot_date === suspendedDate);
     if (suspendedSlotRows.length > 0) {
       const suspendedSlotResults = await Promise.all(
         suspendedSlotRows.map((slot) =>
           supabase
             .from("slots")
-            .update({
-              is_locked: true,
-            })
+            .update({ is_locked: true })
             .eq("slot_id", slot.slot_id)
-            .eq("lesson_plan_id", selectedPlan.lesson_plan_id)
+            .eq("lesson_plan_id", plan.lesson_plan_id)
         )
       );
       const suspendedSlotError = suspendedSlotResults.find((result) => result.error)?.error;
       if (suspendedSlotError) throw suspendedSlotError;
     }
 
-    const autoUpdateResults = await Promise.all(
-      autoBlockRows.map((row) => {
+    const missingPayload = missingAutoBlocks
+      .filter((block) => !droppedElasticBlockIdSet.has(block.id))
+      .map((block) => {
+      const placement = placementByBlockId.get(block.id) ?? null;
+      return {
+        lesson_plan_id: plan.lesson_plan_id,
+        slot_id: placement?.slotId ?? null,
+        root_block_id: null,
+        lesson_id: isUuid(block.sourceTocId) ? block.sourceTocId : null,
+        algorithm_block_key: block.id,
+        block_key: block.id,
+        title: getCanonicalAutoBlockTitle({
+          category: block.type,
+          subcategory: block.subcategory,
+          metadata: block.metadata,
+          fallbackTitle: block.title,
+        }),
+        description: null,
+        session_category: block.type,
+        session_subcategory: block.subcategory,
+        meeting_type:
+          block.preferredSessionType === "lecture" || block.preferredSessionType === "laboratory"
+            ? block.preferredSessionType
+            : null,
+        estimated_minutes: block.estimatedMinutes,
+        min_minutes: block.minMinutes ?? null,
+        max_minutes: block.maxMinutes ?? null,
+        required: block.required,
+        splittable: block.splittable,
+        overlay_mode: block.overlayMode,
+        preferred_session_type: block.preferredSessionType,
+        dependency_keys: block.dependencies,
+        order_no: placement?.orderNo ?? 1,
+        is_locked: false,
+        ww_subtype: block.type === "written_work" ? block.subcategory : null,
+        pt_subtype: block.type === "performance_task" ? block.subcategory : null,
+        metadata: updatedMetadataByBlockId.get(block.id) ?? block.metadata ?? {},
+      };
+    });
+    if (missingPayload.length > 0) {
+      const { error: insertMissingError } = await supabase
+        .from("blocks")
+        .upsert(missingPayload, { onConflict: "lesson_plan_id,algorithm_block_key" });
+      if (insertMissingError) throw insertMissingError;
+    }
+
+    if (droppedElasticBlockIdSet.size > 0) {
+      const { error: deleteDroppedError } = await supabase
+        .from("blocks")
+        .delete()
+        .eq("lesson_plan_id", plan.lesson_plan_id)
+        .in("block_id", Array.from(droppedElasticBlockIdSet));
+      if (deleteDroppedError) throw deleteDroppedError;
+    }
+
+    const updateResults = await Promise.all(
+      planBlocks
+        .filter((row) => !droppedElasticBlockIdSet.has(row.block_id))
+        .map((row) => {
         const placement = placementByBlockId.get(row.block_id) ?? null;
         const nextMetadata = updatedMetadataByBlockId.get(row.block_id) ?? row.metadata ?? {};
-        const fallbackOrderNo = typeof row.order_no === "number" && Number.isFinite(row.order_no) ? row.order_no : 1;
+        const fallbackOrderNo =
+          typeof row.order_no === "number" && Number.isFinite(row.order_no) ? row.order_no : 1;
+        const isManual = Boolean(row.metadata?.manual);
         return supabase
           .from("blocks")
           .update({
             slot_id: placement?.slotId ?? null,
             order_no: placement?.orderNo ?? fallbackOrderNo,
-            title: getCanonicalAutoBlockTitle({
-              category: row.session_category,
-              subcategory: row.session_subcategory,
-              metadata: nextMetadata,
-              fallbackTitle: row.title,
-            }),
+            title: isManual
+              ? row.title
+              : getCanonicalAutoBlockTitle({
+                  category: row.session_category,
+                  subcategory: row.session_subcategory,
+                  metadata: nextMetadata,
+                  fallbackTitle: row.title,
+                }),
             metadata: nextMetadata,
           })
           .eq("block_id", row.block_id)
-          .eq("lesson_plan_id", selectedPlan.lesson_plan_id);
+          .eq("lesson_plan_id", plan.lesson_plan_id);
       })
     );
-    const autoUpdateError = autoUpdateResults.find((result) => result.error)?.error;
-    if (autoUpdateError) throw autoUpdateError;
-
-    if (manualBlocksOnDate.length > 0) {
-      const manualUpdateResults = await Promise.all(
-        manualBlocksOnDate.map((row) =>
-          supabase
-            .from("blocks")
-            .update({
-              slot_id: null,
-              order_no: typeof row.order_no === "number" && Number.isFinite(row.order_no) ? row.order_no : 1,
-            })
-            .eq("block_id", row.block_id)
-            .eq("lesson_plan_id", selectedPlan.lesson_plan_id)
-        )
-      );
-      const manualUpdateError = manualUpdateResults.find((result) => result.error)?.error;
-      if (manualUpdateError) throw manualUpdateError;
-    }
-  }, [selectedDate, selectedPlan, selectedPlanBlocks, selectedPlanSlots]);
+    const updateError = updateResults.find((result) => result.error)?.error;
+    if (updateError) throw updateError;
+  }, [blocksByPlan, plans, slotsByPlan]);
 
   const applyRepopulation = useCallback(async () => {
     if (!selectedPlan || repopulateMutating) return;
@@ -4248,36 +5041,46 @@ export default function CalendarScreen() {
         lockReason: slot.lockReason,
         placements: placementSeed[slot.id] ? [...placementSeed[slot.id]!] : [],
       }));
-      const expectedBlocks = buildBlocks({
-        courseId: selectedPlan.lesson_plan_id,
-        tocUnits,
-        teacherRules,
-        examBlockTemplates: examTemplates,
-        slots: algorithmSlots,
-        initialDelayDates: [],
-      } satisfies BuildBlocksInput);
+
       const algorithmSlotById = new Map(algorithmSlots.map((slot) => [slot.id, slot]));
-      const openActiveSlotRows = selectedPlanSlots.filter((slot) => {
+      const emptyActiveSlotRows = selectedPlanSlots.filter((slot) => {
         if (selectedPlanSuspendedSet.has(slot.slot_date)) return false;
         const algorithmSlot = algorithmSlotById.get(slot.slot_id);
         if (!algorithmSlot || typeof algorithmSlot.termIndex !== "number") return false;
-        const slotBlocks = autoBlockRows.filter((block) => block.slot_id === slot.slot_id);
-        return slotBlocks.length === 0 || slotBlocks.every((block) => block.overlay_mode === "minor");
+        const slotBlocks = selectedPlanBlocks.filter((block) => block.slot_id === slot.slot_id);
+        return isEligibleEmptyPlanSlot(slot, slotBlocks, algorithmSlot);
       });
-      const openSlotRowsByTerm = new Map<number, PlanSlotRow[]>();
-      for (const slot of openActiveSlotRows) {
+      const emptySlotRowsByTerm = new Map<number, PlanSlotRow[]>();
+      for (const slot of emptyActiveSlotRows) {
         const termIndex = algorithmSlotById.get(slot.slot_id)?.termIndex;
         if (typeof termIndex !== "number") continue;
-        const current = openSlotRowsByTerm.get(termIndex) ?? [];
+        const current = emptySlotRowsByTerm.get(termIndex) ?? [];
         current.push(slot);
-        openSlotRowsByTerm.set(termIndex, current);
+        emptySlotRowsByTerm.set(termIndex, current);
       }
+      const currentValidation = validatePlan({
+        slots: seededSlots,
+        blocks: mapBlockRowsToAlgorithmBlocks(autoBlockRows),
+        tocUnits,
+      });
+      const validationTermIndexes = currentValidation.termDiagnostics
+        .filter((diagnostic) => diagnostic.hasValidationErrors)
+        .map((diagnostic) => diagnostic.termIndex);
       const termIndexesToRepopulate = Array.from(
         new Set([
-          ...Array.from(openSlotRowsByTerm.keys()),
+          ...Array.from(emptySlotRowsByTerm.keys()),
+          ...validationTermIndexes,
           ...autoBlockRows
             .filter((block) => !block.slot_id)
             .map((block) => Number(block.metadata?.termIndex ?? -1))
+            .filter((value) => value >= 0),
+          ...selectedPlanSlots
+            .filter((slot) => {
+              const slotBlocks = autoBlockRows.filter((block) => block.slot_id === slot.slot_id);
+              const capacity = getSlotCapacityMinutes(slot);
+              return capacity > 0 && getPlannedMinutesForSlot(slot.slot_id, slotBlocks) > capacity;
+            })
+            .map((slot) => Number(algorithmSlotById.get(slot.slot_id)?.termIndex ?? -1))
             .filter((value) => value >= 0),
         ])
       ).sort((a, b) => a - b);
@@ -4301,7 +5104,7 @@ export default function CalendarScreen() {
         const repopulatedSlotKeys = Array.isArray(block.metadata.repopulatedSlotKeys)
           ? block.metadata.repopulatedSlotKeys.filter((value): value is string => typeof value === "string")
           : [];
-        const emptySlotRows = openSlotRowsByTerm.get(termIndex) ?? [];
+        const emptySlotRows = emptySlotRowsByTerm.get(termIndex) ?? [];
         const emptySlotKeys = emptySlotRows.map((slot) =>
           buildGeneratedSlotKey({
             date: slot.slot_date,
@@ -4331,8 +5134,29 @@ export default function CalendarScreen() {
           },
         };
       });
+     const expectedBlocks = buildBlocks({
+        courseId: selectedPlan.lesson_plan_id,
+        tocUnits,
+        teacherRules,
+        examBlockTemplates: algorithmBlocks
+          .filter((block) => block.type === "exam")
+          .map((block) => ({
+            id: block.id,
+            title: block.title,
+            estimatedMinutes: block.estimatedMinutes,
+            subcategory: block.subcategory as ExamBlockTemplate["subcategory"],
+            preferredDate:
+              typeof block.metadata.preferredDate === "string"
+                ? block.metadata.preferredDate
+                : null,
+            required: true,
+          })),
+        slots: algorithmSlots,
+        initialDelayDates: [],
+      } satisfies BuildBlocksInput);
       const updatedMetadataByBlockId = new Map(algorithmBlocks.map((block) => [block.id, block.metadata]));
       const missingBlocksToInsert: Block[] = [];
+      const droppedElasticBlockIdSet = new Set<string>();
 
       for (const termIndex of termIndexesToRepopulate) {
         const termSlots = seededSlots.filter((slot) => slot.termIndex === termIndex);
@@ -4341,7 +5165,35 @@ export default function CalendarScreen() {
         const currentTermBlocks = dedupeCurrentTermBlocks(
           algorithmBlocks.filter((block) => Number(block.metadata.termIndex ?? -1) === termIndex)
         );
-        const expectedTermBlocks = expectedBlocks.filter((block) => Number(block.metadata.termIndex ?? -1) === termIndex);
+        const expectedTermBlocks = expectedBlocks
+          .filter((block) => Number(block.metadata.termIndex ?? -1) === termIndex)
+          .sort((a, b) => {
+            const categoryRank = (candidate: Block) => {
+              if (candidate.type === "buffer") return 0;
+              if (candidate.type === "lesson") return 1;
+              if (candidate.type === "performance_task") return 2;
+              if (candidate.type === "written_work" && candidate.subcategory === "quiz") return 3;
+              if (candidate.type === "written_work") return 4;
+              if (candidate.type === "exam") return 5;
+              return 99;
+            };
+            const rankDiff = categoryRank(a) - categoryRank(b);
+            if (rankDiff !== 0) return rankDiff;
+            return (
+              getCanonicalSequenceValue({
+                category: a.type,
+                subcategory: a.subcategory,
+                metadata: a.metadata,
+                title: a.title,
+              }) -
+              getCanonicalSequenceValue({
+                category: b.type,
+                subcategory: b.subcategory,
+                metadata: b.metadata,
+                title: b.title,
+              })
+            );
+          });
         const currentIdentitySet = new Set(
           currentTermBlocks
             .map((block) =>
@@ -4356,7 +5208,6 @@ export default function CalendarScreen() {
             .filter((value): value is string => Boolean(value))
         );
         const missingExpectedTermBlocks = expectedTermBlocks.filter((block) => {
-          if (!block.required || Boolean(block.metadata.extraCandidateType)) return false;
           const identity = buildAutoBlockIdentity({
             category: block.type,
             subcategory: block.subcategory,
@@ -4367,65 +5218,64 @@ export default function CalendarScreen() {
           if (!identity) return false;
           return !currentIdentitySet.has(identity);
         });
-        const syntheticRequiredTermBlocks = buildSyntheticRequiredTermBlocks({
-          lessonPlanId: selectedPlan.lesson_plan_id,
-          allPlanBlocks: autoBlockRows,
-          currentTermBlocks,
-          termIndex,
-          termSlots,
-        });
-        const missingRequiredTermBlocks = [...missingExpectedTermBlocks, ...syntheticRequiredTermBlocks].filter(
-          (block, index, list) => {
-            const identity = buildAutoBlockIdentity({
-              category: block.type,
-              subcategory: block.subcategory,
-              sourceTocId: block.sourceTocId ?? null,
-              metadata: block.metadata,
-              title: block.title,
-            });
-            if (!identity) return true;
-            if (currentIdentitySet.has(identity)) return false;
-            return (
-              list.findIndex((candidate) => {
-                const candidateIdentity = buildAutoBlockIdentity({
-                  category: candidate.type,
-                  subcategory: candidate.subcategory,
-                  sourceTocId: candidate.sourceTocId ?? null,
-                  metadata: candidate.metadata,
-                  title: candidate.title,
-                });
-                return candidateIdentity === identity;
-              }) === index
-            );
-          }
+        const missingRequiredTermBlocks = missingExpectedTermBlocks;
+        const manualSlotIds = new Set(
+          selectedPlanBlocks
+            .filter(
+              (block) =>
+                Boolean(block.metadata?.manual) &&
+                block.slot_id &&
+                Number(block.metadata?.termIndex ?? -1) === termIndex
+            )
+            .map((block) => String(block.slot_id))
         );
+        const currentTermDiagnostic = currentValidation.termDiagnostics.find(
+          (diagnostic) => diagnostic.termIndex === termIndex
+        ) ?? null;
+        const shouldRebuildFromScratch = Boolean(
+          currentTermDiagnostic?.hasValidationErrors || currentTermDiagnostic?.requiresCompression
+        );
+        const seededTermSlots = termSlots.map((slot) => ({
+          ...slot,
+          locked: slot.locked || manualSlotIds.has(slot.id),
+          lockReason:
+            slot.locked || manualSlotIds.has(slot.id)
+              ? slot.lockReason ?? "Manual block constraint"
+              : slot.lockReason,
+          placements: shouldRebuildFromScratch
+            ? []
+            : slot.placements.filter((placement) =>
+                currentTermBlocks.some((block) => block.id === placement.blockId)
+              ),
+        }));
         const termBlocks = [...currentTermBlocks, ...missingRequiredTermBlocks];
-        const placeResult = placeBlocks({
-          slots: termSlots,
-          blocks: termBlocks,
-        });
-        const placedSlotsById = new Map(placeResult.slots.map((slot) => [slot.id, slot]));
-        for (const slot of termSlots) {
-          slot.placements = placedSlotsById.get(slot.id)?.placements
-            ? [...placedSlotsById.get(slot.id)!.placements]
-            : [];
-        }
+        const shouldCompress = Boolean(currentTermDiagnostic?.requiresCompression || currentTermDiagnostic?.hasValidationErrors);
+        const placeResult = shouldCompress
+          ? compressTermUsingCapacity({
+              termSlots: seededTermSlots,
+              blocks: termBlocks,
+              missingCanonicalBlockIds: missingRequiredTermBlocks.map((block) => block.id),
+            })
+          : repopulateTermIntoEmptySlots({
+              termSlots: seededTermSlots,
+              blocks: termBlocks,
+              missingCanonicalBlockIds: missingRequiredTermBlocks.map((block) => block.id),
+            });
+        applyTermRepairResult(termSlots, placeResult);
+        placeResult.unscheduledBlockIds.forEach((blockId) => droppedElasticBlockIdSet.add(blockId));
 
         extendTermPlan({
           termSlots,
           blocks: termBlocks,
           unscheduled: new Set(placeResult.unscheduledBlockIds),
         });
-        recoverMissingRequiredBlocks(termSlots, termBlocks);
         normalizeTermPlacements(termSlots, termBlocks);
-        validateAdjustedTerm(termSlots, termBlocks);
-
         termBlocks.forEach((block) => {
           updatedMetadataByBlockId.set(block.id, block.metadata);
         });
         missingBlocksToInsert.push(...missingRequiredTermBlocks);
       }
-
+      
       const placementByBlockId = new Map(
         seededSlots.flatMap((slot) =>
           slot.placements.map((placement, index) => [
@@ -4438,7 +5288,9 @@ export default function CalendarScreen() {
         )
       );
       const uniqueMissingBlocks = missingBlocksToInsert.filter(
-        (block, index, list) => list.findIndex((candidate) => candidate.id === block.id) === index
+        (block, index, list) =>
+          !droppedElasticBlockIdSet.has(block.id) &&
+          list.findIndex((candidate) => candidate.id === block.id) === index
       );
 
       if (uniqueMissingBlocks.length > 0) {
@@ -4485,8 +5337,19 @@ export default function CalendarScreen() {
         if (insertMissingError) throw insertMissingError;
       }
 
+      if (droppedElasticBlockIdSet.size > 0) {
+        const { error: deleteDroppedError } = await supabase
+          .from("blocks")
+          .delete()
+          .eq("lesson_plan_id", selectedPlan.lesson_plan_id)
+          .in("block_id", Array.from(droppedElasticBlockIdSet));
+        if (deleteDroppedError) throw deleteDroppedError;
+      }
+
       const autoUpdateResults = await Promise.all(
-        autoBlockRows.map((row) => {
+        autoBlockRows
+          .filter((row) => !droppedElasticBlockIdSet.has(row.block_id))
+          .map((row) => {
           const placement = placementByBlockId.get(row.block_id) ?? null;
           const nextMetadata = updatedMetadataByBlockId.get(row.block_id) ?? row.metadata ?? {};
           const fallbackOrderNo = typeof row.order_no === "number" && Number.isFinite(row.order_no) ? row.order_no : 1;
@@ -4516,6 +5379,70 @@ export default function CalendarScreen() {
     }
   }, [repopulateMutating, repopulatableDates, selectedPlan, selectedPlanBlocks, selectedPlanSlots, selectedPlanSuspendedSet]);
 
+  const suspendPlansForSelectedDay = useCallback(async (targetPlanIds: string[]) => {
+    const targetPlans = targetPlanIds
+      .map((planId) => plans.find((plan) => plan.lesson_plan_id === planId) ?? null)
+      .filter((plan): plan is LessonPlanOption => Boolean(plan));
+    if (targetPlans.length === 0) return;
+
+    const {
+      data: { user },
+      error: userError,
+    } = await supabase.auth.getUser();
+    if (userError) throw userError;
+    if (!user) throw new Error("No signed-in user found.");
+
+    const uniqueTargets = Array.from(
+      new Map(
+        targetPlans.map((plan) => [
+          `${plan.school_id}|${plan.section_id}|${plan.subject_id}`,
+          plan,
+        ])
+      ).values()
+    );
+
+    const deleteExistingResults = await Promise.all(
+      uniqueTargets.map((plan) =>
+        supabase
+          .from("school_calendar_events")
+          .delete()
+          .eq("school_id", plan.school_id)
+          .eq("section_id", plan.section_id)
+          .eq("subject_id", plan.subject_id)
+          .eq("event_type", "suspension")
+          .eq("blackout_reason", "suspended")
+          .eq("start_date", selectedDate)
+          .eq("end_date", selectedDate)
+      )
+    );
+    const deleteExistingError = deleteExistingResults.find((result) => result.error)?.error;
+    if (deleteExistingError) throw deleteExistingError;
+
+    const insertResults = await Promise.all(
+      uniqueTargets.map((plan) =>
+        supabase.from("school_calendar_events").insert({
+          school_id: plan.school_id,
+          section_id: plan.section_id,
+          subject_id: plan.subject_id,
+          event_type: "suspension",
+          blackout_reason: "suspended",
+          title: "Class suspended",
+          description: "Suspended from daily calendar.",
+          start_date: selectedDate,
+          end_date: selectedDate,
+          is_whole_day: true,
+          created_by: user.id,
+        })
+      )
+    );
+    const insertError = insertResults.find((result) => result.error)?.error;
+    if (insertError) throw insertError;
+
+    for (const planId of targetPlanIds) {
+      await applySuspensionRecoveryForPlan(planId, selectedDate);
+    }
+  }, [applySuspensionRecoveryForPlan, plans, selectedDate]);
+
   const toggleSuspendSelectedDay = useCallback(async () => {
     if (!selectedPlan || suspendMutating) return;
     const isSuspended = selectedPlanSuspendedSet.has(selectedDate);
@@ -4534,29 +5461,18 @@ export default function CalendarScreen() {
           .eq("end_date", selectedDate);
         if (error) throw error;
       } else {
-        const {
-          data: { user },
-          error: userError,
-        } = await supabase.auth.getUser();
-        if (userError) throw userError;
-        if (!user) throw new Error("No signed-in user found.");
-
-        const { error } = await supabase.from("school_calendar_events").insert({
-          school_id: selectedPlan.school_id,
-          section_id: selectedPlan.section_id,
-          subject_id: selectedPlan.subject_id,
-          event_type: "suspension",
-          blackout_reason: "suspended",
-          title: "Class suspended",
-          description: "Suspended from daily calendar.",
-          start_date: selectedDate,
-          end_date: selectedDate,
-          is_whole_day: true,
-          created_by: user.id,
-        });
-        if (error) throw error;
-
-        await applySuspensionCompression();
+        const suspendableIds = suspendablePlansOnSelectedDate.map((plan) => plan.lesson_plan_id);
+        if (suspendableIds.length === 0) {
+          throw new Error("No plans found on the selected day.");
+        }
+        if (suspendableIds.length === 1) {
+          await suspendPlansForSelectedDay(suspendableIds);
+        } else {
+          setSuspensionSelectedPlanIds([selectedPlan.lesson_plan_id]);
+          setSuspensionPickerVisible(true);
+          setSuspendMutating(false);
+          return;
+        }
       }
       await loadCalendarData();
     } catch (error: any) {
@@ -4564,7 +5480,41 @@ export default function CalendarScreen() {
     } finally {
       setSuspendMutating(false);
     }
-  }, [applySuspensionCompression, loadCalendarData, selectedDate, selectedPlan, selectedPlanSuspendedSet, suspendMutating]);
+  }, [loadCalendarData, selectedDate, selectedPlan, selectedPlanSuspendedSet, suspendMutating, suspendPlansForSelectedDay, suspendablePlansOnSelectedDate]);
+
+  const confirmSuspendAllPlansForDay = useCallback(async () => {
+    if (suspendMutating) return;
+    setSuspendMutating(true);
+    try {
+      await suspendPlansForSelectedDay(
+        suspendablePlansOnSelectedDate.map((plan) => plan.lesson_plan_id)
+      );
+      setSuspensionPickerVisible(false);
+      await loadCalendarData();
+    } catch (error: any) {
+      Alert.alert("Update failed", error?.message ?? "Could not suspend the selected day.");
+    } finally {
+      setSuspendMutating(false);
+    }
+  }, [loadCalendarData, suspendMutating, suspendPlansForSelectedDay, suspendablePlansOnSelectedDate]);
+
+  const confirmSuspendSelectedPlansForDay = useCallback(async () => {
+    if (suspendMutating) return;
+    if (suspensionSelectedPlanIds.length === 0) {
+      Alert.alert("Select a plan", "Choose at least one lesson plan to suspend on this day.");
+      return;
+    }
+    setSuspendMutating(true);
+    try {
+      await suspendPlansForSelectedDay(suspensionSelectedPlanIds);
+      setSuspensionPickerVisible(false);
+      await loadCalendarData();
+    } catch (error: any) {
+      Alert.alert("Update failed", error?.message ?? "Could not suspend the selected plans.");
+    } finally {
+      setSuspendMutating(false);
+    }
+  }, [loadCalendarData, suspendMutating, suspendPlansForSelectedDay, suspensionSelectedPlanIds]);
 
   const handlePinchStateChange = useCallback(
     (event: any) => {
@@ -4763,7 +5713,12 @@ export default function CalendarScreen() {
                           subcategory: block.subcategory,
                           metadata: block.metadata,
                         }),
-                        subtitle: null,
+                        subtitle: getDisplaySubtitleForBlockLike({
+                          title: block.title,
+                          category: block.category,
+                          subcategory: block.subcategory,
+                          metadata: block.metadata,
+                        }),
                         category: block.category,
                         description: block.description,
                         scheduled_date: block.scheduledDate,
@@ -4785,6 +5740,7 @@ export default function CalendarScreen() {
                         algorithm_block_key: block.algorithmBlockKey,
                         slot_id: block.slotId,
                         order_no: block.orderNo,
+                        metadata: block.metadata,
                       };
                       const labelSource = displayEntry ?? fallbackEntry;
                       const dailyLabel = getDailyPrimaryLabel(labelSource);
@@ -5152,6 +6108,8 @@ export default function CalendarScreen() {
                                 customSubtype: "",
                                 startTime: createEntrySeedTimes.startTime,
                                 endTime: createEntrySeedTimes.endTime,
+                                quizScopeStartLessonId: null,
+                                quizScopeEndLessonId: null,
                               }));
                               setCreateDropdownOpen(null);
                             }}
@@ -5227,6 +6185,8 @@ export default function CalendarScreen() {
                                 ...prev,
                                 subtype,
                                 customSubtype: subtype === "other" ? prev.customSubtype : "",
+                                quizScopeStartLessonId: subtype === "quiz" ? prev.quizScopeStartLessonId : null,
+                                quizScopeEndLessonId: subtype === "quiz" ? prev.quizScopeEndLessonId : null,
                               }));
                               setCreateDropdownOpen(null);
                             }}
@@ -5273,6 +6233,8 @@ export default function CalendarScreen() {
                           category,
                           subtype: defaultSubtypeForCategory(category),
                           customSubtype: "",
+                          quizScopeStartLessonId: null,
+                          quizScopeEndLessonId: null,
                         }))
                       }
                     >
@@ -5297,12 +6259,64 @@ export default function CalendarScreen() {
                             backgroundColor: entryEditor.subtype === subtype ? `${c.tint}22` : "transparent",
                           },
                         ]}
-                        onPress={() => setEntryEditor((prev) => ({ ...prev, subtype }))}
+                        onPress={() =>
+                          setEntryEditor((prev) => ({
+                            ...prev,
+                            subtype,
+                            quizScopeStartLessonId: subtype === "quiz" ? prev.quizScopeStartLessonId : null,
+                            quizScopeEndLessonId: subtype === "quiz" ? prev.quizScopeEndLessonId : null,
+                          }))
+                        }
                       >
                         <Text style={[styles.entryCategoryText, { color: c.text }]}>{subtype.replace("_", " ")}</Text>
                       </Pressable>
                     ))}
                   </View>
+                </View>
+              ) : null}
+
+              {(entryEditor.category === "written_work" && entryEditor.subtype === "quiz") ? (
+                <View style={styles.editorSection}>
+                  <Text style={[styles.entryFieldLabel, { color: c.mutedText }]}>Quiz lesson scope</Text>
+                  <View style={styles.entryTimeRow}>
+                    <View style={styles.entryTimeCell}>
+                      <Text style={[styles.entryFieldLabel, { color: c.mutedText }]}>Start lesson</Text>
+                      <View style={[styles.entryPickerWrap, { borderColor: c.border, backgroundColor: subtleBg }]}>
+                        <Picker
+                          selectedValue={entryEditor.quizScopeStartLessonId ?? ""}
+                          onValueChange={(value) => setEntryEditor((prev) => ({ ...prev, quizScopeStartLessonId: String(value || "") || null }))}
+                          style={[styles.entryPicker, { color: c.text }]}
+                          itemStyle={[styles.entryPickerItem, { color: c.text }]}
+                          dropdownIconColor={c.text}
+                        >
+                          <Picker.Item label="Select lesson" value="" />
+                          {quizScopeLessonOptions.map((lesson) => (
+                            <Picker.Item key={`quiz-scope-start-${lesson.lessonId}`} label={lesson.label} value={lesson.lessonId} />
+                          ))}
+                        </Picker>
+                      </View>
+                    </View>
+                    <View style={styles.entryTimeCell}>
+                      <Text style={[styles.entryFieldLabel, { color: c.mutedText }]}>End lesson</Text>
+                      <View style={[styles.entryPickerWrap, { borderColor: c.border, backgroundColor: subtleBg }]}>
+                        <Picker
+                          selectedValue={entryEditor.quizScopeEndLessonId ?? ""}
+                          onValueChange={(value) => setEntryEditor((prev) => ({ ...prev, quizScopeEndLessonId: String(value || "") || null }))}
+                          style={[styles.entryPicker, { color: c.text }]}
+                          itemStyle={[styles.entryPickerItem, { color: c.text }]}
+                          dropdownIconColor={c.text}
+                        >
+                          <Picker.Item label="Select lesson" value="" />
+                          {quizScopeLessonOptions.map((lesson) => (
+                            <Picker.Item key={`quiz-scope-end-${lesson.lessonId}`} label={lesson.label} value={lesson.lessonId} />
+                          ))}
+                        </Picker>
+                      </View>
+                    </View>
+                  </View>
+                  <Text style={[styles.entryPreviewSummary, { color: c.mutedText }]}>
+                    Choose 1 or more contiguous lessons in the same term.
+                  </Text>
                 </View>
               ) : null}
 
@@ -5582,6 +6596,76 @@ export default function CalendarScreen() {
                 })}
               </ScrollView>
             </View>
+          </Pressable>
+        </Modal>
+
+        <Modal
+          transparent
+          visible={suspensionPickerVisible}
+          animationType="fade"
+          onRequestClose={() => setSuspensionPickerVisible(false)}
+        >
+          <Pressable style={styles.modalBackdrop} onPress={() => setSuspensionPickerVisible(false)}>
+            <Pressable style={[styles.planModal, { backgroundColor: cardBg, borderColor: c.border }]} onPress={() => {}}>
+              <Text style={[styles.modalTitle, { color: c.text }]}>Suspend this day</Text>
+              <Text style={[styles.suspensionModalText, { color: c.mutedText }]}>
+                Choose whether to suspend all plans on {selectedDate} or only selected plans.
+              </Text>
+              <View style={styles.suspensionActionRow}>
+                <Pressable
+                  style={[styles.editorBtn, { borderColor: c.border, backgroundColor: cardBg }]}
+                  onPress={() => setSuspensionPickerVisible(false)}
+                >
+                  <Text style={[styles.editorBtnText, { color: c.text }]}>Cancel</Text>
+                </Pressable>
+                <Pressable style={[styles.editorBtn, styles.editorBtnPrimary]} onPress={confirmSuspendAllPlansForDay}>
+                  <Text style={styles.editorBtnPrimaryText}>All Plans</Text>
+                </Pressable>
+              </View>
+              <Text style={[styles.entryFieldLabel, { color: c.mutedText }]}>Selected plans only</Text>
+              <ScrollView style={styles.planList}>
+                {suspendablePlansOnSelectedDate.map((plan) => {
+                  const isSelected = suspensionSelectedPlanIds.includes(plan.lesson_plan_id);
+                  return (
+                    <Pressable
+                      key={`suspend-${plan.lesson_plan_id}`}
+                      style={[
+                        styles.planRow,
+                        styles.suspensionPlanRow,
+                        {
+                          backgroundColor: isSelected ? (isDark ? "#1A2B22" : "#E8F9EE") : "transparent",
+                          borderColor: c.border,
+                        },
+                      ]}
+                      onPress={() =>
+                        setSuspensionSelectedPlanIds((prev) =>
+                          prev.includes(plan.lesson_plan_id)
+                            ? prev.filter((value) => value !== plan.lesson_plan_id)
+                            : [...prev, plan.lesson_plan_id]
+                        )
+                      }
+                    >
+                      <View style={{ flex: 1 }}>
+                        <Text style={[styles.planRowTitle, { color: c.text }]} numberOfLines={1}>
+                          {plan.title}
+                        </Text>
+                        <Text style={[styles.planRowSub, { color: c.mutedText }]} numberOfLines={1}>
+                          {[plan.subject_code, plan.subject_title, plan.section_name].filter(Boolean).join(" - ") || "Section"}
+                        </Text>
+                      </View>
+                      <Ionicons
+                        name={isSelected ? "checkbox" : "square-outline"}
+                        size={22}
+                        color={isSelected ? c.tint : c.mutedText}
+                      />
+                    </Pressable>
+                  );
+                })}
+              </ScrollView>
+              <Pressable style={[styles.editorBtn, styles.editorBtnPrimary]} onPress={confirmSuspendSelectedPlansForDay}>
+                <Text style={styles.editorBtnPrimaryText}>Suspend Selected Plans</Text>
+              </Pressable>
+            </Pressable>
           </Pressable>
         </Modal>
 
@@ -6158,6 +7242,23 @@ const styles = StyleSheet.create({
   },
   planList: {
     maxHeight: 360,
+  },
+  suspensionModalText: {
+    ...Typography.body,
+    fontSize: 14,
+    lineHeight: 20,
+    marginBottom: Spacing.md,
+  },
+  suspensionActionRow: {
+    flexDirection: "row",
+    justifyContent: "flex-end",
+    gap: Spacing.sm,
+    marginBottom: Spacing.md,
+  },
+  suspensionPlanRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: Spacing.md,
   },
   planRow: {
     borderWidth: 1,

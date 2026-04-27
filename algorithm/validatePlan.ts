@@ -1,6 +1,11 @@
+import {
+  buildTermSchedulingDiagnostics,
+  getUsedMinutes,
+} from "./slotState";
 import type {
   Block,
   SessionSlot,
+  TermSchedulingDiagnostics,
   TOCUnit,
   ValidationIssue,
 } from "./types";
@@ -19,6 +24,7 @@ export type ValidatePlanInput = {
 
 export type ValidatePlanResult = {
   validationIssues: ValidationIssue[];
+  termDiagnostics: TermSchedulingDiagnostics[];
   metrics: {
     totalSlots: number;
     openSlots: number;
@@ -55,10 +61,6 @@ function sortSlots(slots: SessionSlot[]) {
   });
 }
 
-function getUsedMinutes(slot: SessionSlot) {
-  return slot.placements.reduce((sum, placement) => sum + placement.minutesUsed, 0);
-}
-
 function getUtilizationRatio(slot: SessionSlot) {
   if (slot.minutes <= 0) return 0;
   return getUsedMinutes(slot) / slot.minutes;
@@ -76,9 +78,8 @@ function isRequiredLessonTOCUnit(unit: TOCUnit) {
   return unit.required;
 }
 
-function isMeaningfulMajorInstructionSlot(slot: SessionSlot, blockMap: Map<string, Block>) {
+function isMeaningfulInstructionSlot(slot: SessionSlot, blockMap: Map<string, Block>) {
   return slot.placements.some((placement) => {
-    if (placement.lane !== "major") return false;
     const block = blockMap.get(placement.blockId);
     if (!block) return false;
     return (
@@ -101,7 +102,7 @@ function getLongestEmptyOpenSlotRun(slots: SessionSlot[], blockMap: Map<string, 
       continue;
     }
 
-    if (!isMeaningfulMajorInstructionSlot(slot, blockMap)) {
+    if (!isMeaningfulInstructionSlot(slot, blockMap)) {
       current += 1;
       if (current > longest) longest = current;
     } else {
@@ -157,9 +158,16 @@ function countScheduledBlocksByType(
   };
 }
 
-function getMajorBlock(slot: SessionSlot, blockMap: Map<string, Block>) {
-  const majorPlacement = slot.placements.find((placement) => placement.lane === "major");
-  return majorPlacement ? blockMap.get(majorPlacement.blockId) ?? null : null;
+function getPrimaryBlock(slot: SessionSlot, blockMap: Map<string, Block>) {
+  const placements = slot.placements
+    .map((placement) => blockMap.get(placement.blockId) ?? null)
+    .filter((block): block is Block => Boolean(block));
+  return (
+    placements.find((block) => block.type === "exam") ??
+    placements.find((block) => block.type === "buffer" && block.subcategory === "orientation") ??
+    placements[0] ??
+    null
+  );
 }
 
 function groupSlotsByTerm(slots: SessionSlot[]) {
@@ -197,18 +205,26 @@ function validateTermShape(
     const firstSlot = slots[0]!;
     const secondSlot = slots[1] ?? null;
     const lastSlot = slots[slots.length - 1]!;
-    const firstMajor = getMajorBlock(firstSlot, blockMap);
-    const secondMajor = secondSlot ? getMajorBlock(secondSlot, blockMap) : null;
-    const lastMajor = getMajorBlock(lastSlot, blockMap);
+    const firstMajor = getPrimaryBlock(firstSlot, blockMap);
+    const secondMajor = secondSlot ? getPrimaryBlock(secondSlot, blockMap) : null;
+    const lastMajor = getPrimaryBlock(lastSlot, blockMap);
     const examBlock =
       slots
-        .map((slot) => getMajorBlock(slot, blockMap))
+        .map((slot) => getPrimaryBlock(slot, blockMap))
         .find((block) => block?.type === "exam") ?? null;
     const examAtLastSlot = lastMajor?.type === "exam";
     const examAnchoredToPreferredDate =
       examBlock?.type === "exam" &&
       examBlock.subcategory === "final" &&
       examBlock.metadata.anchoredSlot === "preferred_date";
+    const firstPlacementByBlockId = new Map<string, number>();
+    slots.forEach((slot, slotIndex) => {
+      slot.placements.forEach((placement) => {
+        if (!firstPlacementByBlockId.has(placement.blockId)) {
+          firstPlacementByBlockId.set(placement.blockId, slotIndex);
+        }
+      });
+    });
 
     if (!examBlock) {
       issues.push({
@@ -227,11 +243,16 @@ function validateTermShape(
     }
 
     if (term.termIndex === 0) {
-      const hasOrientation =
-        firstMajor?.type === "buffer" && firstMajor.subcategory === "orientation";
-      const hasAnchoredFirstLesson =
-        secondMajor?.type === "lesson" ||
-        (slots.length === 1 && firstMajor?.type === "lesson");
+      const orientationBlock = Array.from(firstPlacementByBlockId.keys())
+        .map((blockId) => blockMap.get(blockId) ?? null)
+        .find((block) => block?.type === "buffer" && block.subcategory === "orientation") ?? null;
+      const firstLessonBlock = Array.from(firstPlacementByBlockId.keys())
+        .map((blockId) => blockMap.get(blockId) ?? null)
+        .find((block) => block?.type === "lesson" && !block.metadata.extraCandidateType) ?? null;
+      const orientationIndex = orientationBlock ? (firstPlacementByBlockId.get(orientationBlock.id) ?? -1) : -1;
+      const firstLessonIndex = firstLessonBlock ? (firstPlacementByBlockId.get(firstLessonBlock.id) ?? -1) : -1;
+      const hasOrientation = orientationIndex === 0;
+      const hasAnchoredFirstLesson = firstLessonIndex >= 0 && firstLessonIndex <= 1;
 
       if (!hasOrientation || !hasAnchoredFirstLesson) {
         orientationSatisfied = false;
@@ -244,8 +265,17 @@ function validateTermShape(
         });
       }
     } else {
-      const firstLesson = getMajorBlock(firstSlot, blockMap);
-      if (firstLesson?.type !== "lesson") {
+      const firstRequiredLesson = Array.from(firstPlacementByBlockId.entries())
+        .map(([blockId, slotIndex]) => ({
+          block: blockMap.get(blockId) ?? null,
+          slotIndex,
+        }))
+        .filter(
+          (entry): entry is { block: Block; slotIndex: number } =>
+            Boolean(entry.block?.type === "lesson" && !entry.block.metadata.extraCandidateType)
+        )
+        .sort((a, b) => a.slotIndex - b.slotIndex)[0] ?? null;
+      if (!firstRequiredLesson || firstRequiredLesson.slotIndex !== 0) {
         orientationSatisfied = false;
         issues.push({
           code: "VALIDATE_TERM_START_FIRST_LESSON",
@@ -260,9 +290,7 @@ function validateTermShape(
     let lastLessonIndex = -1;
 
     for (let index = 0; index < slots.length; index += 1) {
-      const major = getMajorBlock(slots[index]!, blockMap);
-      if (major?.type === "lesson") lastLessonIndex = index;
-      if (major?.subcategory === "quiz") finalQuizIndex = index;
+      const major = getPrimaryBlock(slots[index]!, blockMap);
 
       const minorBlocks = slots[index]!.placements
         .map((placement) => blockMap.get(placement.blockId))
@@ -283,6 +311,16 @@ function validateTermShape(
       ) {
         expansionSignals += 1;
         termExpansionSignals += 1;
+      }
+    }
+
+    for (const [blockId, slotIndex] of firstPlacementByBlockId.entries()) {
+      const block = blockMap.get(blockId) ?? null;
+      if (block?.type === "lesson" && !block.metadata.extraCandidateType) {
+        lastLessonIndex = Math.max(lastLessonIndex, slotIndex);
+      }
+      if (block?.type === "written_work" && block.subcategory === "quiz") {
+        finalQuizIndex = Math.max(finalQuizIndex, slotIndex);
       }
     }
 
@@ -413,7 +451,7 @@ function validateExpectedDates(
   for (const examDate of examDates) {
     const slotOnDate = sortedSlots.filter((slot) => slot.date === examDate);
     const hasExamOnDate = slotOnDate.some((slot) => {
-      const major = getMajorBlock(slot, blockMap);
+      const major = getPrimaryBlock(slot, blockMap);
       return major?.type === "exam";
     });
 
@@ -461,7 +499,7 @@ function validateExactTermSlots(
 ) {
   for (const term of groupedTerms) {
     const examBlock = term.slots
-      .map((slot) => getMajorBlock(slot, blockMap))
+      .map((slot) => getPrimaryBlock(slot, blockMap))
       .find((block) => block?.type === "exam");
 
     if (!examBlock) continue;
@@ -473,7 +511,7 @@ function validateExactTermSlots(
     const orientationAdjustment =
       term.termIndex === 0 &&
       (() => {
-        const firstBlock = getMajorBlock(term.slots[0]!, blockMap);
+        const firstBlock = getPrimaryBlock(term.slots[0]!, blockMap);
         return firstBlock?.type === "buffer" && firstBlock.subcategory === "orientation";
       })()
         ? 1
@@ -502,6 +540,129 @@ function validateExactTermSlots(
         severity: "error",
         message: `Term ${term.termIndex + 1} termSlots must equal raw term slots minus initial delays${orientationAdjustment ? " and orientation" : ""}.`,
         relatedIds: term.slots.map((slot) => slot.id),
+      });
+    }
+  }
+}
+
+function validateQuizCoverageAndSlotCapacity(
+  groupedTerms: ReturnType<typeof groupSlotsByTerm>,
+  blockMap: Map<string, Block>,
+  tocUnits: TOCUnit[],
+  issues: ValidationIssue[]
+) {
+  const requiredLessonIds = new Set(tocUnits.filter((unit) => unit.required).map((unit) => unit.id));
+
+  for (const term of groupedTerms) {
+    const firstPlacementByBlockId = new Map<string, { slotIndex: number; placementIndex: number }>();
+    const lessonFirstPlacementByOrder = new Map<number, { slotIndex: number; placementIndex: number }>();
+    const coveredLessonIdsInTerm = new Set<string>();
+
+    term.slots.forEach((slot, slotIndex) => {
+      const usedMinutes = getUsedMinutes(slot);
+      if (slot.minutes > 0 && usedMinutes > slot.minutes) {
+        issues.push({
+          code: "VALIDATE_SLOT_MINUTE_OVERFLOW",
+          severity: "error",
+          message: `Slot ${slot.id} exceeds its scheduled minutes.`,
+          relatedIds: [slot.id],
+        });
+      }
+
+      slot.placements.forEach((placement, placementIndex) => {
+        if (!firstPlacementByBlockId.has(placement.blockId)) {
+          firstPlacementByBlockId.set(placement.blockId, { slotIndex, placementIndex });
+        }
+        const block = blockMap.get(placement.blockId) ?? null;
+        if (block?.type === "lesson" && !block.metadata.extraCandidateType) {
+          const lessonOrder = Number(block.metadata.lessonOrder ?? 0);
+          if (lessonOrder > 0 && !lessonFirstPlacementByOrder.has(lessonOrder)) {
+            lessonFirstPlacementByOrder.set(lessonOrder, { slotIndex, placementIndex });
+          }
+        }
+      });
+    });
+
+    for (const slot of term.slots) {
+      for (const placement of slot.placements) {
+        const block = blockMap.get(placement.blockId) ?? null;
+        if (!block || block.type !== "written_work" || block.subcategory !== "quiz") continue;
+
+        const coveredLessonIds = Array.isArray(block.metadata.coveredLessonIds)
+          ? block.metadata.coveredLessonIds.filter((value): value is string => typeof value === "string")
+          : [];
+        const coveredLessonOrders = Array.isArray(block.metadata.coveredLessonOrders)
+          ? block.metadata.coveredLessonOrders
+              .map((value) => Number(value))
+              .filter((value) => Number.isFinite(value) && value > 0)
+          : [];
+        const startOrder = Number(block.metadata.coveredLessonStartOrder ?? 0);
+        const endOrder = Number(block.metadata.coveredLessonEndOrder ?? 0);
+        const coveredLessonCount = Number(block.metadata.coveredLessonCount ?? coveredLessonOrders.length);
+        const quizPlacement = firstPlacementByBlockId.get(block.id) ?? null;
+
+        if (
+          !quizPlacement ||
+          coveredLessonIds.length === 0 ||
+          coveredLessonOrders.length === 0 ||
+          startOrder <= 0 ||
+          endOrder <= 0 ||
+          coveredLessonCount < 1
+        ) {
+          issues.push({
+            code: "VALIDATE_QUIZ_COVERAGE_METADATA",
+            severity: "error",
+            message: `Quiz ${block.title} is missing valid lesson scope metadata.`,
+            relatedIds: [block.id],
+          });
+          continue;
+        }
+
+        coveredLessonIds.forEach((lessonId) => coveredLessonIdsInTerm.add(lessonId));
+        const lastCoveredPlacement = lessonFirstPlacementByOrder.get(endOrder) ?? null;
+        if (!lastCoveredPlacement) {
+          issues.push({
+            code: "VALIDATE_QUIZ_COVERAGE_LESSON_MISSING",
+            severity: "error",
+            message: `Quiz ${block.title} references lessons that were not placed.`,
+            relatedIds: [block.id],
+          });
+          continue;
+        }
+
+        if (
+          quizPlacement.slotIndex < lastCoveredPlacement.slotIndex ||
+          (quizPlacement.slotIndex === lastCoveredPlacement.slotIndex &&
+            quizPlacement.placementIndex <= lastCoveredPlacement.placementIndex)
+        ) {
+          issues.push({
+            code: "VALIDATE_QUIZ_BEFORE_COVERED_LESSONS",
+            severity: "error",
+            message: `Quiz ${block.title} must appear after the lessons it covers.`,
+            relatedIds: [block.id],
+          });
+        }
+      }
+    }
+
+    const termRequiredLessons = Array.from(requiredLessonIds).filter((lessonId) =>
+      Array.from(blockMap.values()).some(
+        (block) =>
+          block.type === "lesson" &&
+          !block.metadata.extraCandidateType &&
+          Number(block.metadata.termIndex ?? -1) === term.termIndex &&
+          block.sourceTocId === lessonId
+      )
+    );
+    const uncoveredRequiredLessons = termRequiredLessons.filter(
+      (lessonId) => !coveredLessonIdsInTerm.has(lessonId)
+    );
+    if (uncoveredRequiredLessons.length > 0) {
+      issues.push({
+        code: "VALIDATE_REQUIRED_LESSON_MISSING_QUIZ_COVERAGE",
+        severity: "error",
+        message: `Some lessons in term ${term.termIndex + 1} are not covered by any quiz.`,
+        relatedIds: uncoveredRequiredLessons,
       });
     }
   }
@@ -758,9 +919,63 @@ export function validatePlan(input: ValidatePlanInput): ValidatePlanResult {
   validateExpectedDelays(blocks, validationIssues, expectedDelayCount);
   validateExactTermSlots(groupedTerms, blockMap, validationIssues);
   validateBlockTitlesAndOrder(blocks, validationIssues);
+  validateQuizCoverageAndSlotCapacity(groupedTerms, blockMap, tocUnits, validationIssues);
+  const termDiagnostics = groupedTerms.map((term) =>
+    buildTermSchedulingDiagnostics({
+      termIndex: term.termIndex,
+      slots: term.slots,
+      blocks: blocks.filter((block) => Number(block.metadata.termIndex ?? -1) === term.termIndex),
+      unscheduledBlockIds: blocks
+        .filter(
+          (block) =>
+            Number(block.metadata.termIndex ?? -1) === term.termIndex &&
+            !placedBlockIds.has(block.id)
+        )
+        .map((block) => block.id),
+      hasValidationErrors: validationIssues.some((issue) =>
+        issue.relatedIds.some((relatedId) => term.slots.some((slot) => slot.id === relatedId))
+      ),
+    })
+  );
+
+  for (const diagnostic of termDiagnostics) {
+    if (!diagnostic.guaranteedPlacementSatisfied) {
+      validationIssues.push({
+        code: "VALIDATE_GUARANTEED_BLOCKS_NOT_PLACED",
+        severity: "error",
+        message: `Term ${diagnostic.termIndex + 1} still has guaranteed blocks that were not placed.`,
+        relatedIds: diagnostic.unscheduledRequiredBlockIds,
+      });
+    }
+    if (diagnostic.emptyEligibleSlotCount > 0 && diagnostic.unscheduledRequiredBlockIds.length > 0) {
+      validationIssues.push({
+        code: "VALIDATE_TERM_HAS_EMPTY_SLOTS_WITH_UNSCHEDULED_REQUIRED_BLOCKS",
+        severity: "warning",
+        message: `Term ${diagnostic.termIndex + 1} still has empty eligible slots while required blocks remain unscheduled.`,
+        relatedIds: diagnostic.unscheduledRequiredBlockIds,
+      });
+    }
+    if (diagnostic.requiresCompression && diagnostic.unscheduledRequiredBlockIds.length > 0) {
+      validationIssues.push({
+        code: "VALIDATE_TERM_REQUIRES_COMPRESSION",
+        severity: "warning",
+        message: `Term ${diagnostic.termIndex + 1} requires compression because empty slots are exhausted.`,
+        relatedIds: diagnostic.unscheduledRequiredBlockIds,
+      });
+    }
+    if (diagnostic.droppedElasticBlockIds.length > 0) {
+      validationIssues.push({
+        code: "VALIDATE_DROPPED_ELASTIC_BLOCKS",
+        severity: "info",
+        message: `Term ${diagnostic.termIndex + 1} dropped optional elastic blocks to preserve the core plan.`,
+        relatedIds: diagnostic.droppedElasticBlockIds,
+      });
+    }
+  }
 
   return {
     validationIssues,
+    termDiagnostics,
     metrics: {
       totalSlots,
       openSlots,
