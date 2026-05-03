@@ -1,39 +1,38 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  ActivityIndicator,
-  Alert,
-  LayoutAnimation,
-  Modal,
-  Platform,
-  Pressable,
-  RefreshControl,
-  ScrollView,
-  StyleSheet,
-  Text,
-  TextInput,
-  UIManager,
-  View,
-} from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import { Picker } from "@react-native-picker/picker";
 import { router, useLocalSearchParams } from "expo-router";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+    ActivityIndicator,
+    Alert,
+    LayoutAnimation,
+    Modal,
+    Platform,
+    Pressable,
+    RefreshControl,
+    ScrollView,
+    StyleSheet,
+    Text,
+    TextInput,
+    UIManager,
+    View,
+} from "react-native";
+import type { TeacherRules, TOCUnit } from "../../../algorithm/00_types";
 import { buildBlocks } from "../../../algorithm/buildBlocks";
 import {
-  complexityScoreToDifficulty,
-  complexityScoreToEstimatedMinutes,
-  deriveLessonComplexityScore,
+    complexityScoreToDifficulty,
+    complexityScoreToEstimatedMinutes,
+    deriveLessonComplexityScore,
 } from "../../../algorithm/buildPacingPlan";
 import { buildSlots, type RawMeetingSchedule } from "../../../algorithm/buildSlots";
 import { placeBlocks } from "../../../algorithm/placeBlocks";
-import type { TeacherRules, TOCUnit } from "../../../algorithm/types";
 import { Radius, Spacing, Typography } from "../../../constants/fonts";
 import { useAppTheme } from "../../../context/theme";
 import { usePullToRefresh } from "../../../hooks/usePullToRefresh";
-import type { PlanBlockRow, PlanSlotRow } from "../../../lib/planning";
 import { emitLessonPlanRefresh } from "../../../lib/lesson-plan-refresh";
+import type { PlanBlockRow, PlanSlotRow } from "../../../lib/planning";
 import { supabase } from "../../../lib/supabase";
 
-type AcademicTerm = "quarter" | "trimester" | "semester";
 type RequirementKey = "written_work" | "performance_task" | "exam";
 type WeekdayName = "monday" | "tuesday" | "wednesday" | "thursday" | "friday" | "saturday";
 type RoomType = "lecture" | "laboratory";
@@ -122,12 +121,9 @@ type DateTarget =
 
 type DuplicatedPlanRow = {
   lesson_plan_id: string;
-  title: string;
   academic_year: string | null;
-  term: string;
   start_date: string;
   end_date: string;
-  notes: string | null;
   school_id: string;
   subject_id: string;
   section_id: string;
@@ -150,12 +146,6 @@ type DuplicatedContentRow = {
 };
 
 type FormFieldErrorKey = "institution" | "subject" | "section" | "startDate" | "endDate";
-
-const TERM_LABEL: Record<AcademicTerm, string> = {
-  quarter: "Quarter",
-  trimester: "Trimester",
-  semester: "Semester",
-};
 
 const REQUIREMENT_LABEL: Record<RequirementKey, string> = {
   written_work: "Written Work",
@@ -579,12 +569,10 @@ export default function LessonplanScreen() {
   const [selectedChapterIds, setSelectedChapterIds] = useState<Set<string>>(new Set());
   const [selectedLessonIds, setSelectedLessonIds] = useState<Set<string>>(new Set());
 
-  const [term, setTerm] = useState<AcademicTerm>("quarter");
   const [academicYearStart, setAcademicYearStart] = useState(nowYear);
   const [startDate, setStartDate] = useState(`${nowYear}-06-05`);
   const [endDate, setEndDate] = useState(`${nowYear + 1}-04-02`);
   const [fieldErrors, setFieldErrors] = useState<Partial<Record<FormFieldErrorKey, string>>>({});
-  const [extraRequirements, setExtraRequirements] = useState("");
   const [requirementCounts, setRequirementCounts] = useState<Record<RequirementKey, string>>({
     written_work: "1",
     performance_task: "1",
@@ -613,7 +601,7 @@ export default function LessonplanScreen() {
     },
   });
 
-  const [specialDates, setSpecialDates] = useState<SpecialDate[]>([{ id: makeId(), dateText: "", reason: "" }]);
+  const [specialDates, setSpecialDates] = useState<SpecialDate[]>([]);
   const [examSchedules, setExamSchedules] = useState<ExamSchedule[]>([{ id: makeId(), dateText: "" }]);
 
   const selectedInstitution = useMemo(
@@ -861,7 +849,7 @@ export default function LessonplanScreen() {
           await Promise.all([
             supabase
               .from("lesson_plans")
-              .select("lesson_plan_id, title, academic_year, term, start_date, end_date, notes, school_id, subject_id, section_id")
+              .select("lesson_plan_id, academic_year, start_date, end_date, school_id, subject_id, section_id")
               .eq("lesson_plan_id", duplicateFromPlanId)
               .maybeSingle(),
             supabase
@@ -965,13 +953,9 @@ export default function LessonplanScreen() {
         setSelectedInstitutionId(sourcePlan.school_id);
         setSelectedSubjectId(sourcePlan.subject_id);
         setSelectedSectionId(sourcePlan.section_id);
-        setTerm((sourcePlan.term === "quarter" || sourcePlan.term === "trimester" || sourcePlan.term === "semester")
-          ? sourcePlan.term
-          : "quarter");
         setAcademicYearStart(parseAcademicStartYear(sourcePlan.academic_year) ?? new Date(`${sourcePlan.start_date}T00:00:00`).getFullYear());
         setStartDate(sourcePlan.start_date);
         setEndDate(sourcePlan.end_date);
-        setExtraRequirements(sourcePlan.notes ?? "");
         setRequirementCounts({
           written_work: String(Math.max(1, writtenWorkCount || 1)),
           performance_task: String(Math.max(1, performanceTaskCount || 1)),
@@ -986,7 +970,7 @@ export default function LessonplanScreen() {
             ? examRows.map((row) => ({ id: makeId(), dateText: row.scheduled_date ?? "" }))
             : [{ id: makeId(), dateText: "" }]
         );
-        setSpecialDates([{ id: makeId(), dateText: "", reason: "" }]);
+        setSpecialDates([]);
         hydratedDuplicateIdRef.current = duplicateFromPlanId;
       } catch (err: any) {
         if (cancelled) return;
@@ -1472,10 +1456,8 @@ export default function LessonplanScreen() {
           section_id: section.section_id,
           title,
           academic_year: yearText,
-          term,
           start_date: normalizedStart,
           end_date: normalizedEnd,
-          notes: extraRequirements.trim() || null,
           status: "draft",
         })
         .select("lesson_plan_id")
@@ -1772,29 +1754,6 @@ export default function LessonplanScreen() {
 
         <Text style={[styles.sectionTitle, { color: c.text }]}>Overview</Text>
 
-        <View
-          style={[
-            styles.nameInput,
-            {
-              backgroundColor: autoPlanName ? filledFieldBg : emptyFieldBg,
-              borderColor: "#D8DDE3",
-              justifyContent: "center",
-            },
-          ]}
-        >
-          <Text
-            style={[
-              styles.fieldText,
-              {
-                color: autoPlanName ? filledText : emptyText,
-              },
-            ]}
-            numberOfLines={1}
-          >
-            {autoPlanName || "Subject_Section_School"}
-          </Text>
-        </View>
-
         <View style={styles.row3}>
           <Pressable
             style={[styles.boxField, { backgroundColor: filledFieldBg }]}
@@ -1804,15 +1763,6 @@ export default function LessonplanScreen() {
             }}
           >
             <Text style={[styles.fieldText, { color: filledText }]}>{formatAcademicYear(academicYearStart)}</Text>
-          </Pressable>
-
-          <Pressable
-            style={[styles.boxField, { backgroundColor: filledFieldBg }]}
-            onPress={() => {
-              setTerm((prev) => (prev === "quarter" ? "trimester" : prev === "trimester" ? "semester" : "quarter"));
-            }}
-          >
-            <Text style={[styles.fieldText, { color: filledText }]}>{TERM_LABEL[term]}</Text>
           </Pressable>
         </View>
 
@@ -2101,18 +2051,6 @@ export default function LessonplanScreen() {
             })}
           </View>
         ) : null}
-
-        <View style={styles.divider} />
-
-        <Text style={[styles.sectionTitle, { color: c.text }]}>Extra Requirements</Text>
-        <TextInput
-          value={extraRequirements}
-          onChangeText={setExtraRequirements}
-          placeholder="(1 Seatwork per Lesson, 1 activity per laboratory session, one long project making week, etc.)"
-          placeholderTextColor="#B0B0B0"
-          multiline
-          style={[styles.extraBox, { backgroundColor: extraRequirements.trim() ? filledFieldBg : emptyFieldBg, color: extraRequirements.trim() ? filledText : emptyText }]}
-        />
 
         <View style={styles.divider} />
 

@@ -11,7 +11,6 @@ create table if not exists public.lesson_plans (
   section_id uuid not null references public.sections(section_id) on delete cascade,
   title text not null,
   academic_year text,
-  term public.academic_term not null,
   start_date date not null,
   end_date date not null,
   status public.record_status not null default 'draft',
@@ -30,7 +29,6 @@ create table if not exists public.slots (
   start_time time not null,
   end_time time not null,
   meeting_type public.meeting_type,
-  room public.room_type,
   slot_number integer not null default 1,
   series_key text not null,
   is_locked boolean not null default false,
@@ -54,12 +52,10 @@ create table if not exists public.blocks (
   session_category public.session_category not null,
   session_subcategory public.session_subcategory,
   meeting_type public.meeting_type,
-  estimated_minutes integer not null default 60,
-  min_minutes integer,
-  max_minutes integer,
+  start_time time not null,
+  end_time time not null,
   required boolean not null default true,
   splittable boolean not null default false,
-  overlay_mode text not null default 'major' check (overlay_mode in ('exclusive', 'major', 'minor')),
   preferred_session_type text not null default 'any' check (preferred_session_type in ('lecture', 'laboratory', 'mixed', 'any')),
   dependency_keys text[] not null default '{}',
   order_no integer not null default 1,
@@ -70,12 +66,7 @@ create table if not exists public.blocks (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   constraint blocks_order_check check (order_no > 0),
-  constraint blocks_minutes_check check (estimated_minutes > 0),
-  constraint blocks_range_check check (
-    min_minutes is null
-    or max_minutes is null
-    or max_minutes >= min_minutes
-  ),
+  constraint blocks_time_check check (end_time > start_time),
   constraint blocks_unique_algorithm_key unique (lesson_plan_id, algorithm_block_key),
   constraint blocks_session_pair_check check (
     (session_category = 'lesson' and session_subcategory in ('lecture', 'laboratory'))
@@ -86,22 +77,7 @@ create table if not exists public.blocks (
   )
 );
 
-create table if not exists public.plan_subject_content (
-  plan_subject_content_id uuid primary key default gen_random_uuid(),
-  lesson_plan_id uuid not null references public.lesson_plans(lesson_plan_id) on delete cascade,
-  subject_id uuid not null references public.subjects(subject_id) on delete cascade,
-  unit_id uuid references public.units(unit_id) on delete set null,
-  chapter_id uuid references public.chapters(chapter_id) on delete set null,
-  lesson_id uuid references public.lessons(lesson_id) on delete set null,
-  content_level text not null check (content_level in ('unit', 'chapter', 'lesson')),
-  sequence_no integer not null default 1,
-  selected_title text,
-  selected_content text,
-  learning_objectives text,
-  estimated_minutes integer,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
-);
+
 
 create table if not exists public.school_calendar_events (
   event_id uuid primary key default gen_random_uuid(),
@@ -137,7 +113,6 @@ create index if not exists lesson_plans_user_id_idx on public.lesson_plans(user_
 create index if not exists lesson_plans_school_id_idx on public.lesson_plans(school_id);
 create index if not exists lesson_plans_subject_id_idx on public.lesson_plans(subject_id);
 create index if not exists lesson_plans_section_id_idx on public.lesson_plans(section_id);
-create index if not exists lesson_plans_term_idx on public.lesson_plans(term);
 create index if not exists lesson_plans_status_idx on public.lesson_plans(status);
 create index if not exists lesson_plans_date_range_idx on public.lesson_plans(start_date, end_date);
 
@@ -145,7 +120,6 @@ create index if not exists slots_lesson_plan_id_idx on public.slots(lesson_plan_
 create index if not exists slots_slot_date_idx on public.slots(slot_date);
 create index if not exists slots_weekday_idx on public.slots(weekday);
 create index if not exists slots_series_key_idx on public.slots(lesson_plan_id, series_key);
-create index if not exists slots_room_idx on public.slots(room);
 
 create index if not exists blocks_lesson_plan_id_idx on public.blocks(lesson_plan_id);
 create index if not exists blocks_slot_id_idx on public.blocks(slot_id);

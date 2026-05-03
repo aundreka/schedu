@@ -98,18 +98,22 @@ create table if not exists public.lessons (
   unique (chapter_id, sequence_no)
 );
 
-alter table public.lessons
-  alter column estimated_minutes set default 60;
-
-update public.lessons
-set estimated_minutes = 60
-where estimated_minutes is null;
-
-alter table public.lessons
-  add column if not exists complexity_score integer;
-
-alter table public.chapters
-  add column if not exists unit_id uuid references public.units(unit_id) on delete set null;
+create table if not exists public.plan_subject_content (
+  plan_subject_content_id uuid primary key default gen_random_uuid(),
+  lesson_plan_id uuid not null references public.lesson_plans(lesson_plan_id) on delete cascade,
+  subject_id uuid not null references public.subjects(subject_id) on delete cascade,
+  unit_id uuid references public.units(unit_id) on delete set null,
+  chapter_id uuid references public.chapters(chapter_id) on delete set null,
+  lesson_id uuid references public.lessons(lesson_id) on delete set null,
+  content_level text not null check (content_level in ('unit', 'chapter', 'lesson')),
+  sequence_no integer not null default 1,
+  selected_title text,
+  selected_content text,
+  learning_objectives text,
+  estimated_minutes integer,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
 
 create index if not exists units_subject_id_idx on public.units(subject_id);
 create index if not exists units_status_idx on public.units(status);
