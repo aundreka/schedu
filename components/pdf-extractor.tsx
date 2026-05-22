@@ -11,6 +11,7 @@ import {
 } from "react-native";
 import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system/legacy";
+import { formatEdgeFunctionError } from "../lib/edge-function-errors";
 import { supabase } from "../lib/supabase";
 
 type PickedFile = {
@@ -59,7 +60,7 @@ async function ocrImage(uri: string): Promise<string> {
 
     const text = pieces.join("\n").trim();
     return text || "";
-  } catch (e: any) {
+  } catch {
     throw new Error(
       "Image OCR needs a Dev Build (not Expo Go). Install react-native-mlkit-ocr and rebuild your app."
     );
@@ -162,7 +163,7 @@ export default function CreateScreen() {
       if (upErr) throw upErr;
 
       setStatus("Extracting text from PDF...");
-      const { data, error } = await supabase.functions.invoke("extract-text", {
+      const { data, error, response } = await supabase.functions.invoke("extract-text", {
         headers: {
           Authorization: `Bearer ${session.access_token}`,
         },
@@ -170,22 +171,7 @@ export default function CreateScreen() {
       });
 
       if (error) {
-        const response = (error as any)?.context as Response | undefined;
-        const status = response?.status;
-        let details = error.message || "Edge Function failed.";
-
-        if (response) {
-          const payload = await response
-            .json()
-            .catch(async () => ({ raw: await response.text().catch(() => "") }));
-          const serverMessage =
-            payload?.details || payload?.message || payload?.error || payload?.raw;
-          if (serverMessage) details = `${details} ${String(serverMessage)}`.trim();
-        }
-
-        throw new Error(
-          status ? `extract-text failed (${status}): ${details}` : `extract-text failed: ${details}`
-        );
+        throw new Error(await formatEdgeFunctionError("extract-text", error, response));
       }
 
       const text = (data?.text ?? "").toString();

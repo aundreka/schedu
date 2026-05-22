@@ -1,6 +1,7 @@
 import * as FileSystem from "expo-file-system/legacy";
 import { Document, HeadingLevel, Packer, Paragraph, TextRun } from "docx";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+import { formatEdgeFunctionError } from "./edge-function-errors";
 import { supabase } from "./supabase";
 
 export type ActivityCategory = "written_work" | "performance_task";
@@ -139,7 +140,7 @@ export async function extractPdfTextFromStoragePath(storagePath: string) {
   const session = sessionData?.session;
   if (!session?.access_token) throw new Error("You must be signed in.");
 
-  const { data, error } = await supabase.functions.invoke("extract-text", {
+  const { data, error, response } = await supabase.functions.invoke("extract-text", {
     headers: {
       Authorization: `Bearer ${session.access_token}`,
     },
@@ -147,21 +148,7 @@ export async function extractPdfTextFromStoragePath(storagePath: string) {
   });
 
   if (error) {
-    const response = (error as any)?.context as Response | undefined;
-    const status = response?.status;
-    let details = error.message || "Edge Function failed.";
-
-    if (response) {
-      const payload = await response
-        .json()
-        .catch(async () => ({ raw: await response.text().catch(() => "") }));
-      const serverMessage = payload?.details || payload?.message || payload?.error || payload?.raw;
-      if (serverMessage) details = `${details} ${String(serverMessage)}`.trim();
-    }
-
-    throw new Error(
-      status ? `extract-text failed (${status}): ${details}` : `extract-text failed: ${details}`
-    );
+    throw new Error(await formatEdgeFunctionError("extract-text", error, response));
   }
 
   return String(data?.text ?? "");

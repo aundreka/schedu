@@ -18,6 +18,7 @@ import { Radius, Spacing, Typography } from "../../../constants/fonts";
 import TabPageHeader from "../../../components/tab-page-header";
 import { usePullToRefresh } from "../../../hooks/usePullToRefresh";
 import { supabase } from "../../../lib/supabase";
+import { getSubjectFallbackColor } from "../../../lib/subject-fallback-color";
 
 type LibrarySubject = {
   subject_id: string;
@@ -192,41 +193,56 @@ export default function LibraryScreen() {
 
   const renderCards = (items: LibrarySubject[]) => (
     <View style={styles.gridWrap}>
-      {items.map((item) => (
-        <Pressable
-          key={item.subject_id}
-          style={styles.cardWrap}
-          onPress={() =>
-            router.push({
-              pathname: "/library/subject_detail",
-              params: { subjectId: item.subject_id },
-            })
-          }
-        >
-          <View style={[styles.cardTop, { backgroundColor: c.border }]}>
-            {item.subject_image_signed_url ? (
-              <Image
-                source={{ uri: item.subject_image_signed_url }}
-                style={styles.cardImage}
-                resizeMode="cover"
-              />
-            ) : (
-              <View style={styles.imageFallback}>
-                <Ionicons name="image-outline" size={34} color={c.mutedText} />
-                <Text style={[styles.fallbackText, { color: c.mutedText }]}>No Image</Text>
-              </View>
-            )}
-          </View>
-          <Text style={[styles.cardTitle, { color: c.text }]} numberOfLines={1}>
-            <Text style={styles.codeText}>{item.code}</Text>
-            {" - "}
-            {item.title}
-          </Text>
-          <Text style={[styles.cardSub, { color: c.mutedText }]} numberOfLines={1}>
-            {item.school_name}
-          </Text>
-        </Pressable>
-      ))}
+      {items.map((item) => {
+        const fallbackColor = getSubjectFallbackColor(`${item.subject_id}:${item.code}`);
+
+        return (
+          <Pressable
+            key={item.subject_id}
+            style={styles.cardWrap}
+            onPress={() =>
+              router.push({
+                pathname: "/library/subject_detail",
+                params: { subjectId: item.subject_id },
+              })
+            }
+          >
+            <View
+              style={[
+                styles.cardTop,
+                { backgroundColor: item.subject_image_signed_url ? c.border : fallbackColor },
+              ]}
+            >
+              {item.subject_image_signed_url ? (
+                <Image
+                  source={{ uri: item.subject_image_signed_url }}
+                  style={styles.cardImage}
+                  resizeMode="cover"
+                />
+              ) : (
+                <View style={styles.imageFallback}>
+                  <Text
+                    style={styles.fallbackCode}
+                    numberOfLines={1}
+                    adjustsFontSizeToFit
+                    minimumFontScale={0.7}
+                  >
+                    {item.code}
+                  </Text>
+                </View>
+              )}
+            </View>
+            <Text style={[styles.cardTitle, { color: c.text }]} numberOfLines={1}>
+              <Text style={styles.codeText}>{item.code}</Text>
+              {" - "}
+              {item.title}
+            </Text>
+            <Text style={[styles.cardSub, { color: c.mutedText }]} numberOfLines={1}>
+              {item.school_name}
+            </Text>
+          </Pressable>
+        );
+      })}
     </View>
   );
 
@@ -468,10 +484,13 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: "center",
     justifyContent: "center",
-    gap: 6,
   },
-  fallbackText: {
-    ...Typography.body,
+  fallbackCode: {
+    ...Typography.h1,
+    color: "#FFFFFF",
+    fontWeight: "700",
+    paddingHorizontal: Spacing.md,
+    textAlign: "center",
   },
   cardTitle: {
     ...Typography.h3,

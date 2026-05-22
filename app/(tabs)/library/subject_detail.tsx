@@ -20,6 +20,7 @@ import { Radius, Spacing, Typography } from "../../../constants/fonts";
 import { useAppTheme } from "../../../context/theme";
 import { usePullToRefresh } from "../../../hooks/usePullToRefresh";
 import { supabase } from "../../../lib/supabase";
+import { getSubjectFallbackColor } from "../../../lib/subject-fallback-color";
 
 type SubjectDetail = {
   subject_id: string;
@@ -708,6 +709,11 @@ export default function SubjectDetailScreen() {
   const lessonRowA = useMemo(() => (scheme === "dark" ? "#1B2A2A" : "#E7F0EC"), [scheme]);
   const lessonRowB = useMemo(() => (scheme === "dark" ? "#223534" : "#DCE9E4"), [scheme]);
   const unitHeaderBg = useMemo(() => (scheme === "dark" ? "#1E3C35" : "#D8ECE6"), [scheme]);
+  const subjectFallbackSeed = subject ? `${subject.subject_id}:${subject.code}` : null;
+  const subjectFallbackColor = useMemo(
+    () => getSubjectFallbackColor(subjectFallbackSeed),
+    [subjectFallbackSeed]
+  );
   const editImagePreview = editImageUri || subject?.subject_image_signed_url || null;
   const editInstitution = useMemo(
     () => institutions.find((item) => item.school_id === editSchoolId) ?? null,
@@ -1340,13 +1346,27 @@ export default function SubjectDetailScreen() {
           </View>
         ) : null}
 
-        <View style={[styles.heroCard, { backgroundColor: c.border }]}> 
+        <View
+          style={[
+            styles.heroCard,
+            { backgroundColor: subject.subject_image_signed_url ? c.border : subjectFallbackColor },
+          ]}
+        >
           {subject.subject_image_signed_url ? (
             <Image source={{ uri: subject.subject_image_signed_url }} style={styles.heroImage} resizeMode="cover" />
           ) : (
             <View style={styles.heroFallback}>
-              <Ionicons name="image-outline" size={52} color={c.mutedText} />
-              <Text style={[styles.fallbackText, { color: c.mutedText }]}>{subject.school_name}</Text>
+              <Text
+                style={styles.heroFallbackCode}
+                numberOfLines={1}
+                adjustsFontSizeToFit
+                minimumFontScale={0.7}
+              >
+                {subject.code}
+              </Text>
+              <Text style={styles.fallbackText} numberOfLines={1}>
+                {subject.school_name}
+              </Text>
             </View>
           )}
         </View>
@@ -1773,6 +1793,13 @@ const styles = StyleSheet.create({
   },
   fallbackText: {
     ...Typography.body,
+    color: "#FFFFFF",
+    textAlign: "center",
+  },
+  heroFallbackCode: {
+    ...Typography.h1,
+    color: "#FFFFFF",
+    fontWeight: "700",
     textAlign: "center",
   },
   addLessonButton: {

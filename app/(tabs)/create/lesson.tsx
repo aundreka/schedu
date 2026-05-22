@@ -22,6 +22,7 @@ import { router, useLocalSearchParams } from "expo-router";
 import { Radius, Spacing, Typography } from "../../../constants/fonts";
 import { useAppTheme } from "../../../context/theme";
 import { usePullToRefresh } from "../../../hooks/usePullToRefresh";
+import { formatEdgeFunctionError } from "../../../lib/edge-function-errors";
 import { supabase } from "../../../lib/supabase";
 
 type SubjectOption = {
@@ -103,7 +104,7 @@ async function extractPdfTextFromStoragePath(storagePath: string) {
   const session = sessionData?.session;
   if (!session?.access_token) throw new Error("You must be signed in.");
 
-  const { data, error } = await supabase.functions.invoke("extract-text", {
+  const { data, error, response } = await supabase.functions.invoke("extract-text", {
     headers: {
       Authorization: `Bearer ${session.access_token}`,
     },
@@ -111,21 +112,7 @@ async function extractPdfTextFromStoragePath(storagePath: string) {
   });
 
   if (error) {
-    const response = (error as any)?.context as Response | undefined;
-    const status = response?.status;
-    let details = error.message || "Edge Function failed.";
-
-    if (response) {
-      const payload = await response
-        .json()
-        .catch(async () => ({ raw: await response.text().catch(() => "") }));
-      const serverMessage = payload?.details || payload?.message || payload?.error || payload?.raw;
-      if (serverMessage) details = `${details} ${String(serverMessage)}`.trim();
-    }
-
-    throw new Error(
-      status ? `extract-text failed (${status}): ${details}` : `extract-text failed: ${details}`
-    );
+    throw new Error(await formatEdgeFunctionError("extract-text", error, response));
   }
 
   return String(data?.text ?? "");

@@ -38,6 +38,7 @@ import {
   shareLocalFile,
   uploadUriAsset,
 } from "../../../lib/activity-utils";
+import { formatEdgeFunctionError } from "../../../lib/edge-function-errors";
 import { supabase } from "../../../lib/supabase";
 
 type PickerKind = "category" | "type" | "subject" | "scope" | null;
@@ -48,7 +49,7 @@ type ActivityRow = {
 };
 
 function toRomanNumeral(value: number) {
-  const numerals: Array<[number, string]> = [
+  const numerals: [number, string][] = [
     [1000, "M"],
     [900, "CM"],
     [500, "D"],
@@ -97,7 +98,6 @@ function distributeWrittenWorkCounts(totalItems: number, componentCount: number)
 
   const idealFirst = Math.ceil(totalItems / componentCount);
   const firstCount = Math.min(totalItems, roundUpToNearestFive(idealFirst));
-  const remaining = Math.max(0, totalItems - firstCount);
   const result = [firstCount];
 
   const remainingSlots = componentCount - 1;
@@ -551,7 +551,7 @@ export default function ActivitiesScreen() {
         .filter((item) => selectedComponents.includes(item.key))
         .map((item) => item.label);
 
-      const { data, error } = await supabase.functions.invoke("generate-activity", {
+      const { data, error, response } = await supabase.functions.invoke("generate-activity", {
         headers: {
           Authorization: `Bearer ${session.access_token}`,
         },
@@ -587,13 +587,7 @@ export default function ActivitiesScreen() {
       });
 
       if (error) {
-        const response = (error as any)?.context as Response | undefined;
-        const detailPayload = response
-          ? await response.json().catch(async () => ({ raw: await response.text().catch(() => "") }))
-          : null;
-        throw new Error(
-          String(detailPayload?.details || detailPayload?.error || error.message || "Generation failed.")
-        );
+        throw new Error(await formatEdgeFunctionError("generate-activity", error, response));
       }
 
       const text = String(data?.text ?? "").trim();
